@@ -1,0 +1,21 @@
+{
+  "name": "pdfeditor-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "setup:wasm": "cargo install wasm-bindgen-cli --version 0.2.121",
+    "wasm:build": "cd ../.. && cargo build -p pdfeditor-core --target wasm32-unknown-unknown --features wasm --release && wasm-bindgen target/wasm32-unknown-unknown/release/pdfeditor_core.wasm --target web --out-dir apps/web/src/wasm --out-name pdfeditor_core",
+    "dev": "npm run wasm:build && vite --host 127.0.0.1",
+    "build": "npm run wasm:build && vue-tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "^5.2.4",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vue": "^3.5.13",
+    "vue-tsc": "^2.2.10"
+  },
+  "devDependencies": {}
+}

@@ -7,6 +7,11 @@ license.workspace = true
 [lib]
 name = "pdfeditor_core"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+wasm = ["dep:serde_json", "dep:wasm-bindgen"]
 
 [dependencies]
 lopdf = "0.34"
@@ -14,3 +19,5 @@ serde = { version = "1", features = ["derive"] }
 tiny-skia = "0.11"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 flate2 = "1"
+serde_json = { version = "1", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }

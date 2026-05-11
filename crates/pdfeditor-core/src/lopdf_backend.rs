@@ -44,6 +44,25 @@ pub struct PageImageExport {
     pub height_px: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageImageBytesExport {
+    pub id: ImageObjectId,
+    pub file_name: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub png: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageFontAsset {
+    pub resource_name: String,
+    pub family_name: String,
+    pub file_name: String,
+    pub mime_type: String,
+    pub format: String,
+    pub bytes: Vec<u8>,
+}
+
 pub fn write_pdf_background_png(
     input: impl AsRef<Path>,
     page: PageIndex,
@@ -63,6 +82,63 @@ pub fn write_pdf_page_images(
     let engine = LopdfEngine;
     let document = engine.open(input.as_ref())?;
     document.write_page_images(page, output_dir.as_ref())
+}
+
+pub fn page_structure_from_pdf_bytes(bytes: &[u8], page: PageIndex) -> CoreResult<PageStructure> {
+    let document = open_lopdf_document_from_bytes(bytes)?;
+    document.page_structure(page)
+}
+
+pub fn page_background_png_from_pdf_bytes(
+    bytes: &[u8],
+    page: PageIndex,
+    options: BackgroundRenderOptions,
+) -> CoreResult<Vec<u8>> {
+    let document = open_lopdf_document_from_bytes(bytes)?;
+    document
+        .background_png_bytes(page, options)
+        .map(|(png, _)| png)
+}
+
+pub fn page_image_png_from_pdf_bytes(
+    bytes: &[u8],
+    page: PageIndex,
+    image_id: ImageObjectId,
+) -> CoreResult<Vec<u8>> {
+    let document = open_lopdf_document_from_bytes(bytes)?;
+    let images = document.page_image_png_bytes(page)?;
+    images
+        .into_iter()
+        .find(|image| image.id == image_id)
+        .map(|image| image.png)
+        .ok_or_else(|| CoreError::NotFound(format!("image object {}", (image_id.0).0)))
+}
+
+pub fn page_font_assets_from_pdf_bytes(
+    bytes: &[u8],
+    page: PageIndex,
+) -> CoreResult<Vec<PageFontAsset>> {
+    let document = open_lopdf_document_from_bytes(bytes)?;
+    document.page_font_assets(page)
+}
+
+pub fn save_pdf_document_to_bytes(document: &LopdfDocument) -> CoreResult<Vec<u8>> {
+    document.save_to_bytes()
+}
+
+pub fn open_lopdf_document_from_bytes(bytes: &[u8]) -> CoreResult<LopdfDocument> {
+    let document = Document::load_mem(bytes)
+        .map_err(|err| CoreError::InvalidPdf(format!("failed to load PDF bytes: {err}")))?;
+    let page_labels = document.get_pages();
+    let pages = page_labels.values().copied().collect::<Vec<_>>();
+    let mut result = LopdfDocument {
+        document,
+        pages,
+        text_objects: HashMap::new(),
+        text_refs: HashMap::new(),
+    };
+    result.extract_text_objects()?;
+    Ok(result)
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +384,15 @@ impl EngineDocument for LopdfDocument {
 }
 
 impl LopdfDocument {
+    pub fn save_to_bytes(&self) -> CoreResult<Vec<u8>> {
+        let mut document = self.document.clone();
+        let mut output = Vec::new();
+        document
+            .save_to(&mut output)
+            .map_err(|err| CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err)))?;
+        Ok(output)
+    }
+
     fn extract_text_objects(&mut self) -> CoreResult<()> {
         self.text_objects.clear();
         self.text_refs.clear();
@@ -421,6 +506,38 @@ impl LopdfDocument {
             }
         }
         maps
+    }
+
+    pub fn page_font_assets(&self, page: PageIndex) -> CoreResult<Vec<PageFontAsset>> {
+        let page_id = self.page_id(page)?;
+        let Ok(fonts) = self.document.get_page_fonts(page_id) else {
+            return Ok(Vec::new());
+        };
+
+        let mut assets = Vec::new();
+        for (name, font) in fonts {
+            let resource_name = String::from_utf8_lossy(&name).into_owned();
+            let Some(descriptor) = font_descriptor(&self.document, font) else {
+                continue;
+            };
+            let Some((bytes, mime_type, format, extension)) =
+                font_file_bytes(&self.document, descriptor)
+            else {
+                continue;
+            };
+            let family_name = font_family_name(&self.document, font, &resource_name);
+            let file_name = format!("{}.{}", sanitize_file_stem(&resource_name), extension);
+            assets.push(PageFontAsset {
+                resource_name,
+                family_name,
+                file_name,
+                mime_type: mime_type.to_string(),
+                format: format.to_string(),
+                bytes,
+            });
+        }
+
+        Ok(assets)
     }
 
     fn structured_text(&self, page: PageIndex) -> CoreResult<Vec<StructuredTextObject>> {
@@ -622,6 +739,19 @@ impl LopdfDocument {
         output: &Path,
         options: BackgroundRenderOptions,
     ) -> CoreResult<BackgroundBitmapReport> {
+        let (png, report) = self.background_png_bytes(page, options)?;
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(output, png)?;
+        Ok(report)
+    }
+
+    fn background_png_bytes(
+        &self,
+        page: PageIndex,
+        options: BackgroundRenderOptions,
+    ) -> CoreResult<(Vec<u8>, BackgroundBitmapReport)> {
         self.ensure_page(page)?;
         let page_id = self.page_id(page)?;
         let page_info = self.page_info(page)?;
@@ -791,17 +921,17 @@ impl LopdfDocument {
             }
         }
 
-        if let Some(parent) = output.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        pixmap.save_png(output).map_err(|error| {
-            CoreError::Engine(format!("failed to save background PNG: {error}"))
+        let png = pixmap.encode_png().map_err(|error| {
+            CoreError::Engine(format!("failed to encode background PNG: {error}"))
         })?;
-        Ok(BackgroundBitmapReport {
-            width_px,
-            height_px,
-            drawn_operations,
-        })
+        Ok((
+            png,
+            BackgroundBitmapReport {
+                width_px,
+                height_px,
+                drawn_operations,
+            },
+        ))
     }
 
     fn write_page_images(
@@ -809,8 +939,34 @@ impl LopdfDocument {
         page: PageIndex,
         output_dir: &Path,
     ) -> CoreResult<Vec<PageImageExport>> {
-        self.ensure_page(page)?;
         std::fs::create_dir_all(output_dir)?;
+        let images = self.page_image_png_bytes(page)?;
+        let mut exported = Vec::new();
+
+        for image in images {
+            let output = output_dir.join(&image.file_name);
+            if !output.exists() {
+                std::fs::write(&output, &image.png)?;
+            }
+
+            if !exported
+                .iter()
+                .any(|item: &PageImageExport| item.id == image.id)
+            {
+                exported.push(PageImageExport {
+                    id: image.id,
+                    file_name: image.file_name,
+                    width_px: image.width_px,
+                    height_px: image.height_px,
+                });
+            }
+        }
+
+        Ok(exported)
+    }
+
+    fn page_image_png_bytes(&self, page: PageIndex) -> CoreResult<Vec<PageImageBytesExport>> {
+        self.ensure_page(page)?;
         let page_id = self.page_id(page)?;
         let content = self.decoded_page_content(page_id)?;
         let xobjects = self.page_xobjects(page_id);
@@ -843,26 +999,26 @@ impl LopdfDocument {
             };
 
             let id = ImageObjectId(PdfObjectId(encode_indirect_object_id(*object_id)));
-            let file_name = format!("{}.image.png", (id.0).0);
-            let output = output_dir.join(&file_name);
-            if !output.exists() {
-                let mut pixmap = Pixmap::new(image.width, image.height).ok_or_else(|| {
-                    CoreError::Engine("failed to allocate image export bitmap".to_string())
-                })?;
-                pixmap.data_mut().copy_from_slice(&image.premultiplied_rgba);
-                pixmap.save_png(&output).map_err(|error| {
-                    CoreError::Engine(format!("failed to save image object PNG: {error}"))
-                })?;
+            if exported
+                .iter()
+                .any(|item: &PageImageBytesExport| item.id == id)
+            {
+                continue;
             }
-
-            if !exported.iter().any(|item: &PageImageExport| item.id == id) {
-                exported.push(PageImageExport {
-                    id,
-                    file_name,
-                    width_px: image.width,
-                    height_px: image.height,
-                });
-            }
+            let mut pixmap = Pixmap::new(image.width, image.height).ok_or_else(|| {
+                CoreError::Engine("failed to allocate image export bitmap".to_string())
+            })?;
+            pixmap.data_mut().copy_from_slice(&image.premultiplied_rgba);
+            let png = pixmap.encode_png().map_err(|error| {
+                CoreError::Engine(format!("failed to encode image object PNG: {error}"))
+            })?;
+            exported.push(PageImageBytesExport {
+                id,
+                file_name: format!("{}.image.png", (id.0).0),
+                width_px: image.width,
+                height_px: image.height,
+                png,
+            });
         }
 
         Ok(exported)
@@ -1741,6 +1897,138 @@ fn collect_xobjects(
         result
             .entry(String::from_utf8_lossy(name).into_owned())
             .or_insert_with(|| (id, stream.clone()));
+    }
+}
+
+fn font_descriptor<'a>(document: &'a Document, font: &'a Dictionary) -> Option<&'a Dictionary> {
+    if let Some(descriptor) = font
+        .get(b"FontDescriptor")
+        .ok()
+        .and_then(|object| dictionary_from_object(document, object))
+    {
+        return Some(descriptor);
+    }
+
+    let descendants = font.get(b"DescendantFonts").ok()?.as_array().ok()?;
+    let descendant = descendants
+        .first()
+        .and_then(|object| dictionary_from_object(document, object))?;
+    descendant
+        .get(b"FontDescriptor")
+        .ok()
+        .and_then(|object| dictionary_from_object(document, object))
+}
+
+fn font_file_bytes(
+    document: &Document,
+    descriptor: &Dictionary,
+) -> Option<(Vec<u8>, &'static str, &'static str, &'static str)> {
+    if let Some(bytes) = descriptor
+        .get(b"FontFile2")
+        .ok()
+        .and_then(|object| stream_from_object(document, object))
+        .and_then(stream_content_bytes)
+    {
+        return Some((bytes, "font/ttf", "truetype", "ttf"));
+    }
+
+    if let Some(stream) = descriptor
+        .get(b"FontFile3")
+        .ok()
+        .and_then(|object| stream_from_object(document, object))
+    {
+        let subtype = stream
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(object_name_bytes)
+            .unwrap_or_else(|| "OpenType".to_string());
+        let (mime_type, format, extension) = match subtype.as_str() {
+            "OpenType" => ("font/otf", "opentype", "otf"),
+            "Type1C" | "CIDFontType0C" => ("application/x-font-cff", "cff", "cff"),
+            _ => ("application/octet-stream", "unknown", "font"),
+        };
+        if let Some(bytes) = stream_content_bytes(stream) {
+            return Some((bytes, mime_type, format, extension));
+        }
+    }
+
+    descriptor
+        .get(b"FontFile")
+        .ok()
+        .and_then(|object| stream_from_object(document, object))
+        .and_then(stream_content_bytes)
+        .map(|bytes| (bytes, "application/x-font-type1", "type1", "pfb"))
+}
+
+fn font_family_name(document: &Document, font: &Dictionary, resource_name: &str) -> String {
+    font_base_name(document, font)
+        .map(|name| strip_subset_prefix(&name).to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| resource_name.to_string())
+}
+
+fn font_base_name(document: &Document, font: &Dictionary) -> Option<String> {
+    if let Some(name) = font.get(b"BaseFont").ok().and_then(object_plain_text) {
+        return Some(name);
+    }
+
+    let descendants = font.get(b"DescendantFonts").ok()?.as_array().ok()?;
+    descendants
+        .first()
+        .and_then(|object| dictionary_from_object(document, object))
+        .and_then(|dict| dict.get(b"BaseFont").ok())
+        .and_then(object_plain_text)
+}
+
+fn dictionary_from_object<'a>(
+    document: &'a Document,
+    object: &'a Object,
+) -> Option<&'a Dictionary> {
+    match object {
+        Object::Reference(id) => document.get_dictionary(*id).ok(),
+        Object::Dictionary(dictionary) => Some(dictionary),
+        _ => None,
+    }
+}
+
+fn stream_from_object<'a>(document: &'a Document, object: &'a Object) -> Option<&'a lopdf::Stream> {
+    match object {
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|object| object.as_stream().ok()),
+        Object::Stream(stream) => Some(stream),
+        _ => None,
+    }
+}
+
+fn strip_subset_prefix(name: &str) -> &str {
+    let Some((prefix, rest)) = name.split_once('+') else {
+        return name;
+    };
+    let is_subset_prefix =
+        prefix.len() == 6 && prefix.bytes().all(|byte| byte.is_ascii_uppercase());
+    if is_subset_prefix {
+        rest
+    } else {
+        name
+    }
+}
+
+fn sanitize_file_stem(value: &str) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+            output.push(character);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        "font".to_string()
+    } else {
+        output
     }
 }
 

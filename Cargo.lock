@@ -438,7 +438,9 @@ dependencies = [
  "image",
  "lopdf",
  "serde",
+ "serde_json",
  "tiny-skia",
+ "wasm-bindgen",
 ]
 
 [[package]]

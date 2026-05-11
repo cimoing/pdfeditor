@@ -1,0 +1,11 @@
+{
+  "name": "pdfeditor-workspace",
+  "private": true,
+  "scripts": {
+    "web:setup-wasm": "npm --prefix apps/web run setup:wasm",
+    "web:wasm": "npm --prefix apps/web run wasm:build",
+    "web:dev": "npm --prefix apps/web run dev",
+    "web:build": "npm --prefix apps/web run build",
+    "web:preview": "npm --prefix apps/web run preview"
+  }
+}

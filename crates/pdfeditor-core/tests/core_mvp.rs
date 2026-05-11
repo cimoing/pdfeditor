@@ -1,10 +1,12 @@
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream, StringFormat};
 use pdfeditor_core::{
-    write_page_structure_pdf, write_pdf_background_png, write_pdf_page_images,
-    BackgroundRenderOptions, Color, DocumentSession, LopdfEngine, MockPdfEngine, OpenOptions,
-    PageBitmapCache, PageIndex, PageInfo, PageStructure, Point, Rect, RenderedPage, ResourceBudget,
-    SaveOptions, Size, StructuredTextObject, TextRun, TextStyle,
+    open_lopdf_document_from_bytes, page_background_png_from_pdf_bytes,
+    page_structure_from_pdf_bytes, save_pdf_document_to_bytes, write_page_structure_pdf,
+    write_pdf_background_png, write_pdf_page_images, BackgroundRenderOptions, Color,
+    DocumentSession, EngineDocument, LopdfEngine, MockPdfEngine, OpenOptions, PageBitmapCache,
+    PageIndex, PageInfo, PageStructure, Point, Rect, RenderedPage, ResourceBudget, SaveOptions,
+    Size, StructuredTextObject, TextObjectId, TextRun, TextStyle,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -335,6 +337,50 @@ fn lopdf_backend_structures_page_content_for_json_export() {
     assert_eq!(structure.text[0].angle_degrees, 0.0);
     assert!(structure.annotations.is_empty());
     assert!(structure.bookmarks.is_empty());
+}
+
+#[test]
+fn lopdf_backend_structures_page_content_from_bytes_for_wasm() {
+    let source = write_lopdf_text_pdf("lopdf-page-json-bytes", "Hello");
+    let bytes = fs::read(source).unwrap();
+
+    let structure = page_structure_from_pdf_bytes(&bytes, PageIndex(0)).unwrap();
+
+    assert_eq!(structure.page.index, PageIndex(0));
+    assert_eq!(structure.text.len(), 1);
+    assert_eq!(structure.text[0].content, "Hello");
+}
+
+#[test]
+fn lopdf_backend_exports_background_png_from_bytes_for_wasm() {
+    let source = write_lopdf_background_pdf("lopdf-background-bytes");
+    let bytes = fs::read(source).unwrap();
+
+    let png = page_background_png_from_pdf_bytes(
+        &bytes,
+        PageIndex(0),
+        BackgroundRenderOptions::default(),
+    )
+    .unwrap();
+
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+}
+
+#[test]
+fn lopdf_backend_updates_text_and_saves_bytes_for_wasm() {
+    let source = write_lopdf_text_pdf("lopdf-update-bytes", "Hello");
+    let bytes = fs::read(source).unwrap();
+    let mut document = open_lopdf_document_from_bytes(&bytes).unwrap();
+    let object = document.text_objects(PageIndex(0)).unwrap()[0].clone();
+
+    document
+        .update_text_object(TextObjectId(object.id.0), "World".to_string(), None)
+        .unwrap();
+    let updated_bytes = save_pdf_document_to_bytes(&document).unwrap();
+
+    let reopened = open_lopdf_document_from_bytes(&updated_bytes).unwrap();
+    let texts = reopened.text_objects(PageIndex(0)).unwrap();
+    assert!(texts.iter().any(|object| object.content == "World"));
 }
 
 #[test]
