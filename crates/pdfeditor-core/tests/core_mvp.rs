@@ -352,6 +352,22 @@ fn lopdf_backend_structures_page_content_from_bytes_for_wasm() {
 }
 
 #[test]
+fn lopdf_backend_advances_consecutive_structured_text_runs() {
+    let source = write_lopdf_consecutive_text_runs_pdf("lopdf-consecutive-runs");
+    let engine = LopdfEngine;
+    let session = DocumentSession::open(&engine, &source, OpenOptions::default()).unwrap();
+
+    let structure = session.page_structure(PageIndex(0)).unwrap();
+
+    assert_eq!(structure.text.len(), 3);
+    assert_eq!(structure.text[0].content, "Go to ");
+    assert_eq!(structure.text[1].content, "www.example.test ");
+    assert_eq!(structure.text[2].content, "now");
+    assert!(structure.text[1].transform[4] > structure.text[0].transform[4]);
+    assert!(structure.text[2].transform[4] > structure.text[1].transform[4]);
+}
+
+#[test]
 fn lopdf_backend_exports_background_png_from_bytes_for_wasm() {
     let source = write_lopdf_background_pdf("lopdf-background-bytes");
     let bytes = fs::read(source).unwrap();
@@ -895,6 +911,8 @@ fn write_lopdf_text_pdf(name: &str, text: &str) -> PathBuf {
         "Type" => "Font",
         "Subtype" => "Type1",
         "BaseFont" => "Helvetica",
+        "FirstChar" => 0,
+        "Widths" => Object::Array((0..=255).map(|_| Object::Integer(600)).collect()),
     });
     let resources_id = document.add_object(dictionary! {
         "Font" => dictionary! {
@@ -910,6 +928,73 @@ fn write_lopdf_text_pdf(name: &str, text: &str) -> PathBuf {
             ),
             Operation::new("Td", vec![Object::Integer(72), Object::Integer(72)]),
             Operation::new("Tj", vec![Object::string_literal(text)]),
+            Operation::new("ET", vec![]),
+        ],
+    };
+    let content_id = document.add_object(Stream::new(
+        dictionary! {},
+        content.encode().expect("encode PDF content stream"),
+    ));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(300), Object::Integer(300)],
+    });
+    document.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    document.compress();
+    document.save(&path).expect("save generated PDF");
+    path
+}
+
+fn write_lopdf_consecutive_text_runs_pdf(name: &str) -> PathBuf {
+    let path = temp_path(name, "pdf");
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let font_id = document.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "FirstChar" => 0,
+        "Widths" => Object::Array((0..=255).map(|_| Object::Integer(600)).collect()),
+    });
+    let resources_id = document.add_object(dictionary! {
+        "Font" => dictionary! {
+            "F1" => font_id,
+        },
+    });
+    let content = Content {
+        operations: vec![
+            Operation::new("BT", vec![]),
+            Operation::new(
+                "Tf",
+                vec![Object::Name(b"F1".to_vec()), Object::Integer(12)],
+            ),
+            Operation::new("Td", vec![Object::Integer(40), Object::Integer(120)]),
+            Operation::new("Tj", vec![Object::string_literal("Go to ")]),
+            Operation::new(
+                "TJ",
+                vec![Object::Array(vec![
+                    Object::string_literal("www.example.test"),
+                    Object::Integer(-120),
+                    Object::string_literal(" "),
+                ])],
+            ),
+            Operation::new("Tj", vec![Object::string_literal("now")]),
             Operation::new("ET", vec![]),
         ],
     };

@@ -159,6 +159,7 @@ button:disabled {
   background: white;
   box-shadow: 0 12px 36px rgba(31, 41, 55, 0.18);
   transform-origin: left top;
+  overflow: hidden;
 }
 
 .background,
@@ -196,6 +197,11 @@ button:disabled {
 .text-object.selected {
   border-color: #1f6feb;
   background: rgba(31, 111, 235, 0.12);
+}
+
+.text-object::-moz-focus-inner {
+  border: 0;
+  padding: 0;
 }
 
 .empty-state {
