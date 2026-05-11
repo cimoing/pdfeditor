@@ -180,7 +180,7 @@ button:disabled {
 }
 
 .text-object {
-  overflow: visible;
+  overflow: hidden;
   padding: 0;
   border: 1px solid transparent;
   background: transparent;
@@ -191,6 +191,17 @@ button:disabled {
   -webkit-font-smoothing: antialiased;
   text-rendering: geometricPrecision;
   appearance: none;
+}
+
+.text-object {
+  display: inline-block;
+  transform-box: border-box;
+}
+
+.text-object span {
+  display: inline-block;
+  transform: scaleX(var(--text-scale-x, 1));
+  transform-origin: left center;
 }
 
 .text-object:hover,

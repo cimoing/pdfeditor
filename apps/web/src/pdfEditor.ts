@@ -1,10 +1,10 @@
 import init, {
   pdf_apply_text_edits,
-  pdf_font_asset,
-  pdf_image_object_png,
-  pdf_page_background_png,
-  pdf_page_fonts_to_json,
-  pdf_page_to_json
+  pdf_apply_text_edits_by_handle,
+  pdf_close_document,
+  pdf_open_document,
+  pdf_page_bundle,
+  pdf_page_bundle_by_handle
 } from "./wasm/pdfeditor_core";
 
 export interface Point {
@@ -39,6 +39,16 @@ export interface StructuredTextObject {
   z_index: number;
 }
 
+export interface StructuredVisualTextObject {
+  id: number;
+  bounds: Rect;
+  font_name: string | null;
+  font_size: number;
+  transform: [number, number, number, number, number, number];
+  angle_degrees: number;
+  z_index: number;
+}
+
 export interface StructuredImageObject {
   id: number;
   name: string | null;
@@ -56,6 +66,7 @@ export interface StructuredImageObject {
 export interface PageStructure {
   page: PageInfo;
   text: StructuredTextObject[];
+  visual_text?: StructuredVisualTextObject[];
   images: StructuredImageObject[];
 }
 
@@ -71,6 +82,32 @@ export interface LoadedPage {
   structure: PageStructure;
   backgroundUrl: string;
   fontFamilies: Record<string, string>;
+}
+
+interface BinaryAssetInfo {
+  file_name: string;
+  mime_type: string;
+  offset: number;
+  length: number;
+}
+
+interface ImageBundleInfo {
+  id: number;
+  file_name: string;
+  width_px: number;
+  height_px: number;
+  asset: BinaryAssetInfo;
+}
+
+interface FontBundleInfo extends EmbeddedFontInfo {
+  asset: BinaryAssetInfo;
+}
+
+interface PageBundleInfo {
+  structure: PageStructure;
+  background_png: BinaryAssetInfo;
+  images: ImageBundleInfo[];
+  fonts: FontBundleInfo[];
 }
 
 let wasmReady: Promise<void> | null = null;
@@ -97,25 +134,50 @@ export function ensureWasm(): Promise<void> {
   return wasmReady;
 }
 
-export async function loadPdfPage(pdfBytes: Uint8Array, pageNumber: number): Promise<LoadedPage> {
+export async function openPdfDocument(pdfBytes: Uint8Array): Promise<number> {
+  await ensureWasm();
+  return pdf_open_document(pdfBytes);
+}
+
+export function closePdfDocument(handle: number | null) {
+  if (handle == null) return;
+  try {
+    pdf_close_document(handle);
+  } catch (error) {
+    console.warn(`Failed to close PDF document handle ${handle}`, error);
+  }
+}
+
+export async function loadPdfPage(
+  pdfBytes: Uint8Array,
+  pageNumber: number,
+  handle?: number | null
+): Promise<LoadedPage> {
   await ensureWasm();
   releaseLoadedFonts();
-  const structure = JSON.parse(pdf_page_to_json(pdfBytes, pageNumber)) as PageStructure;
-  const fontFamilies = await loadEmbeddedFonts(pdfBytes, pageNumber);
-  const backgroundPng = pdf_page_background_png(pdfBytes, pageNumber);
-  const backgroundUrl = URL.createObjectURL(new Blob([asBlobPart(backgroundPng)], { type: "image/png" }));
+  const bundleBytes =
+    handle == null ? pdf_page_bundle(pdfBytes, pageNumber) : pdf_page_bundle_by_handle(handle, pageNumber);
+  const { metadata, payload } = parsePageBundle(bundleBytes);
+  const structure = metadata.structure;
+  const fontFamilies = await loadEmbeddedFonts(metadata.fonts, payload);
+  const backgroundUrl = URL.createObjectURL(
+    new Blob([assetBlobPart(payload, metadata.background_png)], { type: metadata.background_png.mime_type })
+  );
 
+  const imageAssets = new Map(metadata.images.map((image) => [image.id, image.asset]));
   for (const image of structure.images) {
-    const png = pdf_image_object_png(pdfBytes, pageNumber, BigInt(image.id));
-    image.objectUrl = URL.createObjectURL(new Blob([asBlobPart(png)], { type: "image/png" }));
+    const asset = imageAssets.get(image.id);
+    if (!asset) continue;
+    image.objectUrl = URL.createObjectURL(new Blob([assetBlobPart(payload, asset)], { type: asset.mime_type }));
   }
 
   return { structure, backgroundUrl, fontFamilies };
 }
 
 export async function applyTextEdits(
-  pdfBytes: Uint8Array,
-  edits: Array<{ id: number; content: string }>
+  pdfBytes: Uint8Array | null,
+  edits: Array<{ id: number; content: string }>,
+  handle?: number | null
 ): Promise<Uint8Array> {
   await ensureWasm();
   const request = {
@@ -125,11 +187,39 @@ export async function applyTextEdits(
       content: edit.content
     }))
   };
+  if (handle != null) {
+    return pdf_apply_text_edits_by_handle(handle, JSON.stringify(request));
+  }
+  if (!pdfBytes) {
+    throw new Error("Missing PDF bytes for text edit request");
+  }
   return pdf_apply_text_edits(pdfBytes, JSON.stringify(request));
 }
 
 export function asBlobPart(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function parsePageBundle(bytes: Uint8Array): { metadata: PageBundleInfo; payload: Uint8Array } {
+  if (bytes.byteLength < 4) {
+    throw new Error("Invalid page bundle: missing metadata length");
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const jsonLength = view.getUint32(0, false);
+  const jsonStart = 4;
+  const jsonEnd = jsonStart + jsonLength;
+  if (jsonEnd > bytes.byteLength) {
+    throw new Error("Invalid page bundle: metadata length exceeds bundle size");
+  }
+  const json = new TextDecoder().decode(bytes.subarray(jsonStart, jsonEnd));
+  return {
+    metadata: JSON.parse(json) as PageBundleInfo,
+    payload: bytes.subarray(jsonEnd)
+  };
+}
+
+function assetBlobPart(payload: Uint8Array, asset: BinaryAssetInfo): ArrayBuffer {
+  return asBlobPart(payload.subarray(asset.offset, asset.offset + asset.length));
 }
 
 export function resolvePdfFontFamily(fontName: string | null, embeddedFonts: Record<string, string>): string {
@@ -139,9 +229,8 @@ export function resolvePdfFontFamily(fontName: string | null, embeddedFonts: Rec
   return withFallbackFonts(mappedFallbackForFont(fontName));
 }
 
-async function loadEmbeddedFonts(pdfBytes: Uint8Array, pageNumber: number): Promise<Record<string, string>> {
+async function loadEmbeddedFonts(fonts: FontBundleInfo[], payload: Uint8Array): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
-  const fonts = JSON.parse(pdf_page_fonts_to_json(pdfBytes, pageNumber)) as EmbeddedFontInfo[];
 
   for (const font of fonts) {
     let blobUrl: string | null = null;
@@ -150,9 +239,8 @@ async function loadEmbeddedFonts(pdfBytes: Uint8Array, pageNumber: number): Prom
         result[font.resource_name] = withFallbackFonts(mappedFallbackForFont(font.family_name));
         continue;
       }
-      const bytes = pdf_font_asset(pdfBytes, pageNumber, font.resource_name);
-      blobUrl = URL.createObjectURL(new Blob([asBlobPart(bytes)], { type: font.mime_type }));
-      const family = `PdfEmbedded_${pageNumber}_${sanitizeCssName(font.resource_name)}_${fontLoadSequence++}`;
+      blobUrl = URL.createObjectURL(new Blob([assetBlobPart(payload, font.asset)], { type: font.mime_type }));
+      const family = `PdfEmbedded_${sanitizeCssName(font.resource_name)}_${fontLoadSequence++}`;
       const source = `url(${blobUrl}) format("${font.format}")`;
       const face = new FontFace(family, source);
       await face.load();

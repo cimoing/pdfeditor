@@ -1,16 +1,26 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, ref } from "vue";
 import type { PageStructure, StructuredTextObject } from "./pdfEditor";
-import { applyTextEdits, asBlobPart, loadPdfPage, resolvePdfFontFamily } from "./pdfEditor";
+import {
+  applyTextEdits,
+  asBlobPart,
+  closePdfDocument,
+  loadPdfPage,
+  openPdfDocument,
+  resolvePdfFontFamily
+} from "./pdfEditor";
 
 interface EditableText {
   id: number;
   original: string;
   content: string;
   object: StructuredTextObject;
+  visualX: number;
+  visualY: number;
 }
 
 const pdfBytes = ref<Uint8Array | null>(null);
+const pdfHandle = ref<number | null>(null);
 const fileName = ref("");
 const pageNumber = ref(1);
 const status = ref("选择 PDF 后加载页面");
@@ -27,12 +37,20 @@ const selectedText = computed(() =>
 );
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 
+onBeforeUnmount(() => {
+  closePdfDocument(pdfHandle.value);
+});
+
 async function onFileChange(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
   if (!file) return;
+  closePdfDocument(pdfHandle.value);
+  pdfHandle.value = null;
   fileName.value = file.name;
   pdfBytes.value = new Uint8Array(await file.arrayBuffer());
+  status.value = "正在打开 PDF...";
+  pdfHandle.value = await openPdfDocument(pdfBytes.value);
   await loadPage();
 }
 
@@ -40,7 +58,7 @@ async function loadPage() {
   if (!pdfBytes.value) return;
   status.value = "正在解析 PDF 页面...";
   revokeUrls();
-  const loaded = await loadPdfPage(pdfBytes.value, pageNumber.value);
+  const loaded = await loadPdfPage(pdfBytes.value, pageNumber.value, pdfHandle.value);
   page.value = loaded.structure;
   backgroundUrl.value = loaded.backgroundUrl;
   fontFamilies.value = loaded.fontFamilies;
@@ -48,7 +66,9 @@ async function loadPage() {
     id: object.id,
     original: object.content,
     content: object.content,
-    object
+    object,
+    visualX: object.transform[4],
+    visualY: object.transform[5]
   }));
   selectedTextId.value = editableTexts.value[0]?.id ?? null;
   status.value = `已加载第 ${pageNumber.value} 页：${editableTexts.value.length} 个文本对象，${loaded.structure.images.length} 个图片对象`;
@@ -98,17 +118,18 @@ function pageCanvasStyle(pageInfo: PageStructure["page"]) {
 
 function textStyle(text: EditableText) {
   const pageHeight = page.value?.page.size.height ?? 0;
-  const [, , , , x, y] = text.object.transform;
   const fontSize = effectiveFontSize(text.object);
-  const width = Math.max(text.object.bounds.size.width, text.object.bounds.size.height, fontSize);
   const height = Math.max(fontSize * 1.25, 8);
+  const width = Math.max(text.object.bounds.size.width, 1);
+  const scaleX = textHorizontalScale(text.object.content, fontSize, width);
   return {
-    left: `${x}px`,
-    top: `${pageHeight - y}px`,
+    left: `${text.visualX}px`,
+    top: `${pageHeight - text.visualY}px`,
     width: `${width}px`,
     minHeight: `${height}px`,
     fontSize: `${fontSize}px`,
     lineHeight: "1.15",
+    "--text-scale-x": `${scaleX}`,
     transform: `rotate(${-text.object.angle_degrees}deg) translateY(-${fontSize}px)`,
     transformOrigin: "left bottom",
     fontFamily: resolvePdfFontFamily(text.object.font_name, fontFamilies.value),
@@ -117,10 +138,35 @@ function textStyle(text: EditableText) {
 }
 
 function effectiveFontSize(text: StructuredTextObject) {
+  return effectiveObjectFontSize(text);
+}
+
+function effectiveObjectFontSize(text: StructuredTextObject) {
   const [a, b, c, d] = text.transform;
   const xScale = Math.hypot(a, b);
   const yScale = Math.hypot(c, d);
-  return Math.max(text.font_size, xScale, yScale, 1);
+  const transformSize = Math.max(xScale, yScale);
+  return Math.max(transformSize || text.font_size, 1);
+}
+
+function textHorizontalScale(content: string, fontSize: number, targetWidth: number) {
+  const estimatedWidth = estimateBrowserTextWidth(content, fontSize);
+  if (estimatedWidth <= 0 || targetWidth <= 0) return 1;
+  return Math.min(1.2, Math.max(0.35, targetWidth / estimatedWidth));
+}
+
+function estimateBrowserTextWidth(content: string, fontSize: number) {
+  let units = 0;
+  for (const character of content || " ") {
+    if (character === " " || character === "\u00a0") {
+      units += 0.28;
+    } else if (/[\u0000-\u007f]/.test(character)) {
+      units += /[ilI.,|]/.test(character) ? 0.28 : 0.62;
+    } else {
+      units += 1;
+    }
+  }
+  return Math.max(units * fontSize, 1);
 }
 
 function cssColor(color: StructuredTextObject["color"]) {
@@ -149,7 +195,8 @@ async function savePdf() {
     .filter((text) => text.content !== text.original)
     .map((text) => ({ id: text.id, content: text.content }));
 
-  const updated = edits.length > 0 ? await applyTextEdits(pdfBytes.value, edits) : pdfBytes.value;
+  const updated = edits.length > 0 ? await applyTextEdits(pdfBytes.value, edits, pdfHandle.value) : pdfBytes.value;
+  pdfBytes.value = updated;
   const blob = new Blob([asBlobPart(updated)], { type: "application/pdf" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -232,12 +279,13 @@ async function savePdf() {
           <button
             v-for="text in editableTexts"
             :key="text.id"
+            :data-text-id="text.id"
             class="text-object"
             :class="{ selected: text.id === selectedTextId }"
             :style="textStyle(text)"
             @click="selectText(text.id)"
           >
-            {{ text.content }}
+            <span>{{ text.content }}</span>
           </button>
         </div>
       </div>

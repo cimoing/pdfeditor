@@ -77,6 +77,7 @@ pub trait EngineDocument {
         Ok(PageStructure {
             page: page_info,
             text,
+            visual_text: Vec::new(),
             images,
             watermarks: Vec::new(),
             annotations: Vec::new(),

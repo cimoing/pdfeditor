@@ -1,12 +1,12 @@
 use crate::{
     BookmarkItem, Color, CoreError, CoreResult, EngineDocument, ImageObject, ImageObjectId,
     PageIndex, PageInfo, PageStructure, PdfEngine, PdfObjectId, Rect, RenderedPage, Size,
-    StructuredAnnotation, StructuredImageObject, StructuredTextObject, StructuredWatermark,
-    TextObject, TextObjectId, TextRun, TextStyle,
+    StructuredAnnotation, StructuredImageObject, StructuredTextObject, StructuredVisualTextObject,
+    StructuredWatermark, TextObject, TextObjectId, TextRun, TextStyle,
 };
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::Path;
 use tiny_skia::{Color as SkiaColor, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
@@ -61,6 +61,14 @@ pub struct PageFontAsset {
     pub mime_type: String,
     pub format: String,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PageLoadBundle {
+    pub structure: PageStructure,
+    pub background_png: Vec<u8>,
+    pub images: Vec<PageImageBytesExport>,
+    pub fonts: Vec<PageFontAsset>,
 }
 
 pub fn write_pdf_background_png(
@@ -120,6 +128,15 @@ pub fn page_font_assets_from_pdf_bytes(
 ) -> CoreResult<Vec<PageFontAsset>> {
     let document = open_lopdf_document_from_bytes(bytes)?;
     document.page_font_assets(page)
+}
+
+pub fn page_load_bundle_from_pdf_bytes(
+    bytes: &[u8],
+    page: PageIndex,
+    options: BackgroundRenderOptions,
+) -> CoreResult<PageLoadBundle> {
+    let document = open_lopdf_document_from_bytes(bytes)?;
+    document.page_load_bundle(page, options)
 }
 
 pub fn save_pdf_document_to_bytes(document: &LopdfDocument) -> CoreResult<Vec<u8>> {
@@ -214,6 +231,7 @@ impl EngineDocument for LopdfDocument {
         self.ensure_page(page)?;
         let page_info = self.page_info(page)?;
         let text = self.structured_text(page)?;
+        let visual_text = self.structured_visual_text(page)?;
         let images = self.structured_images(page)?;
         let mut watermarks = text
             .iter()
@@ -247,6 +265,7 @@ impl EngineDocument for LopdfDocument {
         Ok(PageStructure {
             page: page_info,
             text,
+            visual_text,
             images,
             watermarks,
             annotations: self.structured_annotations(page)?,
@@ -393,6 +412,23 @@ impl LopdfDocument {
         Ok(output)
     }
 
+    pub fn page_load_bundle(
+        &self,
+        page: PageIndex,
+        options: BackgroundRenderOptions,
+    ) -> CoreResult<PageLoadBundle> {
+        let structure = self.page_structure(page)?;
+        let background_png = self.background_png_bytes(page, options)?.0;
+        let images = self.page_image_png_bytes(page)?;
+        let fonts = self.page_font_assets(page)?;
+        Ok(PageLoadBundle {
+            structure,
+            background_png,
+            images,
+            fonts,
+        })
+    }
+
     fn extract_text_objects(&mut self) -> CoreResult<()> {
         self.text_objects.clear();
         self.text_refs.clear();
@@ -417,6 +453,9 @@ impl LopdfDocument {
                     .as_ref()
                     .and_then(|name| font_maps.get(name));
                 if let Some(text) = operation_text(operation, font_map) {
+                    if text.is_empty() {
+                        continue;
+                    }
                     let object_id = TextObjectId(PdfObjectId(encode_text_object_id(
                         page.0,
                         operation_index as u32,
@@ -515,7 +554,10 @@ impl LopdfDocument {
 
         let mut metrics = HashMap::new();
         for (name, font) in fonts {
-            if let Some(font_metrics) = parse_font_metrics(&self.document, font) {
+            let to_unicode = parse_font_to_unicode(&self.document, font);
+            if let Some(font_metrics) =
+                parse_font_metrics(&self.document, font, to_unicode.as_ref())
+            {
                 metrics.insert(String::from_utf8_lossy(&name).into_owned(), font_metrics);
             }
         }
@@ -534,9 +576,8 @@ impl LopdfDocument {
             let Some(descriptor) = font_descriptor(&self.document, font) else {
                 continue;
             };
-            let to_unicode = parse_font_to_unicode(&self.document, font);
             let Some((bytes, mime_type, format, extension)) =
-                font_file_bytes(&self.document, descriptor, to_unicode.as_ref())
+                font_file_bytes(&self.document, descriptor)
             else {
                 continue;
             };
@@ -576,12 +617,18 @@ impl LopdfDocument {
                 .as_ref()
                 .and_then(|name| font_metrics.get(name));
             if let Some(text) = operation_text(operation, font_map) {
+                if text.is_empty() {
+                    advance_page_text_state(&mut state, operation, metrics);
+                    continue;
+                }
                 let object_id = TextObjectId(PdfObjectId(encode_text_object_id(
                     page.0,
                     operation_index as u32,
                 )));
                 let transform = text_render_transform(&state);
-                let bounds = bounds_for_text(&text, state.text.font_size, transform);
+                let bounds = operation_text_advance(operation, metrics, &state.text)
+                    .map(|width| bounds_for_text_width(width, transform))
+                    .unwrap_or_else(|| bounds_for_text(&text, state.text.font_size, transform));
                 objects.push(StructuredTextObject {
                     id: object_id,
                     bounds,
@@ -599,6 +646,72 @@ impl LopdfDocument {
                         state.text.color,
                     )],
                 });
+                advance_page_text_state(&mut state, operation, metrics);
+            }
+        }
+
+        Ok(objects)
+    }
+
+    fn structured_visual_text(
+        &self,
+        page: PageIndex,
+    ) -> CoreResult<Vec<StructuredVisualTextObject>> {
+        let page_id = self.page_id(page)?;
+        let content = self.decoded_page_content(page_id)?;
+        let page_fonts = self.document.get_page_fonts(page_id).ok();
+        let font_maps = self.page_font_maps(page_id);
+        let font_metrics = self.page_font_metrics(page_id);
+        let mut state = PageParseState::default();
+        let mut objects = Vec::new();
+
+        for (operation_index, operation) in content.operations.iter().enumerate() {
+            update_page_state(&mut state, operation);
+            let font_map = state
+                .text
+                .font_name
+                .as_ref()
+                .and_then(|name| font_maps.get(name));
+            let metrics = state
+                .text
+                .font_name
+                .as_ref()
+                .and_then(|name| font_metrics.get(name));
+            let is_visual_only_type3 = state
+                .text
+                .font_name
+                .as_ref()
+                .and_then(|name| {
+                    page_fonts
+                        .as_ref()
+                        .and_then(|fonts| fonts.get(name.as_bytes()))
+                })
+                .is_some_and(|font| {
+                    font.get(b"Subtype")
+                        .ok()
+                        .and_then(object_name_bytes)
+                        .as_deref()
+                        == Some("Type3")
+                });
+
+            if let Some(text) = operation_text(operation, font_map) {
+                if text.is_empty() && is_visual_only_type3 {
+                    let transform = text_render_transform(&state);
+                    if let Some(width) = operation_text_advance(operation, metrics, &state.text) {
+                        objects.push(StructuredVisualTextObject {
+                            id: TextObjectId(PdfObjectId(encode_text_object_id(
+                                page.0,
+                                operation_index as u32,
+                            ))),
+                            bounds: bounds_for_text_width(width, transform),
+                            font_name: state.text.font_name.clone(),
+                            font_size: state.text.font_size,
+                            transform,
+                            angle_degrees: matrix_angle_degrees(transform),
+                            z_index: operation_index,
+                        });
+                    }
+                }
                 advance_page_text_state(&mut state, operation, metrics);
             }
         }
@@ -793,11 +906,16 @@ impl LopdfDocument {
         pixmap.fill(SkiaColor::from_rgba8(255, 255, 255, 255));
 
         let content = self.decoded_page_content(page_id)?;
+        let page_fonts = self.document.get_page_fonts(page_id).ok();
+        let font_maps = self.page_font_maps(page_id);
+        let font_metrics = self.page_font_metrics(page_id);
         let mut state = GraphicsParseState::default();
+        let mut page_state = PageParseState::default();
         let mut path = PdfPath::default();
         let mut drawn_operations = 0usize;
 
         for operation in &content.operations {
+            update_page_state(&mut page_state, operation);
             match operation.operator.as_str() {
                 "q" => state.stack.push(state.snapshot()),
                 "Q" => {
@@ -939,6 +1057,22 @@ impl LopdfDocument {
                     path.clear();
                 }
                 "Do" => {}
+                "Tj" | "TJ" | "'" | "\"" => {
+                    if self.draw_visual_only_type3_text(
+                        &mut pixmap,
+                        page_fonts.as_ref(),
+                        &font_maps,
+                        &page_state,
+                        operation,
+                        page_info.size.height,
+                        scale,
+                    )? {
+                        drawn_operations += 1;
+                    }
+                    let metrics =
+                        font_metrics.get(page_state.text.font_name.as_deref().unwrap_or_default());
+                    advance_page_text_state(&mut page_state, operation, metrics);
+                }
                 _ => {}
             }
         }
@@ -954,6 +1088,77 @@ impl LopdfDocument {
                 drawn_operations,
             },
         ))
+    }
+
+    fn draw_visual_only_type3_text(
+        &self,
+        pixmap: &mut Pixmap,
+        page_fonts: Option<&BTreeMap<Vec<u8>, &Dictionary>>,
+        font_maps: &HashMap<String, ToUnicodeMap>,
+        state: &PageParseState,
+        operation: &Operation,
+        page_height: f32,
+        scale: f32,
+    ) -> CoreResult<bool> {
+        let Some(font_name) = state.text.font_name.as_ref() else {
+            return Ok(false);
+        };
+        let decoded = font_maps
+            .get(font_name)
+            .and_then(|font_map| operation_text(operation, Some(font_map)))
+            .unwrap_or_default();
+        if !decoded.is_empty() {
+            return Ok(false);
+        }
+        let Some(raw_bytes) = operation_text_bytes(operation) else {
+            return Ok(false);
+        };
+        if raw_bytes.is_empty() {
+            return Ok(false);
+        }
+        let Some(font) = page_fonts.and_then(|fonts| fonts.get(font_name.as_bytes()).copied())
+        else {
+            return Ok(false);
+        };
+        if font
+            .get(b"Subtype")
+            .ok()
+            .and_then(object_name_bytes)
+            .as_deref()
+            != Some("Type3")
+        {
+            return Ok(false);
+        }
+
+        let Some(type3) = Type3FontRenderInfo::from_font(&self.document, font) else {
+            return Ok(false);
+        };
+        let transform = text_render_transform(state);
+        let mut text_cursor = 0.0f32;
+        let mut drew = false;
+        for byte in raw_bytes {
+            let Some(char_proc) = type3.char_proc(byte) else {
+                text_cursor += type3.advance(byte);
+                continue;
+            };
+            let glyph_transform = multiply_matrix(
+                transform,
+                multiply_matrix([1.0, 0.0, 0.0, 1.0, text_cursor, 0.0], type3.font_matrix),
+            );
+            if draw_type3_char_proc(
+                pixmap,
+                &char_proc,
+                glyph_transform,
+                state.text.color,
+                page_height,
+                scale,
+            )? {
+                drew = true;
+            }
+            text_cursor += type3.advance(byte);
+        }
+
+        Ok(drew)
     }
 
     fn write_page_images(
@@ -1178,6 +1383,285 @@ impl PdfPath {
         }
         builder.finish()
     }
+}
+
+#[derive(Debug, Clone)]
+struct Type3FontRenderInfo {
+    font_matrix: [f32; 6],
+    advance_scale: f32,
+    widths: HashMap<u8, f32>,
+    encoding: HashMap<u8, String>,
+    char_procs: HashMap<String, Content>,
+}
+
+impl Type3FontRenderInfo {
+    fn from_font(document: &Document, font: &Dictionary) -> Option<Self> {
+        let font_matrix = font
+            .get(b"FontMatrix")
+            .ok()
+            .and_then(object_matrix)
+            .unwrap_or([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        let widths = type3_widths(font);
+        let encoding = type3_encoding(font);
+        let char_procs_dict = font.get(b"CharProcs").ok()?.as_dict().ok()?;
+        let mut char_procs = HashMap::new();
+        for (name, object) in char_procs_dict {
+            let stream = stream_from_object(document, object)?;
+            let bytes = stream_content_bytes(stream)?;
+            let content = Content::decode(&bytes).ok()?;
+            char_procs.insert(String::from_utf8_lossy(name).into_owned(), content);
+        }
+        Some(Self {
+            font_matrix,
+            advance_scale: font_matrix_advance_scale(font_matrix),
+            widths,
+            encoding,
+            char_procs,
+        })
+    }
+
+    fn char_proc(&self, code: u8) -> Option<&Content> {
+        self.encoding
+            .get(&code)
+            .and_then(|name| self.char_procs.get(name))
+    }
+
+    fn width(&self, code: u8) -> f32 {
+        self.widths.get(&code).copied().unwrap_or(1000.0)
+    }
+
+    fn advance(&self, code: u8) -> f32 {
+        self.width(code) * self.advance_scale
+    }
+}
+
+fn type3_widths(font: &Dictionary) -> HashMap<u8, f32> {
+    let first_char = font
+        .get(b"FirstChar")
+        .ok()
+        .and_then(object_to_i64)
+        .unwrap_or(0);
+    let mut widths = HashMap::new();
+    if let Ok(array) = font.get(b"Widths").and_then(Object::as_array) {
+        for (index, object) in array.iter().enumerate() {
+            let code = first_char + index as i64;
+            if (0..=255).contains(&code) {
+                if let Some(width) = object_to_f32(object) {
+                    widths.insert(code as u8, width);
+                }
+            }
+        }
+    }
+    widths
+}
+
+fn type3_encoding(font: &Dictionary) -> HashMap<u8, String> {
+    let mut encoding = HashMap::new();
+    if let Ok(encoding_object) = font.get(b"Encoding") {
+        if let Some(dictionary) = dictionary_from_inline_object(encoding_object) {
+            if let Ok(differences) = dictionary.get(b"Differences").and_then(Object::as_array) {
+                let mut code: Option<u8> = None;
+                for item in differences {
+                    if let Some(next_code) = object_to_i64(item)
+                        .and_then(|value| (0..=255).contains(&value).then_some(value as u8))
+                    {
+                        code = Some(next_code);
+                    } else if let (Some(current), Some(name)) = (code, object_name(item)) {
+                        encoding.insert(current, name);
+                        code = current.checked_add(1);
+                    }
+                }
+            }
+        }
+    }
+    encoding
+}
+
+fn draw_type3_char_proc(
+    pixmap: &mut Pixmap,
+    content: &Content,
+    glyph_transform: [f32; 6],
+    color: Color,
+    page_height: f32,
+    scale: f32,
+) -> CoreResult<bool> {
+    let mut path = PdfPath::default();
+    let mut state = Type3GraphicsState::new(glyph_transform);
+    let mut stack = Vec::new();
+    let mut drew = false;
+    for operation in &content.operations {
+        match operation.operator.as_str() {
+            "q" => stack.push(state),
+            "Q" => {
+                if let Some(previous) = stack.pop() {
+                    state = previous;
+                }
+            }
+            "cm" => {
+                if let Some(matrix) = operation_matrix(operation) {
+                    state.transform = multiply_matrix(state.transform, matrix);
+                }
+            }
+            "w" => {
+                if let Some(width) = operation.operands.first().and_then(object_to_f32) {
+                    state.line_width = width.max(0.0);
+                }
+            }
+            "m" => {
+                if let Some((x, y)) = operation_point(operation, 0) {
+                    let point = transform_point(state.transform, x, y);
+                    path.move_to(point.0, point.1);
+                }
+            }
+            "l" => {
+                if let Some((x, y)) = operation_point(operation, 0) {
+                    let point = transform_point(state.transform, x, y);
+                    path.line_to(point.0, point.1);
+                }
+            }
+            "c" => {
+                if let (Some(p1), Some(p2), Some(p3)) = (
+                    operation_point(operation, 0),
+                    operation_point(operation, 2),
+                    operation_point(operation, 4),
+                ) {
+                    path.curve_to(
+                        transform_point(state.transform, p1.0, p1.1),
+                        transform_point(state.transform, p2.0, p2.1),
+                        transform_point(state.transform, p3.0, p3.1),
+                    );
+                }
+            }
+            "v" => {
+                if let (Some(p2), Some(p3)) =
+                    (operation_point(operation, 0), operation_point(operation, 2))
+                {
+                    let current = path.current_point().unwrap_or((0.0, 0.0));
+                    path.curve_to(
+                        current,
+                        transform_point(state.transform, p2.0, p2.1),
+                        transform_point(state.transform, p3.0, p3.1),
+                    );
+                }
+            }
+            "y" => {
+                if let (Some(p1), Some(p3)) =
+                    (operation_point(operation, 0), operation_point(operation, 2))
+                {
+                    let p1 = transform_point(state.transform, p1.0, p1.1);
+                    let p3 = transform_point(state.transform, p3.0, p3.1);
+                    path.curve_to(p1, p3, p3);
+                }
+            }
+            "re" => {
+                if let (Some(x), Some(y), Some(w), Some(h)) = (
+                    operation.operands.first().and_then(object_to_f32),
+                    operation.operands.get(1).and_then(object_to_f32),
+                    operation.operands.get(2).and_then(object_to_f32),
+                    operation.operands.get(3).and_then(object_to_f32),
+                ) {
+                    let p0 = transform_point(state.transform, x, y);
+                    let p1 = transform_point(state.transform, x + w, y);
+                    let p2 = transform_point(state.transform, x + w, y + h);
+                    let p3 = transform_point(state.transform, x, y + h);
+                    path.move_to(p0.0, p0.1);
+                    path.line_to(p1.0, p1.1);
+                    path.line_to(p2.0, p2.1);
+                    path.line_to(p3.0, p3.1);
+                    path.close();
+                }
+            }
+            "h" => path.close(),
+            "n" => path.clear(),
+            "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*" | "d0" | "d1" => {
+                if matches!(operation.operator.as_str(), "s" | "b" | "b*") {
+                    path.close();
+                }
+                if matches!(operation.operator.as_str(), "f" | "F" | "f*" | "B" | "B*" | "b" | "b*")
+                    && fill_type3_path(pixmap, &path, color, page_height, scale)
+                {
+                    drew = true;
+                }
+                if matches!(operation.operator.as_str(), "S" | "s" | "B" | "B*" | "b" | "b*")
+                    && stroke_type3_path(pixmap, &path, &state, color, page_height, scale)
+                {
+                    drew = true;
+                }
+                if matches!(
+                    operation.operator.as_str(),
+                    "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*"
+                ) {
+                    path.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(drew)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Type3GraphicsState {
+    transform: [f32; 6],
+    line_width: f32,
+}
+
+impl Type3GraphicsState {
+    fn new(transform: [f32; 6]) -> Self {
+        Self {
+            transform,
+            line_width: 1.0,
+        }
+    }
+}
+
+fn fill_type3_path(
+    pixmap: &mut Pixmap,
+    path: &PdfPath,
+    color: Color,
+    page_height: f32,
+    scale: f32,
+) -> bool {
+    let Some(path) = path.to_skia_path(page_height, scale) else {
+        return false;
+    };
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+    true
+}
+
+fn stroke_type3_path(
+    pixmap: &mut Pixmap,
+    path: &PdfPath,
+    state: &Type3GraphicsState,
+    color: Color,
+    page_height: f32,
+    scale: f32,
+) -> bool {
+    let Some(path) = path.to_skia_path(page_height, scale) else {
+        return false;
+    };
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+    let stroke = Stroke {
+        width: type3_stroke_width(state, scale),
+        ..Stroke::default()
+    };
+    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    true
+}
+
+fn type3_stroke_width(state: &Type3GraphicsState, scale: f32) -> f32 {
+    let x_scale = state.transform[0].hypot(state.transform[1]);
+    let y_scale = state.transform[2].hypot(state.transform[3]);
+    (state.line_width * x_scale.max(y_scale) * scale).max(0.5)
 }
 
 fn stroke_pdf_path(
@@ -1712,7 +2196,11 @@ fn advance_page_text_state(
     let Some(advance) = operation_text_advance(operation, metrics, &state.text) else {
         return;
     };
-    state.text_matrix = multiply_matrix(state.text_matrix, [1.0, 0.0, 0.0, 1.0, advance, 0.0]);
+    let user_advance = advance * state.text.font_size.abs().max(1.0);
+    state.text_matrix = multiply_matrix(
+        state.text_matrix,
+        [1.0, 0.0, 0.0, 1.0, user_advance, 0.0],
+    );
     state.text.x = state.text_matrix[4];
     state.text.y = state.text_matrix[5];
 }
@@ -1725,6 +2213,18 @@ fn operation_matrix(operation: &Operation) -> Option<[f32; 6]> {
         operation.operands.get(3).and_then(object_to_f32)?,
         operation.operands.get(4).and_then(object_to_f32)?,
         operation.operands.get(5).and_then(object_to_f32)?,
+    ])
+}
+
+fn object_matrix(object: &Object) -> Option<[f32; 6]> {
+    let array = object.as_array().ok()?;
+    Some([
+        array.first().and_then(object_to_f32)?,
+        array.get(1).and_then(object_to_f32)?,
+        array.get(2).and_then(object_to_f32)?,
+        array.get(3).and_then(object_to_f32)?,
+        array.get(4).and_then(object_to_f32)?,
+        array.get(5).and_then(object_to_f32)?,
     ])
 }
 
@@ -1758,7 +2258,11 @@ fn text_render_transform(state: &PageParseState) -> [f32; 6] {
 
 fn bounds_for_text(content: &str, font_size: f32, transform: [f32; 6]) -> Rect {
     let width = estimate_text_width(content, font_size) / font_size.max(1.0);
-    transformed_rect_bounds(transform, width, 1.2)
+    bounds_for_text_width(width, transform)
+}
+
+fn bounds_for_text_width(width: f32, transform: [f32; 6]) -> Rect {
+    transformed_rect_bounds(transform, width.max(0.0), 1.2)
 }
 
 fn unit_bounds_after_transform(transform: [f32; 6]) -> Rect {
@@ -1817,6 +2321,27 @@ fn operation_text(operation: &Operation, font_map: Option<&ToUnicodeMap>) -> Opt
                 }
             }
             Some(text)
+        }
+        _ => None,
+    }
+}
+
+fn operation_text_bytes(operation: &Operation) -> Option<Vec<u8>> {
+    match operation.operator.as_str() {
+        "Tj" | "'" | "\"" => operation
+            .operands
+            .last()
+            .and_then(object_string_bytes)
+            .map(|bytes| bytes.to_vec()),
+        "TJ" => {
+            let array = operation.operands.first()?.as_array().ok()?;
+            let mut bytes = Vec::new();
+            for item in array {
+                if let Some(part) = object_string_bytes(item) {
+                    bytes.extend_from_slice(part);
+                }
+            }
+            Some(bytes)
         }
         _ => None,
     }
@@ -1977,6 +2502,13 @@ fn object_text(object: &Object, font_map: Option<&ToUnicodeMap>) -> Option<Strin
     }
 }
 
+fn object_string_bytes(object: &Object) -> Option<&[u8]> {
+    match object {
+        Object::String(value, _) => Some(value),
+        _ => None,
+    }
+}
+
 fn normalized_color_channel(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
@@ -2027,6 +2559,7 @@ struct FontMetrics {
     widths: HashMap<u32, f32>,
     default_width: f32,
     code_len: usize,
+    width_scale: f32,
 }
 
 impl FontMetrics {
@@ -2036,7 +2569,7 @@ impl FontMetrics {
             .iter()
             .map(|code| self.widths.get(code).copied().unwrap_or(self.default_width))
             .sum::<f32>()
-            / 1000.0;
+            * self.width_scale;
         let char_gaps = codes.len().saturating_sub(1) as f32;
         let word_gaps = codes.iter().filter(|code| **code == 32).count() as f32;
         let font_size = state.font_size.abs().max(1.0);
@@ -2062,9 +2595,13 @@ impl FontMetrics {
     }
 }
 
-fn parse_font_metrics(document: &Document, font: &Dictionary) -> Option<FontMetrics> {
+fn parse_font_metrics(
+    document: &Document,
+    font: &Dictionary,
+    to_unicode: Option<&ToUnicodeMap>,
+) -> Option<FontMetrics> {
     if font.get(b"DescendantFonts").is_ok() {
-        parse_cid_font_metrics(document, font)
+        parse_cid_font_metrics(document, font, to_unicode)
     } else {
         parse_simple_font_metrics(font)
     }
@@ -2088,10 +2625,15 @@ fn parse_simple_font_metrics(font: &Dictionary) -> Option<FontMetrics> {
         widths,
         default_width: 0.0,
         code_len: 1,
+        width_scale: simple_font_width_scale(font),
     })
 }
 
-fn parse_cid_font_metrics(document: &Document, font: &Dictionary) -> Option<FontMetrics> {
+fn parse_cid_font_metrics(
+    document: &Document,
+    font: &Dictionary,
+    to_unicode: Option<&ToUnicodeMap>,
+) -> Option<FontMetrics> {
     let descendants = font.get(b"DescendantFonts").ok()?.as_array().ok()?;
     let descendant = descendants
         .first()
@@ -2112,8 +2654,36 @@ fn parse_cid_font_metrics(document: &Document, font: &Dictionary) -> Option<Font
     Some(FontMetrics {
         widths,
         default_width,
-        code_len: 2,
+        code_len: to_unicode.map(|map| map.max_code_len.max(1)).unwrap_or(2),
+        width_scale: 0.001,
     })
+}
+
+fn simple_font_width_scale(font: &Dictionary) -> f32 {
+    if font
+        .get(b"Subtype")
+        .ok()
+        .and_then(object_name_bytes)
+        .as_deref()
+        == Some("Type3")
+    {
+        font.get(b"FontMatrix")
+            .ok()
+            .and_then(object_matrix)
+            .map(font_matrix_advance_scale)
+            .unwrap_or(0.001)
+    } else {
+        0.001
+    }
+}
+
+fn font_matrix_advance_scale(matrix: [f32; 6]) -> f32 {
+    let scale = matrix[0].hypot(matrix[1]);
+    if scale > 0.0 {
+        scale
+    } else {
+        0.001
+    }
 }
 
 fn parse_cid_widths(entries: &[Object], widths: &mut HashMap<u32, f32>) {
@@ -2172,7 +2742,6 @@ fn font_descriptor<'a>(document: &'a Document, font: &'a Dictionary) -> Option<&
 fn font_file_bytes(
     document: &Document,
     descriptor: &Dictionary,
-    to_unicode: Option<&ToUnicodeMap>,
 ) -> Option<(Vec<u8>, &'static str, &'static str, &'static str)> {
     if let Some(bytes) = descriptor
         .get(b"FontFile2")
@@ -2180,6 +2749,9 @@ fn font_file_bytes(
         .and_then(|object| stream_from_object(document, object))
         .and_then(stream_content_bytes)
     {
+        if !sfnt_has_usable_cmap(&bytes) {
+            return Some((bytes, "application/octet-stream", "unknown", "font"));
+        }
         return Some((bytes, "font/ttf", "truetype", "ttf"));
     }
 
@@ -2200,10 +2772,8 @@ fn font_file_bytes(
             _ => ("application/octet-stream", "unknown", "font"),
         };
         if let Some(bytes) = stream_content_bytes(stream) {
-            if matches!(subtype.as_str(), "Type1C" | "CIDFontType0C") {
-                if let Some(otf) = wrap_cff_as_otf(&bytes, to_unicode) {
-                    return Some((otf, "font/otf", "opentype", "otf"));
-                }
+            if matches!(format, "opentype") && !sfnt_has_usable_cmap(&bytes) {
+                return Some((bytes, "application/octet-stream", "unknown", "font"));
             }
             return Some((bytes, mime_type, format, extension));
         }
@@ -2217,62 +2787,95 @@ fn font_file_bytes(
         .map(|bytes| (bytes, "application/x-font-type1", "type1", "pfb"))
 }
 
-fn wrap_cff_as_otf(cff: &[u8], to_unicode: Option<&ToUnicodeMap>) -> Option<Vec<u8>> {
-    let (sid_map, cff_glyph_count) = parse_cff_unicode_map(cff)?;
-    let glyph_count = cff_glyph_count.max(1);
-
-    // Prefer ToUnicode-derived cmap over SID-based cmap.
-    // ToUnicode gives char_code → unicode; CFF Encoding gives char_code → GID.
-    let cmap_entries = to_unicode
-        .and_then(|tu| build_tounicode_cmap_entries(cff, tu))
-        .unwrap_or(sid_map);
-
-    let cmap = if cmap_entries.is_empty() {
-        build_cmap_table(&[(0x0020, 0)])?
-    } else {
-        build_cmap_table(&cmap_entries)?
-    };
-    let hmtx = build_hmtx_table(glyph_count);
-    let tables = vec![
-        (*b"CFF ", cff.to_vec()),
-        (*b"OS/2", build_os2_table()),
-        (*b"cmap", cmap),
-        (*b"head", build_head_table()),
-        (*b"hhea", build_hhea_table(glyph_count)),
-        (*b"hmtx", hmtx),
-        (*b"maxp", build_maxp_table(glyph_count)),
-        (*b"name", build_name_table()),
-        (*b"post", build_post_table()),
-    ];
-    build_sfnt(*b"OTTO", tables)
+fn sfnt_has_usable_cmap(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 {
+        return false;
+    }
+    let version = &bytes[0..4];
+    if version != b"OTTO" && version != [0x00, 0x01, 0x00, 0x00] {
+        return false;
+    }
+    let num_tables = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    for index in 0..num_tables {
+        let record_offset = 12 + index * 16;
+        if record_offset + 16 > bytes.len() {
+            return false;
+        }
+        if &bytes[record_offset..record_offset + 4] != b"cmap" {
+            continue;
+        }
+        let table_offset = u32::from_be_bytes([
+            bytes[record_offset + 8],
+            bytes[record_offset + 9],
+            bytes[record_offset + 10],
+            bytes[record_offset + 11],
+        ]) as usize;
+        let table_length = u32::from_be_bytes([
+            bytes[record_offset + 12],
+            bytes[record_offset + 13],
+            bytes[record_offset + 14],
+            bytes[record_offset + 15],
+        ]) as usize;
+        if table_offset + table_length > bytes.len() || table_length < 4 {
+            return false;
+        }
+        let cmap = &bytes[table_offset..table_offset + table_length];
+        let subtable_count = u16::from_be_bytes([cmap[2], cmap[3]]);
+        return subtable_count > 0;
+    }
+    false
 }
 
-/// Build cmap entries using the PDF ToUnicode CMap and the CFF Encoding.
-///
-/// The CFF Encoding maps character codes → glyph IDs.  The PDF ToUnicode CMap
-/// maps character codes → Unicode strings.  By combining both we get
-/// Unicode → glyph ID which is exactly what the OTF cmap needs.
-fn build_tounicode_cmap_entries(cff: &[u8], to_unicode: &ToUnicodeMap) -> Option<Vec<(u16, u16)>> {
-    let encoding = parse_cff_encoding(cff)?;
-    if encoding.is_empty() {
-        return None;
+#[allow(dead_code)]
+mod cff_otf_wrap {
+    use super::*;
+
+    fn wrap_cff_as_otf(cff: &[u8], to_unicode: Option<&ToUnicodeMap>) -> Option<Vec<u8>> {
+        let (sid_map, cff_glyph_count) = parse_cff_unicode_map(cff)?;
+        let glyph_count = cff_glyph_count.max(1);
+
+        // Prefer ToUnicode-derived cmap over SID-based cmap.
+        // ToUnicode gives char_code → unicode; CFF Encoding gives char_code → GID.
+        let cmap_entries = to_unicode
+            .and_then(|tu| build_tounicode_cmap_entries(cff, tu))
+            .unwrap_or(sid_map);
+
+        let cmap = if cmap_entries.is_empty() {
+            build_cmap_table(&[(0x0020, 0)])?
+        } else {
+            build_cmap_table(&cmap_entries)?
+        };
+        let hmtx = build_hmtx_table(glyph_count);
+        let tables = vec![
+            (*b"CFF ", cff.to_vec()),
+            (*b"OS/2", build_os2_table()),
+            (*b"cmap", cmap),
+            (*b"head", build_head_table()),
+            (*b"hhea", build_hhea_table(glyph_count)),
+            (*b"hmtx", hmtx),
+            (*b"maxp", build_maxp_table(glyph_count)),
+            (*b"name", build_name_table()),
+            (*b"post", build_post_table()),
+        ];
+        build_sfnt(*b"OTTO", tables)
     }
-    let mut entries = Vec::new();
-    for &(char_code, glyph_id) in &encoding {
-        let key = vec![char_code];
-        if let Some(unicode_str) = to_unicode.forward.get(&key) {
-            if let Some(ch) = unicode_str.chars().next() {
-                let cp = ch as u32;
-                if cp > 0 && cp <= 0xFFFF {
-                    entries.push((cp as u16, glyph_id));
-                }
-            }
+
+    /// Build cmap entries using the PDF ToUnicode CMap and the CFF Encoding.
+    ///
+    /// The CFF Encoding maps character codes → glyph IDs.  The PDF ToUnicode CMap
+    /// maps character codes → Unicode strings.  By combining both we get
+    /// Unicode → glyph ID which is exactly what the OTF cmap needs.
+    fn build_tounicode_cmap_entries(
+        cff: &[u8],
+        to_unicode: &ToUnicodeMap,
+    ) -> Option<Vec<(u16, u16)>> {
+        let encoding = parse_cff_encoding(cff)?;
+        if encoding.is_empty() {
+            return None;
         }
-    }
-    if entries.is_empty() {
-        // Try 2-byte codes (CID fonts)
+        let mut entries = Vec::new();
         for &(char_code, glyph_id) in &encoding {
-            let key = vec![0u8, char_code];
+            let key = vec![char_code];
             if let Some(unicode_str) = to_unicode.forward.get(&key) {
                 if let Some(ch) = unicode_str.chars().next() {
                     let cp = ch as u32;
@@ -2282,670 +2885,685 @@ fn build_tounicode_cmap_entries(cff: &[u8], to_unicode: &ToUnicodeMap) -> Option
                 }
             }
         }
-    }
-    if entries.is_empty() { None } else { Some(entries) }
-}
-
-/// Parse the CFF Encoding table to get character_code → glyph_index mappings.
-///
-/// The Encoding is referenced by operator 16 in the Top DICT.
-/// Value 0 = Standard Encoding, 1 = Expert Encoding, otherwise offset.
-fn parse_cff_encoding(cff: &[u8]) -> Option<Vec<(u8, u16)>> {
-    let header_size = usize::from(*cff.get(2)?);
-    let (_, name_end) = read_cff_index(cff, header_size)?;
-    let (top_dicts, _) = read_cff_index(cff, name_end)?;
-    let top_dict = top_dicts.first()?;
-    let top_values = parse_cff_top_dict(top_dict);
-
-    let encoding_offset = *top_values.get(&16).unwrap_or(&0);
-    match encoding_offset {
-        0 => Some(standard_encoding_map()),
-        1 => Some(expert_encoding_map()),
-        offset => {
-            let offset = usize::try_from(offset).ok()?;
-            parse_cff_encoding_at(cff, offset)
-        }
-    }
-}
-
-fn parse_cff_encoding_at(cff: &[u8], offset: usize) -> Option<Vec<(u8, u16)>> {
-    let format = *cff.get(offset)? & 0x7F; // high bit = supplement flag
-    let mut result = Vec::new();
-    match format {
-        0 => {
-            let n_codes = usize::from(*cff.get(offset + 1)?);
-            for i in 0..n_codes {
-                let code = *cff.get(offset + 2 + i)?;
-                result.push((code, (i + 1) as u16)); // GID 1, 2, 3, ...
-            }
-        }
-        1 => {
-            let n_ranges = usize::from(*cff.get(offset + 1)?);
-            let mut gid = 1u16;
-            let mut cursor = offset + 2;
-            for _ in 0..n_ranges {
-                let first = *cff.get(cursor)?;
-                let n_left = usize::from(*cff.get(cursor + 1)?);
-                cursor += 2;
-                for j in 0..=n_left {
-                    let code = first.wrapping_add(j as u8);
-                    result.push((code, gid));
-                    gid += 1;
+        if entries.is_empty() {
+            // Try 2-byte codes (CID fonts)
+            for &(char_code, glyph_id) in &encoding {
+                let key = vec![0u8, char_code];
+                if let Some(unicode_str) = to_unicode.forward.get(&key) {
+                    if let Some(ch) = unicode_str.chars().next() {
+                        let cp = ch as u32;
+                        if cp > 0 && cp <= 0xFFFF {
+                            entries.push((cp as u16, glyph_id));
+                        }
+                    }
                 }
             }
         }
-        _ => return None,
-    }
-    Some(result)
-}
-
-fn standard_encoding_map() -> Vec<(u8, u16)> {
-    // Map from standard encoding character codes to glyph index (1-based)
-    // This is the Adobe Standard Encoding; map code→GID where GID = code position
-    let codes: &[u8] = &[
-        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, // space ! " # $ % & '
-        0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, // ( ) * + , - . /
-        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, // 0-7
-        0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, // 8 9 : ; < = > ?
-        0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, // @ A-G
-        0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, // H-O
-        0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, // P-W
-        0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, // X-Z [ \ ] ^ _
-        0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, // ` a-g
-        0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, // h-o
-        0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, // p-w
-        0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E,       // x-z { | } ~
-    ];
-    codes
-        .iter()
-        .enumerate()
-        .map(|(i, &code)| (code, (i + 1) as u16))
-        .collect()
-}
-
-fn expert_encoding_map() -> Vec<(u8, u16)> {
-    // Simplified expert encoding — rare in PDF subset fonts
-    standard_encoding_map()
-}
-
-fn build_sfnt(sfnt_version: [u8; 4], mut tables: Vec<([u8; 4], Vec<u8>)>) -> Option<Vec<u8>> {
-    tables.sort_by_key(|(tag, _)| *tag);
-    let num_tables = u16::try_from(tables.len()).ok()?;
-    let max_power = 1u16 << (15 - num_tables.leading_zeros() as u16);
-    let search_range = max_power * 16;
-    let entry_selector = max_power.trailing_zeros() as u16;
-    let range_shift = num_tables * 16 - search_range;
-    let directory_len = 12usize + tables.len() * 16;
-    let mut offset = directory_len as u32;
-    let mut records = Vec::new();
-    let mut payload = Vec::new();
-
-    for (tag, data) in &tables {
-        let checksum = table_checksum(data);
-        records.push((*tag, checksum, offset, data.len() as u32));
-        payload.extend_from_slice(data);
-        while payload.len() % 4 != 0 {
-            payload.push(0);
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
         }
-        offset = directory_len as u32 + payload.len() as u32;
     }
 
-    let mut output = Vec::new();
-    output.extend_from_slice(&sfnt_version);
-    push_u16(&mut output, num_tables);
-    push_u16(&mut output, search_range);
-    push_u16(&mut output, entry_selector);
-    push_u16(&mut output, range_shift);
-    for (tag, checksum, table_offset, length) in &records {
-        output.extend_from_slice(tag);
-        push_u32(&mut output, *checksum);
-        push_u32(&mut output, *table_offset);
-        push_u32(&mut output, *length);
+    /// Parse the CFF Encoding table to get character_code → glyph_index mappings.
+    ///
+    /// The Encoding is referenced by operator 16 in the Top DICT.
+    /// Value 0 = Standard Encoding, 1 = Expert Encoding, otherwise offset.
+    fn parse_cff_encoding(cff: &[u8]) -> Option<Vec<(u8, u16)>> {
+        let header_size = usize::from(*cff.get(2)?);
+        let (_, name_end) = read_cff_index(cff, header_size)?;
+        let (top_dicts, _) = read_cff_index(cff, name_end)?;
+        let top_dict = top_dicts.first()?;
+        let top_values = parse_cff_top_dict(top_dict);
+
+        let encoding_offset = *top_values.get(&16).unwrap_or(&0);
+        match encoding_offset {
+            0 => Some(standard_encoding_map()),
+            1 => Some(expert_encoding_map()),
+            offset => {
+                let offset = usize::try_from(offset).ok()?;
+                parse_cff_encoding_at(cff, offset)
+            }
+        }
     }
-    output.extend_from_slice(&payload);
 
-    let checksum_adjustment = 0xB1B0AFBAu32.wrapping_sub(table_checksum(&output));
-    let head_offset = records
-        .iter()
-        .find(|(tag, _, _, _)| tag == b"head")
-        .map(|(_, _, table_offset, _)| *table_offset as usize)?;
-    output[head_offset + 8..head_offset + 12].copy_from_slice(&checksum_adjustment.to_be_bytes());
-    Some(output)
-}
+    fn parse_cff_encoding_at(cff: &[u8], offset: usize) -> Option<Vec<(u8, u16)>> {
+        let format = *cff.get(offset)? & 0x7F; // high bit = supplement flag
+        let mut result = Vec::new();
+        match format {
+            0 => {
+                let n_codes = usize::from(*cff.get(offset + 1)?);
+                for i in 0..n_codes {
+                    let code = *cff.get(offset + 2 + i)?;
+                    result.push((code, (i + 1) as u16)); // GID 1, 2, 3, ...
+                }
+            }
+            1 => {
+                let n_ranges = usize::from(*cff.get(offset + 1)?);
+                let mut gid = 1u16;
+                let mut cursor = offset + 2;
+                for _ in 0..n_ranges {
+                    let first = *cff.get(cursor)?;
+                    let n_left = usize::from(*cff.get(cursor + 1)?);
+                    cursor += 2;
+                    for j in 0..=n_left {
+                        let code = first.wrapping_add(j as u8);
+                        result.push((code, gid));
+                        gid += 1;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(result)
+    }
 
-fn build_head_table() -> Vec<u8> {
-    let mut table = Vec::new();
-    push_u32(&mut table, 0x0001_0000);
-    push_u32(&mut table, 0x0001_0000);
-    push_u32(&mut table, 0);
-    push_u32(&mut table, 0x5F0F_3CF5);
-    push_u16(&mut table, 0);
-    push_u16(&mut table, 1000);
-    table.extend_from_slice(&0u64.to_be_bytes());
-    table.extend_from_slice(&0u64.to_be_bytes());
-    push_i16(&mut table, 0);
-    push_i16(&mut table, -250);
-    push_i16(&mut table, 1000);
-    push_i16(&mut table, 1000);
-    push_u16(&mut table, 0);
-    push_u16(&mut table, 8);
-    push_i16(&mut table, 2);
-    push_i16(&mut table, 0);
-    push_i16(&mut table, 0);
-    table
-}
+    fn standard_encoding_map() -> Vec<(u8, u16)> {
+        // Map from standard encoding character codes to glyph index (1-based)
+        // This is the Adobe Standard Encoding; map code→GID where GID = code position
+        let codes: &[u8] = &[
+            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, // space ! " # $ % & '
+            0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, // ( ) * + , - . /
+            0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, // 0-7
+            0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, // 8 9 : ; < = > ?
+            0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, // @ A-G
+            0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, // H-O
+            0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, // P-W
+            0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, // X-Z [ \ ] ^ _
+            0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, // ` a-g
+            0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, // h-o
+            0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, // p-w
+            0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, // x-z { | } ~
+        ];
+        codes
+            .iter()
+            .enumerate()
+            .map(|(i, &code)| (code, (i + 1) as u16))
+            .collect()
+    }
 
-fn build_hhea_table(glyph_count: u16) -> Vec<u8> {
-    let mut table = Vec::new();
-    push_u32(&mut table, 0x0001_0000);
-    push_i16(&mut table, 800);
-    push_i16(&mut table, -200);
-    push_i16(&mut table, 0);
-    push_u16(&mut table, 1000);
-    push_i16(&mut table, 0);
-    push_i16(&mut table, 0);
-    push_i16(&mut table, 1000);
-    push_i16(&mut table, 1);
-    push_i16(&mut table, 0);
-    push_i16(&mut table, 0);
-    for _ in 0..4 {
+    fn expert_encoding_map() -> Vec<(u8, u16)> {
+        // Simplified expert encoding — rare in PDF subset fonts
+        standard_encoding_map()
+    }
+
+    fn build_sfnt(sfnt_version: [u8; 4], mut tables: Vec<([u8; 4], Vec<u8>)>) -> Option<Vec<u8>> {
+        tables.sort_by_key(|(tag, _)| *tag);
+        let num_tables = u16::try_from(tables.len()).ok()?;
+        let max_power = 1u16 << (15 - num_tables.leading_zeros() as u16);
+        let search_range = max_power * 16;
+        let entry_selector = max_power.trailing_zeros() as u16;
+        let range_shift = num_tables * 16 - search_range;
+        let directory_len = 12usize + tables.len() * 16;
+        let mut offset = directory_len as u32;
+        let mut records = Vec::new();
+        let mut payload = Vec::new();
+
+        for (tag, data) in &tables {
+            let checksum = table_checksum(data);
+            records.push((*tag, checksum, offset, data.len() as u32));
+            payload.extend_from_slice(data);
+            while payload.len() % 4 != 0 {
+                payload.push(0);
+            }
+            offset = directory_len as u32 + payload.len() as u32;
+        }
+
+        let mut output = Vec::new();
+        output.extend_from_slice(&sfnt_version);
+        push_u16(&mut output, num_tables);
+        push_u16(&mut output, search_range);
+        push_u16(&mut output, entry_selector);
+        push_u16(&mut output, range_shift);
+        for (tag, checksum, table_offset, length) in &records {
+            output.extend_from_slice(tag);
+            push_u32(&mut output, *checksum);
+            push_u32(&mut output, *table_offset);
+            push_u32(&mut output, *length);
+        }
+        output.extend_from_slice(&payload);
+
+        let checksum_adjustment = 0xB1B0AFBAu32.wrapping_sub(table_checksum(&output));
+        let head_offset = records
+            .iter()
+            .find(|(tag, _, _, _)| tag == b"head")
+            .map(|(_, _, table_offset, _)| *table_offset as usize)?;
+        output[head_offset + 8..head_offset + 12]
+            .copy_from_slice(&checksum_adjustment.to_be_bytes());
+        Some(output)
+    }
+
+    fn build_head_table() -> Vec<u8> {
+        let mut table = Vec::new();
+        push_u32(&mut table, 0x0001_0000);
+        push_u32(&mut table, 0x0001_0000);
+        push_u32(&mut table, 0);
+        push_u32(&mut table, 0x5F0F_3CF5);
+        push_u16(&mut table, 0);
+        push_u16(&mut table, 1000);
+        table.extend_from_slice(&0u64.to_be_bytes());
+        table.extend_from_slice(&0u64.to_be_bytes());
         push_i16(&mut table, 0);
-    }
-    push_i16(&mut table, 0);
-    push_u16(&mut table, glyph_count);
-    table
-}
-
-fn build_maxp_table(glyph_count: u16) -> Vec<u8> {
-    let mut table = Vec::new();
-    push_u32(&mut table, 0x0000_5000);
-    push_u16(&mut table, glyph_count);
-    table
-}
-
-fn build_hmtx_table(glyph_count: u16) -> Vec<u8> {
-    let mut table = Vec::new();
-    for _ in 0..glyph_count {
-        push_u16(&mut table, 600);
+        push_i16(&mut table, -250);
+        push_i16(&mut table, 1000);
+        push_i16(&mut table, 1000);
+        push_u16(&mut table, 0);
+        push_u16(&mut table, 8);
+        push_i16(&mut table, 2);
         push_i16(&mut table, 0);
+        push_i16(&mut table, 0);
+        table
     }
-    table
-}
 
-fn build_os2_table() -> Vec<u8> {
-    let mut table = vec![0u8; 78];
-    table[0..2].copy_from_slice(&0u16.to_be_bytes());
-    table[2..4].copy_from_slice(&600i16.to_be_bytes());
-    table[4..6].copy_from_slice(&400u16.to_be_bytes());
-    table[6..8].copy_from_slice(&5u16.to_be_bytes());
-    table[68..70].copy_from_slice(&800i16.to_be_bytes());
-    table[70..72].copy_from_slice(&200i16.to_be_bytes());
-    table
-}
+    fn build_hhea_table(glyph_count: u16) -> Vec<u8> {
+        let mut table = Vec::new();
+        push_u32(&mut table, 0x0001_0000);
+        push_i16(&mut table, 800);
+        push_i16(&mut table, -200);
+        push_i16(&mut table, 0);
+        push_u16(&mut table, 1000);
+        push_i16(&mut table, 0);
+        push_i16(&mut table, 0);
+        push_i16(&mut table, 1000);
+        push_i16(&mut table, 1);
+        push_i16(&mut table, 0);
+        push_i16(&mut table, 0);
+        for _ in 0..4 {
+            push_i16(&mut table, 0);
+        }
+        push_i16(&mut table, 0);
+        push_u16(&mut table, glyph_count);
+        table
+    }
 
-fn build_post_table() -> Vec<u8> {
-    let mut table = Vec::new();
-    push_u32(&mut table, 0x0003_0000);
-    push_u32(&mut table, 0);
-    push_i16(&mut table, 0);
-    push_i16(&mut table, 0);
-    push_u32(&mut table, 0);
-    push_u32(&mut table, 0);
-    push_u32(&mut table, 0);
-    push_u32(&mut table, 0);
-    push_u32(&mut table, 0);
-    table
-}
+    fn build_maxp_table(glyph_count: u16) -> Vec<u8> {
+        let mut table = Vec::new();
+        push_u32(&mut table, 0x0000_5000);
+        push_u16(&mut table, glyph_count);
+        table
+    }
 
-fn build_name_table() -> Vec<u8> {
-    let names: &[(u16, &str)] = &[
-        (1, "PDF Embedded CFF"),
-        (2, "Regular"),
-        (4, "PDF Embedded CFF Regular"),
-        (6, "PDFEmbeddedCFF-Regular"),
-    ];
-    let encoded: Vec<(u16, Vec<u8>)> = names
-        .iter()
-        .map(|(id, text)| {
-            let bytes: Vec<u8> = text
-                .encode_utf16()
-                .flat_map(u16::to_be_bytes)
-                .collect();
-            (*id, bytes)
-        })
-        .collect();
-    let count = encoded.len() as u16;
-    let storage_offset = 6 + count * 12;
-    let mut table = Vec::new();
-    push_u16(&mut table, 0); // format
-    push_u16(&mut table, count);
-    push_u16(&mut table, storage_offset);
-    let mut string_offset = 0u16;
-    for (name_id, bytes) in &encoded {
-        push_u16(&mut table, 3);       // platformID (Windows)
-        push_u16(&mut table, 1);       // encodingID (Unicode BMP)
-        push_u16(&mut table, 0x0409);  // languageID (English US)
-        push_u16(&mut table, *name_id);
-        push_u16(&mut table, bytes.len() as u16);
-        push_u16(&mut table, string_offset);
-        string_offset += bytes.len() as u16;
+    fn build_hmtx_table(glyph_count: u16) -> Vec<u8> {
+        let mut table = Vec::new();
+        for _ in 0..glyph_count {
+            push_u16(&mut table, 600);
+            push_i16(&mut table, 0);
+        }
+        table
     }
-    for (_, bytes) in &encoded {
-        table.extend_from_slice(bytes);
-    }
-    table
 
-}
+    fn build_os2_table() -> Vec<u8> {
+        let mut table = vec![0u8; 78];
+        table[0..2].copy_from_slice(&0u16.to_be_bytes());
+        table[2..4].copy_from_slice(&600i16.to_be_bytes());
+        table[4..6].copy_from_slice(&400u16.to_be_bytes());
+        table[6..8].copy_from_slice(&5u16.to_be_bytes());
+        table[68..70].copy_from_slice(&800i16.to_be_bytes());
+        table[70..72].copy_from_slice(&200i16.to_be_bytes());
+        table
+    }
 
-fn build_cmap_table(map: &[(u16, u16)]) -> Option<Vec<u8>> {
-    let mut entries = map.to_vec();
-    entries.sort_by_key(|(code, _)| *code);
-    entries.dedup_by_key(|(code, _)| *code);
-    entries.retain(|(code, _)| *code != 0xFFFF);
-    let seg_count = u16::try_from(entries.len() + 1).ok()?;
-    let seg_count_x2 = seg_count * 2;
-    let max_power = 1u16 << (15 - seg_count.leading_zeros() as u16);
-    let search_range = max_power * 2;
-    let entry_selector = max_power.trailing_zeros() as u16;
-    let range_shift = seg_count_x2 - search_range;
-    let length = 16 + usize::from(seg_count) * 8;
-    let mut subtable = Vec::new();
-    push_u16(&mut subtable, 4);
-    push_u16(&mut subtable, length as u16);
-    push_u16(&mut subtable, 0);
-    push_u16(&mut subtable, seg_count_x2);
-    push_u16(&mut subtable, search_range);
-    push_u16(&mut subtable, entry_selector);
-    push_u16(&mut subtable, range_shift);
-    for (code, _) in &entries {
-        push_u16(&mut subtable, *code);
+    fn build_post_table() -> Vec<u8> {
+        let mut table = Vec::new();
+        push_u32(&mut table, 0x0003_0000);
+        push_u32(&mut table, 0);
+        push_i16(&mut table, 0);
+        push_i16(&mut table, 0);
+        push_u32(&mut table, 0);
+        push_u32(&mut table, 0);
+        push_u32(&mut table, 0);
+        push_u32(&mut table, 0);
+        push_u32(&mut table, 0);
+        table
     }
-    push_u16(&mut subtable, 0xFFFF);
-    push_u16(&mut subtable, 0);
-    for (code, _) in &entries {
-        push_u16(&mut subtable, *code);
+
+    fn build_name_table() -> Vec<u8> {
+        let names: &[(u16, &str)] = &[
+            (1, "PDF Embedded CFF"),
+            (2, "Regular"),
+            (4, "PDF Embedded CFF Regular"),
+            (6, "PDFEmbeddedCFF-Regular"),
+        ];
+        let encoded: Vec<(u16, Vec<u8>)> = names
+            .iter()
+            .map(|(id, text)| {
+                let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+                (*id, bytes)
+            })
+            .collect();
+        let count = encoded.len() as u16;
+        let storage_offset = 6 + count * 12;
+        let mut table = Vec::new();
+        push_u16(&mut table, 0); // format
+        push_u16(&mut table, count);
+        push_u16(&mut table, storage_offset);
+        let mut string_offset = 0u16;
+        for (name_id, bytes) in &encoded {
+            push_u16(&mut table, 3); // platformID (Windows)
+            push_u16(&mut table, 1); // encodingID (Unicode BMP)
+            push_u16(&mut table, 0x0409); // languageID (English US)
+            push_u16(&mut table, *name_id);
+            push_u16(&mut table, bytes.len() as u16);
+            push_u16(&mut table, string_offset);
+            string_offset += bytes.len() as u16;
+        }
+        for (_, bytes) in &encoded {
+            table.extend_from_slice(bytes);
+        }
+        table
     }
-    push_u16(&mut subtable, 0xFFFF);
-    for (code, glyph_id) in &entries {
-        push_i16(&mut subtable, (*glyph_id as i32 - *code as i32) as i16);
-    }
-    push_i16(&mut subtable, 1);
-    for _ in 0..seg_count {
+
+    fn build_cmap_table(map: &[(u16, u16)]) -> Option<Vec<u8>> {
+        let mut entries = map.to_vec();
+        entries.sort_by_key(|(code, _)| *code);
+        entries.dedup_by_key(|(code, _)| *code);
+        entries.retain(|(code, _)| *code != 0xFFFF);
+        let seg_count = u16::try_from(entries.len() + 1).ok()?;
+        let seg_count_x2 = seg_count * 2;
+        let max_power = 1u16 << (15 - seg_count.leading_zeros() as u16);
+        let search_range = max_power * 2;
+        let entry_selector = max_power.trailing_zeros() as u16;
+        let range_shift = seg_count_x2 - search_range;
+        let length = 16 + usize::from(seg_count) * 8;
+        let mut subtable = Vec::new();
+        push_u16(&mut subtable, 4);
+        push_u16(&mut subtable, length as u16);
         push_u16(&mut subtable, 0);
-    }
-
-    let mut table = Vec::new();
-    push_u16(&mut table, 0);
-    push_u16(&mut table, 1);
-    push_u16(&mut table, 3);
-    push_u16(&mut table, 1);
-    push_u32(&mut table, 12);
-    table.extend_from_slice(&subtable);
-    Some(table)
-}
-
-fn parse_cff_unicode_map(cff: &[u8]) -> Option<(Vec<(u16, u16)>, u16)> {
-    let header_size = usize::from(*cff.get(2)?);
-    let (_, name_end) = read_cff_index(cff, header_size)?;
-    let (top_dicts, top_end) = read_cff_index(cff, name_end)?;
-    let (_, string_end) = read_cff_index(cff, top_end)?;
-    let (_, _) = read_cff_index(cff, string_end)?;
-    let top_dict = top_dicts.first()?;
-    let top_values = parse_cff_top_dict(top_dict);
-    let charstrings_offset = usize::try_from(*top_values.get(&17)?).ok()?;
-    let charset_offset = usize::try_from(*top_values.get(&15).unwrap_or(&0)).ok()?;
-    let (charstrings, _) = read_cff_index(cff, charstrings_offset)?;
-    let glyph_count = charstrings.len();
-    let sids = parse_cff_charset(cff, charset_offset, glyph_count)?;
-    let mut map = Vec::new();
-    for (glyph_index, sid) in sids.into_iter().enumerate().skip(1) {
-        if let Some(unicode) = cff_sid_to_unicode(sid) {
-            map.push((unicode, glyph_index as u16));
+        push_u16(&mut subtable, seg_count_x2);
+        push_u16(&mut subtable, search_range);
+        push_u16(&mut subtable, entry_selector);
+        push_u16(&mut subtable, range_shift);
+        for (code, _) in &entries {
+            push_u16(&mut subtable, *code);
         }
-    }
-    let actual_count = u16::try_from(glyph_count).unwrap_or(u16::MAX);
-    Some((map, actual_count))
-}
+        push_u16(&mut subtable, 0xFFFF);
+        push_u16(&mut subtable, 0);
+        for (code, _) in &entries {
+            push_u16(&mut subtable, *code);
+        }
+        push_u16(&mut subtable, 0xFFFF);
+        for (code, glyph_id) in &entries {
+            push_i16(&mut subtable, (*glyph_id as i32 - *code as i32) as i16);
+        }
+        push_i16(&mut subtable, 1);
+        for _ in 0..seg_count {
+            push_u16(&mut subtable, 0);
+        }
 
-fn read_cff_index(data: &[u8], offset: usize) -> Option<(Vec<&[u8]>, usize)> {
-    let count = usize::from(read_u16(data, offset)?);
-    if count == 0 {
-        return Some((Vec::new(), offset + 2));
+        let mut table = Vec::new();
+        push_u16(&mut table, 0);
+        push_u16(&mut table, 1);
+        push_u16(&mut table, 3);
+        push_u16(&mut table, 1);
+        push_u32(&mut table, 12);
+        table.extend_from_slice(&subtable);
+        Some(table)
     }
-    let off_size = usize::from(*data.get(offset + 2)?);
-    let offsets_start = offset + 3;
-    let data_start = offsets_start + (count + 1) * off_size;
-    let mut offsets = Vec::new();
-    for index in 0..=count {
-        offsets.push(read_cff_offset(
-            data,
-            offsets_start + index * off_size,
-            off_size,
-        )?);
-    }
-    let mut objects = Vec::new();
-    for index in 0..count {
-        let start = data_start + offsets[index].saturating_sub(1);
-        let end = data_start + offsets[index + 1].saturating_sub(1);
-        objects.push(data.get(start..end)?);
-    }
-    let end = data_start + offsets[count].saturating_sub(1);
-    Some((objects, end))
-}
 
-fn read_cff_offset(data: &[u8], offset: usize, size: usize) -> Option<usize> {
-    let mut value = 0usize;
-    for byte in data.get(offset..offset + size)? {
-        value = (value << 8) | usize::from(*byte);
+    fn parse_cff_unicode_map(cff: &[u8]) -> Option<(Vec<(u16, u16)>, u16)> {
+        let header_size = usize::from(*cff.get(2)?);
+        let (_, name_end) = read_cff_index(cff, header_size)?;
+        let (top_dicts, top_end) = read_cff_index(cff, name_end)?;
+        let (_, string_end) = read_cff_index(cff, top_end)?;
+        let (_, _) = read_cff_index(cff, string_end)?;
+        let top_dict = top_dicts.first()?;
+        let top_values = parse_cff_top_dict(top_dict);
+        let charstrings_offset = usize::try_from(*top_values.get(&17)?).ok()?;
+        let charset_offset = usize::try_from(*top_values.get(&15).unwrap_or(&0)).ok()?;
+        let (charstrings, _) = read_cff_index(cff, charstrings_offset)?;
+        let glyph_count = charstrings.len();
+        let sids = parse_cff_charset(cff, charset_offset, glyph_count)?;
+        let mut map = Vec::new();
+        for (glyph_index, sid) in sids.into_iter().enumerate().skip(1) {
+            if let Some(unicode) = cff_sid_to_unicode(sid) {
+                map.push((unicode, glyph_index as u16));
+            }
+        }
+        let actual_count = u16::try_from(glyph_count).unwrap_or(u16::MAX);
+        Some((map, actual_count))
     }
-    Some(value)
-}
 
-fn parse_cff_top_dict(dict: &[u8]) -> HashMap<u16, i32> {
-    let mut values = HashMap::new();
-    let mut stack = Vec::new();
-    let mut index = 0usize;
-    while index < dict.len() {
-        let byte = dict[index];
-        match byte {
-            0..=21 => {
-                let operator = if byte == 12 {
+    fn read_cff_index(data: &[u8], offset: usize) -> Option<(Vec<&[u8]>, usize)> {
+        let count = usize::from(read_u16(data, offset)?);
+        if count == 0 {
+            return Some((Vec::new(), offset + 2));
+        }
+        let off_size = usize::from(*data.get(offset + 2)?);
+        let offsets_start = offset + 3;
+        let data_start = offsets_start + (count + 1) * off_size;
+        let mut offsets = Vec::new();
+        for index in 0..=count {
+            offsets.push(read_cff_offset(
+                data,
+                offsets_start + index * off_size,
+                off_size,
+            )?);
+        }
+        let mut objects = Vec::new();
+        for index in 0..count {
+            let start = data_start + offsets[index].saturating_sub(1);
+            let end = data_start + offsets[index + 1].saturating_sub(1);
+            objects.push(data.get(start..end)?);
+        }
+        let end = data_start + offsets[count].saturating_sub(1);
+        Some((objects, end))
+    }
+
+    fn read_cff_offset(data: &[u8], offset: usize, size: usize) -> Option<usize> {
+        let mut value = 0usize;
+        for byte in data.get(offset..offset + size)? {
+            value = (value << 8) | usize::from(*byte);
+        }
+        Some(value)
+    }
+
+    fn parse_cff_top_dict(dict: &[u8]) -> HashMap<u16, i32> {
+        let mut values = HashMap::new();
+        let mut stack = Vec::new();
+        let mut index = 0usize;
+        while index < dict.len() {
+            let byte = dict[index];
+            match byte {
+                0..=21 => {
+                    let operator = if byte == 12 {
+                        index += 1;
+                        1200 + u16::from(*dict.get(index).unwrap_or(&0))
+                    } else {
+                        u16::from(byte)
+                    };
+                    if let Some(value) = stack.last().copied() {
+                        values.insert(operator, value);
+                    }
+                    stack.clear();
                     index += 1;
-                    1200 + u16::from(*dict.get(index).unwrap_or(&0))
-                } else {
-                    u16::from(byte)
-                };
-                if let Some(value) = stack.last().copied() {
-                    values.insert(operator, value);
                 }
-                stack.clear();
-                index += 1;
-            }
-            28 => {
-                if index + 2 < dict.len() {
-                    stack.push(i16::from_be_bytes([dict[index + 1], dict[index + 2]]) as i32);
+                28 => {
+                    if index + 2 < dict.len() {
+                        stack.push(i16::from_be_bytes([dict[index + 1], dict[index + 2]]) as i32);
+                    }
+                    index += 3;
                 }
-                index += 3;
-            }
-            29 => {
-                if index + 4 < dict.len() {
-                    stack.push(i32::from_be_bytes([
-                        dict[index + 1],
-                        dict[index + 2],
-                        dict[index + 3],
-                        dict[index + 4],
-                    ]));
+                29 => {
+                    if index + 4 < dict.len() {
+                        stack.push(i32::from_be_bytes([
+                            dict[index + 1],
+                            dict[index + 2],
+                            dict[index + 3],
+                            dict[index + 4],
+                        ]));
+                    }
+                    index += 5;
                 }
-                index += 5;
-            }
-            32..=246 => {
-                stack.push(i32::from(byte) - 139);
-                index += 1;
-            }
-            247..=250 => {
-                if let Some(next) = dict.get(index + 1) {
-                    stack.push((i32::from(byte) - 247) * 256 + i32::from(*next) + 108);
+                32..=246 => {
+                    stack.push(i32::from(byte) - 139);
+                    index += 1;
                 }
-                index += 2;
-            }
-            251..=254 => {
-                if let Some(next) = dict.get(index + 1) {
-                    stack.push(-((i32::from(byte) - 251) * 256) - i32::from(*next) - 108);
+                247..=250 => {
+                    if let Some(next) = dict.get(index + 1) {
+                        stack.push((i32::from(byte) - 247) * 256 + i32::from(*next) + 108);
+                    }
+                    index += 2;
                 }
-                index += 2;
+                251..=254 => {
+                    if let Some(next) = dict.get(index + 1) {
+                        stack.push(-((i32::from(byte) - 251) * 256) - i32::from(*next) - 108);
+                    }
+                    index += 2;
+                }
+                _ => index += 1,
             }
-            _ => index += 1,
         }
+        values
     }
-    values
-}
 
-fn parse_cff_charset(cff: &[u8], offset: usize, glyph_count: usize) -> Option<Vec<u16>> {
-    if glyph_count == 0 {
-        return Some(Vec::new());
-    }
-    if offset == 0 {
-        return Some((0..glyph_count as u16).collect());
-    }
-    let format = *cff.get(offset)?;
-    let mut sids = vec![0u16];
-    let mut cursor = offset + 1;
-    match format {
-        0 => {
-            while sids.len() < glyph_count {
-                sids.push(read_u16(cff, cursor)?);
-                cursor += 2;
-            }
+    fn parse_cff_charset(cff: &[u8], offset: usize, glyph_count: usize) -> Option<Vec<u16>> {
+        if glyph_count == 0 {
+            return Some(Vec::new());
         }
-        1 => {
-            while sids.len() < glyph_count {
-                let first = read_u16(cff, cursor)?;
-                let n_left = u16::from(*cff.get(cursor + 2)?);
-                cursor += 3;
-                for sid in first..=first + n_left {
-                    sids.push(sid);
-                    if sids.len() == glyph_count {
-                        break;
+        if offset == 0 {
+            return Some((0..glyph_count as u16).collect());
+        }
+        let format = *cff.get(offset)?;
+        let mut sids = vec![0u16];
+        let mut cursor = offset + 1;
+        match format {
+            0 => {
+                while sids.len() < glyph_count {
+                    sids.push(read_u16(cff, cursor)?);
+                    cursor += 2;
+                }
+            }
+            1 => {
+                while sids.len() < glyph_count {
+                    let first = read_u16(cff, cursor)?;
+                    let n_left = u16::from(*cff.get(cursor + 2)?);
+                    cursor += 3;
+                    for sid in first..=first + n_left {
+                        sids.push(sid);
+                        if sids.len() == glyph_count {
+                            break;
+                        }
                     }
                 }
             }
-        }
-        2 => {
-            while sids.len() < glyph_count {
-                let first = read_u16(cff, cursor)?;
-                let n_left = read_u16(cff, cursor + 2)?;
-                cursor += 4;
-                for sid in first..=first + n_left {
-                    sids.push(sid);
-                    if sids.len() == glyph_count {
-                        break;
+            2 => {
+                while sids.len() < glyph_count {
+                    let first = read_u16(cff, cursor)?;
+                    let n_left = read_u16(cff, cursor + 2)?;
+                    cursor += 4;
+                    for sid in first..=first + n_left {
+                        sids.push(sid);
+                        if sids.len() == glyph_count {
+                            break;
+                        }
                     }
                 }
             }
+            _ => return None,
         }
-        _ => return None,
+        Some(sids)
     }
-    Some(sids)
-}
 
-fn cff_sid_to_unicode(sid: u16) -> Option<u16> {
-    // Standard CFF SID to Unicode mapping (Adobe standard encoding, SIDs 0–390)
-    match sid {
-        0 => Some(0x0000),   // .notdef
-        1 => Some(0x0020),   // space
-        2 => Some(0x0021),   // exclam
-        3 => Some(0x0022),   // quotedbl
-        4 => Some(0x0023),   // numbersign
-        5 => Some(0x0024),   // dollar
-        6 => Some(0x0025),   // percent
-        7 => Some(0x0026),   // ampersand
-        8 => Some(0x2019),   // quoteright
-        9 => Some(0x0028),   // parenleft
-        10 => Some(0x0029),  // parenright
-        11 => Some(0x002A),  // asterisk
-        12 => Some(0x002B),  // plus
-        13 => Some(0x002C),  // comma
-        14 => Some(0x002D),  // hyphen
-        15 => Some(0x002E),  // period
-        16 => Some(0x002F),  // slash
-        17..=26 => Some(0x30 + sid - 17), // zero..nine
-        27 => Some(0x003A),  // colon
-        28 => Some(0x003B),  // semicolon
-        29 => Some(0x003C),  // less
-        30 => Some(0x003D),  // equal
-        31 => Some(0x003E),  // greater
-        32 => Some(0x003F),  // question
-        33 => Some(0x0040),  // at
-        34..=59 => Some(0x41 + sid - 34), // A..Z
-        60 => Some(0x005B),  // bracketleft
-        61 => Some(0x005C),  // backslash
-        62 => Some(0x005D),  // bracketright
-        63 => Some(0x005E),  // asciicircum
-        64 => Some(0x005F),  // underscore
-        65 => Some(0x2018),  // quoteleft
-        66..=91 => Some(0x61 + sid - 66), // a..z
-        92 => Some(0x007B),  // braceleft
-        93 => Some(0x007C),  // bar
-        94 => Some(0x007D),  // braceright
-        95 => Some(0x007E),  // asciitilde
-        96 => Some(0x00A1),  // exclamdown
-        97 => Some(0x00A2),  // cent
-        98 => Some(0x00A3),  // sterling
-        99 => Some(0x2044),  // fraction
-        100 => Some(0x00A5), // yen
-        101 => Some(0x0192), // florin
-        102 => Some(0x00A7), // section
-        103 => Some(0x00A4), // currency
-        104 => Some(0x0027), // quotesingle
-        105 => Some(0x201C), // quotedblleft
-        106 => Some(0x00AB), // guillemotleft
-        107 => Some(0x2039), // guilsinglleft
-        108 => Some(0x203A), // guilsinglright
-        109 => Some(0xFB01), // fi
-        110 => Some(0xFB02), // fl
-        111 => Some(0x2013), // endash
-        112 => Some(0x2020), // dagger
-        113 => Some(0x2021), // daggerdbl
-        114 => Some(0x00B7), // periodcentered
-        115 => Some(0x00B6), // paragraph
-        116 => Some(0x2022), // bullet
-        117 => Some(0x201A), // quotesinglbase
-        118 => Some(0x201E), // quotedblbase
-        119 => Some(0x201D), // quotedblright
-        120 => Some(0x00BB), // guillemotright
-        121 => Some(0x2026), // ellipsis
-        122 => Some(0x2030), // perthousand
-        123 => Some(0x00BF), // questiondown
-        124 => Some(0x0060), // grave
-        125 => Some(0x00B4), // acute
-        126 => Some(0x02C6), // circumflex
-        127 => Some(0x02DC), // tilde
-        128 => Some(0x00AF), // macron
-        129 => Some(0x02D8), // breve
-        130 => Some(0x02D9), // dotaccent
-        131 => Some(0x00A8), // dieresis
-        132 => Some(0x02DA), // ring
-        133 => Some(0x00B8), // cedilla
-        134 => Some(0x02DD), // hungarumlaut
-        135 => Some(0x02DB), // ogonek
-        136 => Some(0x02C7), // caron
-        137 => Some(0x2014), // emdash
-        138 => Some(0x00C6), // AE
-        139 => Some(0x00AA), // ordfeminine
-        140 => Some(0x0141), // Lslash
-        141 => Some(0x00D8), // Oslash
-        142 => Some(0x0152), // OE
-        143 => Some(0x00BA), // ordmasculine
-        144 => Some(0x00E6), // ae
-        145 => Some(0x0131), // dotlessi
-        146 => Some(0x0142), // lslash
-        147 => Some(0x00F8), // oslash
-        148 => Some(0x0153), // oe
-        149 => Some(0x00DF), // germandbls
-        150 => Some(0x00C1), // Aacute
-        151 => Some(0x00C2), // Acircumflex
-        152 => Some(0x00C4), // Adieresis
-        153 => Some(0x00C0), // Agrave
-        154 => Some(0x00C5), // Aring
-        155 => Some(0x00C3), // Atilde
-        156 => Some(0x00C7), // Ccedilla
-        157 => Some(0x00C9), // Eacute
-        158 => Some(0x00CA), // Ecircumflex
-        159 => Some(0x00CB), // Edieresis
-        160 => Some(0x00C8), // Egrave
-        161 => Some(0x00CD), // Iacute
-        162 => Some(0x00CE), // Icircumflex
-        163 => Some(0x00CF), // Idieresis
-        164 => Some(0x00CC), // Igrave
-        165 => Some(0x00D1), // Ntilde
-        166 => Some(0x00D3), // Oacute
-        167 => Some(0x00D4), // Ocircumflex
-        168 => Some(0x00D6), // Odieresis
-        169 => Some(0x00D2), // Ograve
-        170 => Some(0x00D5), // Otilde
-        171 => Some(0x0160), // Scaron
-        172 => Some(0x00DA), // Uacute
-        173 => Some(0x00DB), // Ucircumflex
-        174 => Some(0x00DC), // Udieresis
-        175 => Some(0x00D9), // Ugrave
-        176 => Some(0x0178), // Ydieresis
-        177 => Some(0x017D), // Zcaron
-        178 => Some(0x00E1), // aacute
-        179 => Some(0x00E2), // acircumflex
-        180 => Some(0x00E4), // adieresis
-        181 => Some(0x00E0), // agrave
-        182 => Some(0x00E5), // aring
-        183 => Some(0x00E3), // atilde
-        184 => Some(0x00E7), // ccedilla
-        185 => Some(0x00E9), // eacute
-        186 => Some(0x00EA), // ecircumflex
-        187 => Some(0x00EB), // edieresis
-        188 => Some(0x00E8), // egrave
-        189 => Some(0x00ED), // iacute
-        190 => Some(0x00EE), // icircumflex
-        191 => Some(0x00EF), // idieresis
-        192 => Some(0x00EC), // igrave
-        193 => Some(0x00F1), // ntilde
-        194 => Some(0x00F3), // oacute
-        195 => Some(0x00F4), // ocircumflex
-        196 => Some(0x00F6), // odieresis
-        197 => Some(0x00F2), // ograve
-        198 => Some(0x00F5), // otilde
-        199 => Some(0x0161), // scaron
-        200 => Some(0x00FA), // uacute
-        201 => Some(0x00FB), // ucircumflex
-        202 => Some(0x00FC), // udieresis
-        203 => Some(0x00F9), // ugrave
-        204 => Some(0x00FF), // ydieresis
-        205 => Some(0x017E), // zcaron
-        206 => Some(0x00A0), // nbspace (non-breaking space)
-        207 => Some(0x00AC), // logicalnot
-        208 => Some(0x00A6), // brokenbar
-        209 => Some(0x00A9), // copyright
-        210 => Some(0x00AE), // registered
-        211 => Some(0x2122), // trademark
-        212 => Some(0x00B0), // degree
-        213 => Some(0x00B1), // plusminus
-        214 => Some(0x00B2), // twosuperior
-        215 => Some(0x00B3), // threesuperior
-        216 => Some(0x00D7), // multiply
-        217 => Some(0x00B9), // onesuperior
-        218 => Some(0x00F7), // divide
-        219 => Some(0x00BC), // onequarter
-        220 => Some(0x00BD), // onehalf
-        221 => Some(0x00BE), // threequarters
-        222 => Some(0x20AC), // Euro
-        _ => None,
+    fn cff_sid_to_unicode(sid: u16) -> Option<u16> {
+        // Standard CFF SID to Unicode mapping (Adobe standard encoding, SIDs 0–390)
+        match sid {
+            0 => Some(0x0000),                // .notdef
+            1 => Some(0x0020),                // space
+            2 => Some(0x0021),                // exclam
+            3 => Some(0x0022),                // quotedbl
+            4 => Some(0x0023),                // numbersign
+            5 => Some(0x0024),                // dollar
+            6 => Some(0x0025),                // percent
+            7 => Some(0x0026),                // ampersand
+            8 => Some(0x2019),                // quoteright
+            9 => Some(0x0028),                // parenleft
+            10 => Some(0x0029),               // parenright
+            11 => Some(0x002A),               // asterisk
+            12 => Some(0x002B),               // plus
+            13 => Some(0x002C),               // comma
+            14 => Some(0x002D),               // hyphen
+            15 => Some(0x002E),               // period
+            16 => Some(0x002F),               // slash
+            17..=26 => Some(0x30 + sid - 17), // zero..nine
+            27 => Some(0x003A),               // colon
+            28 => Some(0x003B),               // semicolon
+            29 => Some(0x003C),               // less
+            30 => Some(0x003D),               // equal
+            31 => Some(0x003E),               // greater
+            32 => Some(0x003F),               // question
+            33 => Some(0x0040),               // at
+            34..=59 => Some(0x41 + sid - 34), // A..Z
+            60 => Some(0x005B),               // bracketleft
+            61 => Some(0x005C),               // backslash
+            62 => Some(0x005D),               // bracketright
+            63 => Some(0x005E),               // asciicircum
+            64 => Some(0x005F),               // underscore
+            65 => Some(0x2018),               // quoteleft
+            66..=91 => Some(0x61 + sid - 66), // a..z
+            92 => Some(0x007B),               // braceleft
+            93 => Some(0x007C),               // bar
+            94 => Some(0x007D),               // braceright
+            95 => Some(0x007E),               // asciitilde
+            96 => Some(0x00A1),               // exclamdown
+            97 => Some(0x00A2),               // cent
+            98 => Some(0x00A3),               // sterling
+            99 => Some(0x2044),               // fraction
+            100 => Some(0x00A5),              // yen
+            101 => Some(0x0192),              // florin
+            102 => Some(0x00A7),              // section
+            103 => Some(0x00A4),              // currency
+            104 => Some(0x0027),              // quotesingle
+            105 => Some(0x201C),              // quotedblleft
+            106 => Some(0x00AB),              // guillemotleft
+            107 => Some(0x2039),              // guilsinglleft
+            108 => Some(0x203A),              // guilsinglright
+            109 => Some(0xFB01),              // fi
+            110 => Some(0xFB02),              // fl
+            111 => Some(0x2013),              // endash
+            112 => Some(0x2020),              // dagger
+            113 => Some(0x2021),              // daggerdbl
+            114 => Some(0x00B7),              // periodcentered
+            115 => Some(0x00B6),              // paragraph
+            116 => Some(0x2022),              // bullet
+            117 => Some(0x201A),              // quotesinglbase
+            118 => Some(0x201E),              // quotedblbase
+            119 => Some(0x201D),              // quotedblright
+            120 => Some(0x00BB),              // guillemotright
+            121 => Some(0x2026),              // ellipsis
+            122 => Some(0x2030),              // perthousand
+            123 => Some(0x00BF),              // questiondown
+            124 => Some(0x0060),              // grave
+            125 => Some(0x00B4),              // acute
+            126 => Some(0x02C6),              // circumflex
+            127 => Some(0x02DC),              // tilde
+            128 => Some(0x00AF),              // macron
+            129 => Some(0x02D8),              // breve
+            130 => Some(0x02D9),              // dotaccent
+            131 => Some(0x00A8),              // dieresis
+            132 => Some(0x02DA),              // ring
+            133 => Some(0x00B8),              // cedilla
+            134 => Some(0x02DD),              // hungarumlaut
+            135 => Some(0x02DB),              // ogonek
+            136 => Some(0x02C7),              // caron
+            137 => Some(0x2014),              // emdash
+            138 => Some(0x00C6),              // AE
+            139 => Some(0x00AA),              // ordfeminine
+            140 => Some(0x0141),              // Lslash
+            141 => Some(0x00D8),              // Oslash
+            142 => Some(0x0152),              // OE
+            143 => Some(0x00BA),              // ordmasculine
+            144 => Some(0x00E6),              // ae
+            145 => Some(0x0131),              // dotlessi
+            146 => Some(0x0142),              // lslash
+            147 => Some(0x00F8),              // oslash
+            148 => Some(0x0153),              // oe
+            149 => Some(0x00DF),              // germandbls
+            150 => Some(0x00C1),              // Aacute
+            151 => Some(0x00C2),              // Acircumflex
+            152 => Some(0x00C4),              // Adieresis
+            153 => Some(0x00C0),              // Agrave
+            154 => Some(0x00C5),              // Aring
+            155 => Some(0x00C3),              // Atilde
+            156 => Some(0x00C7),              // Ccedilla
+            157 => Some(0x00C9),              // Eacute
+            158 => Some(0x00CA),              // Ecircumflex
+            159 => Some(0x00CB),              // Edieresis
+            160 => Some(0x00C8),              // Egrave
+            161 => Some(0x00CD),              // Iacute
+            162 => Some(0x00CE),              // Icircumflex
+            163 => Some(0x00CF),              // Idieresis
+            164 => Some(0x00CC),              // Igrave
+            165 => Some(0x00D1),              // Ntilde
+            166 => Some(0x00D3),              // Oacute
+            167 => Some(0x00D4),              // Ocircumflex
+            168 => Some(0x00D6),              // Odieresis
+            169 => Some(0x00D2),              // Ograve
+            170 => Some(0x00D5),              // Otilde
+            171 => Some(0x0160),              // Scaron
+            172 => Some(0x00DA),              // Uacute
+            173 => Some(0x00DB),              // Ucircumflex
+            174 => Some(0x00DC),              // Udieresis
+            175 => Some(0x00D9),              // Ugrave
+            176 => Some(0x0178),              // Ydieresis
+            177 => Some(0x017D),              // Zcaron
+            178 => Some(0x00E1),              // aacute
+            179 => Some(0x00E2),              // acircumflex
+            180 => Some(0x00E4),              // adieresis
+            181 => Some(0x00E0),              // agrave
+            182 => Some(0x00E5),              // aring
+            183 => Some(0x00E3),              // atilde
+            184 => Some(0x00E7),              // ccedilla
+            185 => Some(0x00E9),              // eacute
+            186 => Some(0x00EA),              // ecircumflex
+            187 => Some(0x00EB),              // edieresis
+            188 => Some(0x00E8),              // egrave
+            189 => Some(0x00ED),              // iacute
+            190 => Some(0x00EE),              // icircumflex
+            191 => Some(0x00EF),              // idieresis
+            192 => Some(0x00EC),              // igrave
+            193 => Some(0x00F1),              // ntilde
+            194 => Some(0x00F3),              // oacute
+            195 => Some(0x00F4),              // ocircumflex
+            196 => Some(0x00F6),              // odieresis
+            197 => Some(0x00F2),              // ograve
+            198 => Some(0x00F5),              // otilde
+            199 => Some(0x0161),              // scaron
+            200 => Some(0x00FA),              // uacute
+            201 => Some(0x00FB),              // ucircumflex
+            202 => Some(0x00FC),              // udieresis
+            203 => Some(0x00F9),              // ugrave
+            204 => Some(0x00FF),              // ydieresis
+            205 => Some(0x017E),              // zcaron
+            206 => Some(0x00A0),              // nbspace (non-breaking space)
+            207 => Some(0x00AC),              // logicalnot
+            208 => Some(0x00A6),              // brokenbar
+            209 => Some(0x00A9),              // copyright
+            210 => Some(0x00AE),              // registered
+            211 => Some(0x2122),              // trademark
+            212 => Some(0x00B0),              // degree
+            213 => Some(0x00B1),              // plusminus
+            214 => Some(0x00B2),              // twosuperior
+            215 => Some(0x00B3),              // threesuperior
+            216 => Some(0x00D7),              // multiply
+            217 => Some(0x00B9),              // onesuperior
+            218 => Some(0x00F7),              // divide
+            219 => Some(0x00BC),              // onequarter
+            220 => Some(0x00BD),              // onehalf
+            221 => Some(0x00BE),              // threequarters
+            222 => Some(0x20AC),              // Euro
+            _ => None,
+        }
     }
-}
 
-fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([
-        *data.get(offset)?,
-        *data.get(offset + 1)?,
-    ]))
-}
-
-fn table_checksum(data: &[u8]) -> u32 {
-    let mut sum = 0u32;
-    for chunk in data.chunks(4) {
-        let mut word = [0u8; 4];
-        word[..chunk.len()].copy_from_slice(chunk);
-        sum = sum.wrapping_add(u32::from_be_bytes(word));
+    fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_be_bytes([
+            *data.get(offset)?,
+            *data.get(offset + 1)?,
+        ]))
     }
-    sum
-}
 
-fn push_u16(output: &mut Vec<u8>, value: u16) {
-    output.extend_from_slice(&value.to_be_bytes());
-}
+    fn table_checksum(data: &[u8]) -> u32 {
+        let mut sum = 0u32;
+        for chunk in data.chunks(4) {
+            let mut word = [0u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            sum = sum.wrapping_add(u32::from_be_bytes(word));
+        }
+        sum
+    }
 
-fn push_i16(output: &mut Vec<u8>, value: i16) {
-    output.extend_from_slice(&value.to_be_bytes());
-}
+    fn push_u16(output: &mut Vec<u8>, value: u16) {
+        output.extend_from_slice(&value.to_be_bytes());
+    }
 
-fn push_u32(output: &mut Vec<u8>, value: u32) {
-    output.extend_from_slice(&value.to_be_bytes());
+    fn push_i16(output: &mut Vec<u8>, value: i16) {
+        output.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn push_u32(output: &mut Vec<u8>, value: u32) {
+        output.extend_from_slice(&value.to_be_bytes());
+    }
 }
 
 fn font_family_name(document: &Document, font: &Dictionary, resource_name: &str) -> String {
@@ -2974,6 +3592,13 @@ fn dictionary_from_object<'a>(
 ) -> Option<&'a Dictionary> {
     match object {
         Object::Reference(id) => document.get_dictionary(*id).ok(),
+        Object::Dictionary(dictionary) => Some(dictionary),
+        _ => None,
+    }
+}
+
+fn dictionary_from_inline_object(object: &Object) -> Option<&Dictionary> {
+    match object {
         Object::Dictionary(dictionary) => Some(dictionary),
         _ => None,
     }
@@ -3033,13 +3658,15 @@ struct ToUnicodeMap {
 
 impl ToUnicodeMap {
     fn insert(&mut self, source: Vec<u8>, target: String) {
-        if source.is_empty() || target.is_empty() {
+        if source.is_empty() {
             return;
         }
         self.max_code_len = self.max_code_len.max(source.len());
-        self.reverse
-            .entry(target.clone())
-            .or_insert_with(|| source.clone());
+        if !target.is_empty() {
+            self.reverse
+                .entry(target.clone())
+                .or_insert_with(|| source.clone());
+        }
         self.forward.insert(source, target);
     }
 
@@ -3081,7 +3708,10 @@ impl ToUnicodeMap {
 fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUnicodeMap> {
     if let Ok(to_unicode) = font.get(b"ToUnicode") {
         if let Some(stream) = match to_unicode {
-            Object::Reference(id) => document.get_object(*id).ok().and_then(|o| o.as_stream().ok()),
+            Object::Reference(id) => document
+                .get_object(*id)
+                .ok()
+                .and_then(|o| o.as_stream().ok()),
             Object::Stream(s) => Some(s),
             _ => None,
         } {
@@ -3126,33 +3756,33 @@ fn win_ansi_to_unicode(code: u8) -> Option<u16> {
         return Some(code as u16);
     }
     match code {
-        128 => Some(0x20AC), // Euro
-        130 => Some(0x201A), // quotesinglbase
-        131 => Some(0x0192), // florin
-        132 => Some(0x201E), // quotedblbase
-        133 => Some(0x2026), // ellipsis
-        134 => Some(0x2020), // dagger
-        135 => Some(0x2021), // daggerdbl
-        136 => Some(0x02C6), // circumflex
-        137 => Some(0x2030), // perthousand
-        138 => Some(0x0160), // Scaron
-        139 => Some(0x2039), // guilsinglleft
-        140 => Some(0x0152), // OE
-        142 => Some(0x017D), // Zcaron
-        145 => Some(0x2018), // quoteleft
-        146 => Some(0x2019), // quoteright
-        147 => Some(0x201C), // quotedblleft
-        148 => Some(0x201D), // quotedblright
-        149 => Some(0x2022), // bullet
-        150 => Some(0x2013), // endash
-        151 => Some(0x2014), // emdash
-        152 => Some(0x02DC), // tilde
-        153 => Some(0x2122), // trademark
-        154 => Some(0x0161), // scaron
-        155 => Some(0x203A), // guilsinglright
-        156 => Some(0x0153), // oe
-        158 => Some(0x017E), // zcaron
-        159 => Some(0x0178), // Ydieresis
+        128 => Some(0x20AC),            // Euro
+        130 => Some(0x201A),            // quotesinglbase
+        131 => Some(0x0192),            // florin
+        132 => Some(0x201E),            // quotedblbase
+        133 => Some(0x2026),            // ellipsis
+        134 => Some(0x2020),            // dagger
+        135 => Some(0x2021),            // daggerdbl
+        136 => Some(0x02C6),            // circumflex
+        137 => Some(0x2030),            // perthousand
+        138 => Some(0x0160),            // Scaron
+        139 => Some(0x2039),            // guilsinglleft
+        140 => Some(0x0152),            // OE
+        142 => Some(0x017D),            // Zcaron
+        145 => Some(0x2018),            // quoteleft
+        146 => Some(0x2019),            // quoteright
+        147 => Some(0x201C),            // quotedblleft
+        148 => Some(0x201D),            // quotedblright
+        149 => Some(0x2022),            // bullet
+        150 => Some(0x2013),            // endash
+        151 => Some(0x2014),            // emdash
+        152 => Some(0x02DC),            // tilde
+        153 => Some(0x2122),            // trademark
+        154 => Some(0x0161),            // scaron
+        155 => Some(0x203A),            // guilsinglright
+        156 => Some(0x0153),            // oe
+        158 => Some(0x017E),            // zcaron
+        159 => Some(0x0178),            // Ydieresis
         160..=255 => Some(code as u16), // ISO-8859-1
         _ => None,
     }
@@ -3283,7 +3913,14 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
 }
 
 fn utf16be_to_string(bytes: &[u8]) -> String {
-    String::from_utf16_lossy(&bytes_to_u16_units(bytes))
+    sanitize_cmap_unicode(&String::from_utf16_lossy(&bytes_to_u16_units(bytes)))
+}
+
+fn sanitize_cmap_unicode(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !matches!(character, '\0' | '\u{0001}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}' | '\u{007F}'))
+        .collect()
 }
 
 fn bytes_to_u16_units(bytes: &[u8]) -> Vec<u16> {

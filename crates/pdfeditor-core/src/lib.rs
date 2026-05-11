@@ -22,15 +22,17 @@ pub use engine::{EngineDocument, MockPdfEngine, PdfEngine};
 pub use error::{CoreError, CoreResult};
 pub use lopdf_backend::{
     open_lopdf_document_from_bytes, page_background_png_from_pdf_bytes,
-    page_font_assets_from_pdf_bytes, page_image_png_from_pdf_bytes, page_structure_from_pdf_bytes,
-    save_pdf_document_to_bytes, write_pdf_background_png, write_pdf_page_images,
-    BackgroundBitmapReport, BackgroundRenderOptions, LopdfEngine, PageFontAsset,
-    PageImageBytesExport, PageImageExport,
+    page_font_assets_from_pdf_bytes, page_image_png_from_pdf_bytes,
+    page_load_bundle_from_pdf_bytes, page_structure_from_pdf_bytes, save_pdf_document_to_bytes,
+    write_pdf_background_png, write_pdf_page_images, BackgroundBitmapReport,
+    BackgroundRenderOptions, LopdfEngine, PageFontAsset, PageImageBytesExport, PageImageExport,
+    PageLoadBundle,
 };
 pub use page_writer::write_page_structure_pdf;
 pub use resource::ResourceBudget;
 pub use types::{
     BookmarkItem, Color, ImageObject, ImageObjectId, PageIndex, PageInfo, PageStructure,
     PdfObjectId, Point, Rect, RenderedPage, Size, StructuredAnnotation, StructuredImageObject,
-    StructuredTextObject, StructuredWatermark, TextObject, TextObjectId, TextRun,
+    StructuredTextObject, StructuredVisualTextObject, StructuredWatermark, TextObject,
+    TextObjectId, TextRun,
 };

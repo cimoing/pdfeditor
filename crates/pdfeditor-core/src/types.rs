@@ -140,6 +140,8 @@ pub struct RenderedPage {
 pub struct PageStructure {
     pub page: PageInfo,
     pub text: Vec<StructuredTextObject>,
+    #[serde(default)]
+    pub visual_text: Vec<StructuredVisualTextObject>,
     pub images: Vec<StructuredImageObject>,
     pub watermarks: Vec<StructuredWatermark>,
     pub annotations: Vec<StructuredAnnotation>,
@@ -158,6 +160,17 @@ pub struct StructuredTextObject {
     pub angle_degrees: f32,
     pub z_index: usize,
     pub runs: Vec<TextRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct StructuredVisualTextObject {
+    pub id: TextObjectId,
+    pub bounds: Rect,
+    pub font_name: Option<String>,
+    pub font_size: f32,
+    pub transform: [f32; 6],
+    pub angle_degrees: f32,
+    pub z_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
