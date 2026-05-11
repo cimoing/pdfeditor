@@ -1,5 +1,7 @@
 use pdfeditor_core::{
-    CoreError, DocumentSession, LopdfEngine, OpenOptions, PageIndex, Rect, SaveOptions,
+    write_page_structure_pdf, write_pdf_background_png, write_pdf_page_images,
+    BackgroundRenderOptions, CoreError, DocumentSession, LopdfEngine, OpenOptions, PageIndex,
+    PageStructure, Rect, SaveOptions,
 };
 use std::env;
 use std::ffi::OsString;
@@ -17,6 +19,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(CommandReport::DumpText) => ExitCode::SUCCESS,
+        Ok(CommandReport::PageJson) => ExitCode::SUCCESS,
+        Ok(CommandReport::JsonPage(report)) => {
+            println!("Wrote {}", report.output.display());
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             eprintln!("{error}");
             ExitCode::FAILURE
@@ -46,6 +53,8 @@ struct ReplaceReport {
 enum CommandReport {
     Replace(ReplaceReport),
     DumpText,
+    PageJson,
+    JsonPage(JsonPageReport),
 }
 
 fn run<I>(args: I) -> Result<CommandReport, String>
@@ -60,6 +69,13 @@ where
             dump_pdf_text(&args).map_err(|error| error.to_string())?;
             Ok(CommandReport::DumpText)
         }
+        CommandArgs::PageJson(args) => {
+            page_to_json(&args).map_err(|error| error.to_string())?;
+            Ok(CommandReport::PageJson)
+        }
+        CommandArgs::JsonPage(args) => json_to_page(&args)
+            .map(CommandReport::JsonPage)
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -68,10 +84,32 @@ struct DumpTextArgs {
     file: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageJsonArgs {
+    file: PathBuf,
+    page: PageIndex,
+    output: Option<PathBuf>,
+    bitmap_dir: Option<PathBuf>,
+    bitmap_width: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonPageArgs {
+    file: PathBuf,
+    output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonPageReport {
+    output: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum CommandArgs {
     Replace(ReplaceArgs),
     DumpText(DumpTextArgs),
+    PageJson(PageJsonArgs),
+    JsonPage(JsonPageArgs),
 }
 
 fn parse_args<I>(args: I) -> Result<CommandArgs, String>
@@ -87,6 +125,8 @@ where
     match command.to_string_lossy().as_ref() {
         "replace" => parse_replace_args(program, args),
         "dump-text" => parse_dump_text_args(program, args),
+        "page-json" => parse_page_json_args(program, args),
+        "json-page" | "json-to-page" => parse_json_page_args(program, args),
         _ => Err(usage(&program)),
     }
 }
@@ -165,6 +205,77 @@ where
 
     Ok(CommandArgs::DumpText(DumpTextArgs {
         file: file.ok_or_else(|| "--file is required".to_string())?,
+    }))
+}
+
+fn parse_page_json_args<I>(program: OsString, args: I) -> Result<CommandArgs, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut file = None;
+    let mut page = PageIndex(0);
+    let mut output = None;
+    let mut bitmap_dir = None;
+    let mut bitmap_width = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.to_string_lossy().as_ref() {
+            "--file" | "-f" => file = Some(next_path(&mut args, "--file")?),
+            "--page" | "-p" => {
+                let value = next_string(&mut args, "--page")?;
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| "--page must be a positive page number".to_string())?;
+                if parsed == 0 {
+                    return Err("--page is 1-based and must be greater than 0".to_string());
+                }
+                page = PageIndex(parsed - 1);
+            }
+            "--output" | "-o" => output = Some(next_path(&mut args, "--output")?),
+            "--bitmap-dir" => bitmap_dir = Some(next_path(&mut args, "--bitmap-dir")?),
+            "--bitmap-width" => {
+                let value = next_string(&mut args, "--bitmap-width")?;
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| "--bitmap-width must be a positive integer".to_string())?;
+                if parsed == 0 {
+                    return Err("--bitmap-width must be positive".to_string());
+                }
+                bitmap_width = Some(parsed);
+            }
+            "--help" | "-h" => return Err(usage(&program)),
+            other => return Err(format!("unknown argument: {other}\n\n{}", usage(&program))),
+        }
+    }
+
+    Ok(CommandArgs::PageJson(PageJsonArgs {
+        file: file.ok_or_else(|| "--file is required".to_string())?,
+        page,
+        output,
+        bitmap_dir,
+        bitmap_width,
+    }))
+}
+
+fn parse_json_page_args<I>(program: OsString, args: I) -> Result<CommandArgs, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut file = None;
+    let mut output = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.to_string_lossy().as_ref() {
+            "--file" | "-f" => file = Some(next_path(&mut args, "--file")?),
+            "--output" | "-o" => output = Some(next_path(&mut args, "--output")?),
+            "--help" | "-h" => return Err(usage(&program)),
+            other => return Err(format!("unknown argument: {other}\n\n{}", usage(&program))),
+        }
+    }
+
+    Ok(CommandArgs::JsonPage(JsonPageArgs {
+        file: file.ok_or_else(|| "--file is required".to_string())?,
+        output: output.ok_or_else(|| "--output is required".to_string())?,
     }))
 }
 
@@ -423,6 +534,73 @@ fn dump_pdf_text(args: &DumpTextArgs) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn page_to_json(args: &PageJsonArgs) -> Result<(), CoreError> {
+    let engine = LopdfEngine;
+    let session = DocumentSession::open(&engine, &args.file, OpenOptions::default())?;
+    let mut structure = session.page_structure(args.page)?;
+    if let Some(bitmap_dir) = &args.bitmap_dir {
+        write_page_background_bitmap(args, bitmap_dir, &structure)?;
+        write_page_image_objects(args, bitmap_dir, &mut structure)?;
+    }
+    let json = serde_json::to_string_pretty(&structure)
+        .map_err(|error| CoreError::Engine(format!("failed to serialize page JSON: {error}")))?;
+    if let Some(output) = &args.output {
+        std::fs::write(output, json)?;
+    } else {
+        println!("{json}");
+    }
+    Ok(())
+}
+
+fn write_page_background_bitmap(
+    args: &PageJsonArgs,
+    bitmap_dir: &Path,
+    _structure: &PageStructure,
+) -> Result<(), CoreError> {
+    std::fs::create_dir_all(bitmap_dir)?;
+    if args.bitmap_width.is_some() {
+        eprintln!(
+            "--bitmap-width is ignored because background PNG dimensions must match page.size"
+        );
+    }
+    let output = bitmap_dir.join(format!("{}.png", args.page.0 + 1));
+    write_pdf_background_png(
+        &args.file,
+        args.page,
+        output,
+        BackgroundRenderOptions::default(),
+    )?;
+    Ok(())
+}
+
+fn write_page_image_objects(
+    args: &PageJsonArgs,
+    bitmap_dir: &Path,
+    structure: &mut PageStructure,
+) -> Result<(), CoreError> {
+    let exported = write_pdf_page_images(&args.file, args.page, bitmap_dir)?;
+    for image in &mut structure.images {
+        if let Some(export) = exported.iter().find(|export| export.id == image.id) {
+            image.source_file = Some(export.file_name.clone());
+        }
+    }
+    Ok(())
+}
+
+fn json_to_page(args: &JsonPageArgs) -> Result<JsonPageReport, CoreError> {
+    let json = std::fs::read_to_string(&args.file)?;
+    let mut structure: PageStructure = serde_json::from_str(&json)
+        .map_err(|error| CoreError::InvalidOperation(format!("invalid page JSON: {error}")))?;
+    structure.page.index = PageIndex(0);
+    for bookmark in &mut structure.bookmarks {
+        bookmark.page = Some(PageIndex(0));
+    }
+    write_page_structure_pdf(&structure, &args.output)?;
+    Ok(JsonPageReport {
+        output: args.output.clone(),
+    })
+}
+
 fn output_path(args: &ReplaceArgs) -> PathBuf {
     if args.in_place {
         return args.file.clone();
@@ -464,7 +642,10 @@ where
 
 fn usage(program: &OsString) -> String {
     format!(
-        "Usage:\n  {} replace --file <input.pdf> --find <text> --replace <text> [--count <n>] [--bounds x,y,width,height] [--allow-overflow] [--output <output.pdf> | --in-place]",
+        "Usage:\n  {} replace --file <input.pdf> --find <text> --replace <text> [--count <n>] [--bounds x,y,width,height] [--allow-overflow] [--output <output.pdf> | --in-place]\n  {} dump-text --file <input.pdf>\n  {} page-json --file <input.pdf> [--page <1-based-page>] [--output <page.json>] [--bitmap-dir <dir>] [--bitmap-width <px>]\n  {} json-page --file <page.json> --output <single-page.pdf>",
+        Path::new(program).display(),
+        Path::new(program).display(),
+        Path::new(program).display(),
         Path::new(program).display()
     )
 }
@@ -502,6 +683,55 @@ mod tests {
         assert_eq!(args.count, Some(2));
         assert!(args.allow_overflow);
         assert_eq!(args.bounds, Some(Rect::new(1.0, 2.0, 300.0, 40.0)));
+    }
+
+    #[test]
+    fn parses_page_json_args() {
+        let args = parse_args([
+            OsString::from("pdfeditor"),
+            OsString::from("page-json"),
+            OsString::from("--file"),
+            OsString::from("a.pdf"),
+            OsString::from("--page"),
+            OsString::from("2"),
+            OsString::from("--output"),
+            OsString::from("page.json"),
+            OsString::from("--bitmap-dir"),
+            OsString::from("bitmaps"),
+            OsString::from("--bitmap-width"),
+            OsString::from("600"),
+        ])
+        .unwrap();
+
+        let CommandArgs::PageJson(args) = args else {
+            panic!("expected page-json args");
+        };
+
+        assert_eq!(args.file, PathBuf::from("a.pdf"));
+        assert_eq!(args.page, PageIndex(1));
+        assert_eq!(args.output, Some(PathBuf::from("page.json")));
+        assert_eq!(args.bitmap_dir, Some(PathBuf::from("bitmaps")));
+        assert_eq!(args.bitmap_width, Some(600));
+    }
+
+    #[test]
+    fn parses_json_page_args() {
+        let args = parse_args([
+            OsString::from("pdfeditor"),
+            OsString::from("json-page"),
+            OsString::from("--file"),
+            OsString::from("page.json"),
+            OsString::from("--output"),
+            OsString::from("page.pdf"),
+        ])
+        .unwrap();
+
+        let CommandArgs::JsonPage(args) = args else {
+            panic!("expected json-page args");
+        };
+
+        assert_eq!(args.file, PathBuf::from("page.json"));
+        assert_eq!(args.output, PathBuf::from("page.pdf"));
     }
 
     #[test]

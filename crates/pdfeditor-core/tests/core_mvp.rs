@@ -1,8 +1,10 @@
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream, StringFormat};
 use pdfeditor_core::{
-    Color, DocumentSession, LopdfEngine, MockPdfEngine, OpenOptions, PageBitmapCache, PageIndex,
-    Point, Rect, RenderedPage, ResourceBudget, SaveOptions, TextRun, TextStyle,
+    write_page_structure_pdf, write_pdf_background_png, write_pdf_page_images,
+    BackgroundRenderOptions, Color, DocumentSession, LopdfEngine, MockPdfEngine, OpenOptions,
+    PageBitmapCache, PageIndex, PageInfo, PageStructure, Point, Rect, RenderedPage, ResourceBudget,
+    SaveOptions, Size, StructuredTextObject, TextRun, TextStyle,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -317,6 +319,197 @@ fn lopdf_backend_decodes_to_unicode_cmap_and_replaces_text() {
     assert!(!texts.iter().any(|object| object.content == "24.8"));
 }
 
+#[test]
+fn lopdf_backend_structures_page_content_for_json_export() {
+    let source = write_lopdf_text_pdf("lopdf-page-json", "Hello");
+    let engine = LopdfEngine;
+    let session = DocumentSession::open(&engine, &source, OpenOptions::default()).unwrap();
+
+    let structure = session.page_structure(PageIndex(0)).unwrap();
+
+    assert_eq!(structure.page.index, PageIndex(0));
+    assert_eq!(structure.text.len(), 1);
+    assert_eq!(structure.text[0].content, "Hello");
+    assert_eq!(structure.text[0].font_name.as_deref(), Some("F1"));
+    assert_eq!(structure.text[0].font_size, 12.0);
+    assert_eq!(structure.text[0].angle_degrees, 0.0);
+    assert!(structure.annotations.is_empty());
+    assert!(structure.bookmarks.is_empty());
+}
+
+#[test]
+fn lopdf_backend_writes_basic_background_png() {
+    let source = write_lopdf_background_pdf("lopdf-background");
+    let target = temp_path("lopdf-background", "png");
+
+    let report = write_pdf_background_png(
+        &source,
+        PageIndex(0),
+        &target,
+        BackgroundRenderOptions {
+            scale: 1.0,
+            max_pixels: 1_000_000,
+        },
+    )
+    .unwrap();
+
+    let bytes = fs::read(&target).unwrap();
+    assert_eq!(report.width_px, 200);
+    assert_eq!(report.height_px, 200);
+    assert!(report.drawn_operations >= 2);
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+}
+
+#[test]
+fn lopdf_backend_exports_image_xobject_separately_from_background_png() {
+    let source = write_lopdf_image_background_pdf("lopdf-image-background");
+    let background = temp_path("lopdf-image-background", "png");
+    let image_dir = temp_dir("lopdf-image-background-images");
+
+    let report = write_pdf_background_png(
+        &source,
+        PageIndex(0),
+        &background,
+        BackgroundRenderOptions {
+            scale: 1.0,
+            max_pixels: 1_000_000,
+        },
+    )
+    .unwrap();
+    let images = write_pdf_page_images(&source, PageIndex(0), &image_dir).unwrap();
+
+    let bytes = fs::read(&background).unwrap();
+    assert_eq!(report.width_px, 200);
+    assert_eq!(report.height_px, 200);
+    assert_eq!(report.drawn_operations, 0);
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(images.len(), 1);
+    assert!(images[0].file_name.ends_with(".image.png"));
+    assert!(image_dir.join(&images[0].file_name).exists());
+}
+
+#[test]
+fn lopdf_backend_applies_image_soft_mask_to_exported_image_png() {
+    let source = write_lopdf_smask_image_background_pdf("lopdf-smask-image-background");
+    let background = temp_path("lopdf-smask-image-background", "png");
+    let image_dir = temp_dir("lopdf-smask-image-background-images");
+
+    let report = write_pdf_background_png(
+        &source,
+        PageIndex(0),
+        &background,
+        BackgroundRenderOptions {
+            scale: 1.0,
+            max_pixels: 1_000_000,
+        },
+    )
+    .unwrap();
+    let images = write_pdf_page_images(&source, PageIndex(0), &image_dir).unwrap();
+    let image_path = image_dir.join(&images[0].file_name);
+
+    let bytes = fs::read(&background).unwrap();
+    let pixmap = tiny_skia::Pixmap::load_png(&image_path).unwrap();
+    let transparent_corner = pixmap.pixel(0, 0).unwrap();
+    let opaque_corner = pixmap.pixel(1, 0).unwrap();
+    assert_eq!(report.drawn_operations, 0);
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(transparent_corner.alpha(), 0);
+    assert_eq!(opaque_corner.alpha(), 255);
+    assert!(opaque_corner.red() > opaque_corner.green());
+}
+
+#[test]
+fn lopdf_backend_applies_dct_image_soft_mask_to_background_png() {
+    let source = write_lopdf_dct_smask_image_background_pdf("lopdf-dct-smask-image-background");
+    let image_dir = temp_dir("lopdf-dct-smask-image-background-images");
+
+    let images = write_pdf_page_images(&source, PageIndex(0), &image_dir).unwrap();
+
+    let pixmap = tiny_skia::Pixmap::load_png(image_dir.join(&images[0].file_name)).unwrap();
+    let transparent_corner = pixmap.pixel(0, 0).unwrap();
+    assert_eq!(transparent_corner.alpha(), 0);
+}
+
+#[test]
+fn writes_single_page_pdf_from_page_structure() {
+    let target = temp_path("json-to-page", "pdf");
+    let structure = PageStructure {
+        page: PageInfo {
+            index: PageIndex(42),
+            size: Size::new(300.0, 300.0),
+        },
+        text: vec![StructuredTextObject {
+            id: pdfeditor_core::TextObjectId(pdfeditor_core::PdfObjectId(1)),
+            bounds: Rect::new(72.0, 72.0, 120.0, 20.0),
+            content: "Hello JSON".to_string(),
+            font_name: Some("Helvetica".to_string()),
+            font_size: 12.0,
+            color: Color::BLACK,
+            transform: [12.0, 0.0, 0.0, 12.0, 72.0, 72.0],
+            angle_degrees: 0.0,
+            z_index: 0,
+            runs: Vec::new(),
+        }],
+        images: Vec::new(),
+        watermarks: Vec::new(),
+        annotations: Vec::new(),
+        bookmarks: Vec::new(),
+    };
+
+    write_page_structure_pdf(&structure, &target).unwrap();
+
+    let engine = LopdfEngine;
+    let session = DocumentSession::open(&engine, &target, OpenOptions::default()).unwrap();
+    assert_eq!(session.page_count(), 1);
+    assert_eq!(
+        session.page_info(PageIndex(0)).unwrap().size,
+        Size::new(300.0, 300.0)
+    );
+    assert!(session
+        .text_objects(PageIndex(0))
+        .unwrap()
+        .iter()
+        .any(|object| object.content == "Hello JSON"));
+}
+
+#[test]
+fn writes_single_page_pdf_from_page_structure_with_chinese_text() {
+    let target = temp_path("json-to-page-chinese", "pdf");
+    let structure = PageStructure {
+        page: PageInfo {
+            index: PageIndex(0),
+            size: Size::new(300.0, 300.0),
+        },
+        text: vec![StructuredTextObject {
+            id: pdfeditor_core::TextObjectId(pdfeditor_core::PdfObjectId(1)),
+            bounds: Rect::new(72.0, 120.0, 160.0, 24.0),
+            content: "你好，PDF".to_string(),
+            font_name: Some("STSong-Light".to_string()),
+            font_size: 14.0,
+            color: Color::BLACK,
+            transform: [14.0, 0.0, 0.0, 14.0, 72.0, 120.0],
+            angle_degrees: 0.0,
+            z_index: 0,
+            runs: Vec::new(),
+        }],
+        images: Vec::new(),
+        watermarks: Vec::new(),
+        annotations: Vec::new(),
+        bookmarks: Vec::new(),
+    };
+
+    write_page_structure_pdf(&structure, &target).unwrap();
+
+    let engine = LopdfEngine;
+    let session = DocumentSession::open(&engine, &target, OpenOptions::default()).unwrap();
+    assert_eq!(session.page_count(), 1);
+    assert!(session
+        .text_objects(PageIndex(0))
+        .unwrap()
+        .iter()
+        .any(|object| object.content == "你好，PDF"));
+}
+
 fn rendered(page: PageIndex, byte_len: usize) -> RenderedPage {
     RenderedPage {
         page,
@@ -344,6 +537,307 @@ endobj
 %%EOF",
     )
     .unwrap();
+    path
+}
+
+fn write_lopdf_background_pdf(name: &str) -> PathBuf {
+    let path = temp_path(name, "pdf");
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let content = Content {
+        operations: vec![
+            Operation::new(
+                "rg",
+                vec![Object::Real(0.9), Object::Real(0.9), Object::Real(0.9)],
+            ),
+            Operation::new(
+                "re",
+                vec![
+                    Object::Integer(20),
+                    Object::Integer(20),
+                    Object::Integer(80),
+                    Object::Integer(40),
+                ],
+            ),
+            Operation::new("f", vec![]),
+            Operation::new("w", vec![Object::Integer(2)]),
+            Operation::new(
+                "RG",
+                vec![Object::Real(0.1), Object::Real(0.2), Object::Real(0.8)],
+            ),
+            Operation::new("m", vec![Object::Integer(20), Object::Integer(120)]),
+            Operation::new("l", vec![Object::Integer(180), Object::Integer(120)]),
+            Operation::new("S", vec![]),
+        ],
+    };
+    let content_id = document.add_object(Stream::new(
+        dictionary! {},
+        content.encode().expect("encode PDF content stream"),
+    ));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(200), Object::Integer(200)],
+    });
+    document.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    document.compress();
+    document.save(&path).expect("save generated PDF");
+    path
+}
+
+fn write_lopdf_image_background_pdf(name: &str) -> PathBuf {
+    let path = temp_path(name, "pdf");
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let image_id = document.add_object(Stream::new(
+        dictionary! {
+            "Type" => Object::Name(b"XObject".to_vec()),
+            "Subtype" => Object::Name(b"Image".to_vec()),
+            "Width" => 2,
+            "Height" => 2,
+            "ColorSpace" => Object::Name(b"DeviceRGB".to_vec()),
+            "BitsPerComponent" => 8,
+        },
+        vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0],
+    ));
+    let resources_id = document.add_object(dictionary! {
+        "XObject" => dictionary! {
+            "Im1" => image_id,
+        },
+    });
+    let content = Content {
+        operations: vec![
+            Operation::new("q", vec![]),
+            Operation::new(
+                "cm",
+                vec![
+                    Object::Integer(80),
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(80),
+                    Object::Integer(40),
+                    Object::Integer(40),
+                ],
+            ),
+            Operation::new("Do", vec![Object::Name(b"Im1".to_vec())]),
+            Operation::new("Q", vec![]),
+        ],
+    };
+    let content_id = document.add_object(Stream::new(
+        dictionary! {},
+        content.encode().expect("encode PDF content stream"),
+    ));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(200), Object::Integer(200)],
+    });
+    document.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    document.compress();
+    document.save(&path).expect("save generated PDF");
+    path
+}
+
+fn write_lopdf_smask_image_background_pdf(name: &str) -> PathBuf {
+    let path = temp_path(name, "pdf");
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let smask_id = document.add_object(Stream::new(
+        dictionary! {
+            "Type" => Object::Name(b"XObject".to_vec()),
+            "Subtype" => Object::Name(b"Image".to_vec()),
+            "Width" => 2,
+            "Height" => 2,
+            "ColorSpace" => Object::Name(b"DeviceGray".to_vec()),
+            "BitsPerComponent" => 8,
+            "Matte" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(0)],
+        },
+        vec![0, 255, 255, 0],
+    ));
+    let image_id = document.add_object(Stream::new(
+        dictionary! {
+            "Type" => Object::Name(b"XObject".to_vec()),
+            "Subtype" => Object::Name(b"Image".to_vec()),
+            "Width" => 2,
+            "Height" => 2,
+            "ColorSpace" => Object::Name(b"DeviceRGB".to_vec()),
+            "BitsPerComponent" => 8,
+            "SMask" => Object::Reference(smask_id),
+        },
+        vec![0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 0],
+    ));
+    let resources_id = document.add_object(dictionary! {
+        "XObject" => dictionary! {
+            "Im1" => image_id,
+        },
+    });
+    let content = Content {
+        operations: vec![
+            Operation::new("q", vec![]),
+            Operation::new(
+                "cm",
+                vec![
+                    Object::Integer(80),
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(80),
+                    Object::Integer(40),
+                    Object::Integer(40),
+                ],
+            ),
+            Operation::new("Do", vec![Object::Name(b"Im1".to_vec())]),
+            Operation::new("Q", vec![]),
+        ],
+    };
+    let content_id = document.add_object(Stream::new(
+        dictionary! {},
+        content.encode().expect("encode PDF content stream"),
+    ));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(200), Object::Integer(200)],
+    });
+    document.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    document.compress();
+    document.save(&path).expect("save generated PDF");
+    path
+}
+
+fn write_lopdf_dct_smask_image_background_pdf(name: &str) -> PathBuf {
+    let path = temp_path(name, "pdf");
+    let jpeg = temp_path(&format!("{name}-source"), "jpg");
+    image::save_buffer_with_format(
+        &jpeg,
+        &[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 0],
+        2,
+        2,
+        image::ColorType::Rgb8,
+        image::ImageFormat::Jpeg,
+    )
+    .unwrap();
+    let jpeg_bytes = fs::read(jpeg).unwrap();
+
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let smask_id = document.add_object(Stream::new(
+        dictionary! {
+            "Type" => Object::Name(b"XObject".to_vec()),
+            "Subtype" => Object::Name(b"Image".to_vec()),
+            "Width" => 2,
+            "Height" => 2,
+            "ColorSpace" => Object::Name(b"DeviceGray".to_vec()),
+            "BitsPerComponent" => 8,
+            "Matte" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(0)],
+        },
+        vec![0, 255, 255, 0],
+    ));
+    let image_id = document.add_object(Stream::new(
+        dictionary! {
+            "Type" => Object::Name(b"XObject".to_vec()),
+            "Subtype" => Object::Name(b"Image".to_vec()),
+            "Width" => 2,
+            "Height" => 2,
+            "ColorSpace" => Object::Name(b"DeviceRGB".to_vec()),
+            "BitsPerComponent" => 8,
+            "Filter" => Object::Name(b"DCTDecode".to_vec()),
+            "SMask" => Object::Reference(smask_id),
+        },
+        jpeg_bytes,
+    ));
+    let resources_id = document.add_object(dictionary! {
+        "XObject" => dictionary! {
+            "Im1" => image_id,
+        },
+    });
+    let content = Content {
+        operations: vec![
+            Operation::new("q", vec![]),
+            Operation::new(
+                "cm",
+                vec![
+                    Object::Integer(80),
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(80),
+                    Object::Integer(40),
+                    Object::Integer(40),
+                ],
+            ),
+            Operation::new("Do", vec![Object::Name(b"Im1".to_vec())]),
+            Operation::new("Q", vec![]),
+        ],
+    };
+    let content_id = document.add_object(Stream::new(
+        dictionary! {},
+        content.encode().expect("encode PDF content stream"),
+    ));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(200), Object::Integer(200)],
+    });
+    document.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    document.save(&path).unwrap();
     path
 }
 
@@ -501,4 +995,12 @@ fn temp_path(name: &str, extension: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("pdfeditor-core-{name}-{nanos}.{extension}"))
+}
+
+fn temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("pdfeditor-core-{name}-{nanos}"))
 }

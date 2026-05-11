@@ -1,7 +1,7 @@
 use crate::{
     CoreError, CoreResult, EditCommand, EditQueue, EngineDocument, ImageObject, ObjectSnapshot,
-    PageBitmapCache, PageIndex, PageInfo, PdfEngine, Point, Rect, RenderedPage, ResourceBudget,
-    TextObject, TextObjectId, TextRun, TextStyle,
+    PageBitmapCache, PageIndex, PageInfo, PageStructure, PdfEngine, Point, Rect, RenderedPage,
+    ResourceBudget, TextObject, TextObjectId, TextRun, TextStyle,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -81,6 +81,10 @@ impl<D: EngineDocument> DocumentSession<D> {
 
     pub fn image_objects(&self, page: PageIndex) -> CoreResult<Vec<ImageObject>> {
         self.document.image_objects(page)
+    }
+
+    pub fn page_structure(&self, page: PageIndex) -> CoreResult<PageStructure> {
+        self.document.page_structure(page)
     }
 
     pub fn render_page(&mut self, page: PageIndex, scale: f32) -> CoreResult<&RenderedPage> {

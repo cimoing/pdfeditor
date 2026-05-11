@@ -1,16 +1,18 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct PageIndex(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct PdfObjectId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct TextObjectId(pub PdfObjectId);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct ImageObjectId(pub PdfObjectId);
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub struct Point {
     pub x: f32,
     pub y: f32,
@@ -22,7 +24,7 @@ impl Point {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub struct Size {
     pub width: f32,
     pub height: f32,
@@ -34,7 +36,7 @@ impl Size {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub struct Rect {
     pub origin: Point,
     pub size: Size,
@@ -63,7 +65,7 @@ impl Rect {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -79,13 +81,13 @@ impl Color {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct PageInfo {
     pub index: PageIndex,
     pub size: Size,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct TextRun {
     pub content: String,
     pub font_name: Option<String>,
@@ -104,7 +106,7 @@ impl TextRun {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct TextObject {
     pub id: TextObjectId,
     pub page: PageIndex,
@@ -116,7 +118,7 @@ pub struct TextObject {
     pub runs: Vec<TextRun>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ImageObject {
     pub id: ImageObjectId,
     pub page: PageIndex,
@@ -132,6 +134,73 @@ pub struct RenderedPage {
     pub height_px: u32,
     pub scale: f32,
     pub rgba: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct PageStructure {
+    pub page: PageInfo,
+    pub text: Vec<StructuredTextObject>,
+    pub images: Vec<StructuredImageObject>,
+    pub watermarks: Vec<StructuredWatermark>,
+    pub annotations: Vec<StructuredAnnotation>,
+    pub bookmarks: Vec<BookmarkItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct StructuredTextObject {
+    pub id: TextObjectId,
+    pub bounds: Rect,
+    pub content: String,
+    pub font_name: Option<String>,
+    pub font_size: f32,
+    pub color: Color,
+    pub transform: [f32; 6],
+    pub angle_degrees: f32,
+    pub z_index: usize,
+    pub runs: Vec<TextRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct StructuredImageObject {
+    pub id: ImageObjectId,
+    pub name: Option<String>,
+    pub source_file: Option<String>,
+    pub bounds: Rect,
+    pub transform: [f32; 6],
+    pub angle_degrees: f32,
+    pub width_px: Option<u32>,
+    pub height_px: Option<u32>,
+    pub color_space: Option<String>,
+    pub bits_per_component: Option<u8>,
+    pub filters: Vec<String>,
+    pub byte_len: usize,
+    pub z_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct StructuredAnnotation {
+    pub id: Option<PdfObjectId>,
+    pub subtype: Option<String>,
+    pub bounds: Option<Rect>,
+    pub contents: Option<String>,
+    pub name: Option<String>,
+    pub flags: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct StructuredWatermark {
+    pub kind: String,
+    pub object_id: PdfObjectId,
+    pub bounds: Rect,
+    pub content: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct BookmarkItem {
+    pub title: String,
+    pub page: Option<PageIndex>,
+    pub level: usize,
 }
 
 impl RenderedPage {

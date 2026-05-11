@@ -1,6 +1,7 @@
 use crate::{
-    Color, CoreError, CoreResult, ImageObject, ImageObjectId, PageIndex, PageInfo, PdfObjectId,
-    Rect, RenderedPage, Size, TextObject, TextObjectId, TextRun, TextStyle,
+    BookmarkItem, Color, CoreError, CoreResult, ImageObject, ImageObjectId, PageIndex, PageInfo,
+    PageStructure, PdfObjectId, Rect, RenderedPage, Size, StructuredImageObject,
+    StructuredTextObject, TextObject, TextObjectId, TextRun, TextStyle,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -17,6 +18,75 @@ pub trait EngineDocument {
     fn page_info(&self, page: PageIndex) -> CoreResult<PageInfo>;
     fn text_objects(&self, page: PageIndex) -> CoreResult<Vec<TextObject>>;
     fn image_objects(&self, page: PageIndex) -> CoreResult<Vec<ImageObject>>;
+    fn bookmarks(&self) -> CoreResult<Vec<BookmarkItem>> {
+        Ok(Vec::new())
+    }
+    fn page_structure(&self, page: PageIndex) -> CoreResult<PageStructure> {
+        let page_info = self.page_info(page)?;
+        let text = self
+            .text_objects(page)?
+            .into_iter()
+            .enumerate()
+            .map(|(z_index, object)| StructuredTextObject {
+                id: object.id,
+                bounds: object.bounds,
+                content: object.content,
+                font_name: object.font_name,
+                font_size: object.font_size,
+                color: object.color,
+                transform: [
+                    object.font_size,
+                    0.0,
+                    0.0,
+                    object.font_size,
+                    object.bounds.origin.x,
+                    object.bounds.origin.y,
+                ],
+                angle_degrees: 0.0,
+                z_index,
+                runs: object.runs,
+            })
+            .collect();
+        let images = self
+            .image_objects(page)?
+            .into_iter()
+            .enumerate()
+            .map(|(z_index, object)| StructuredImageObject {
+                id: object.id,
+                name: None,
+                source_file: None,
+                bounds: object.bounds,
+                transform: [
+                    object.bounds.size.width,
+                    0.0,
+                    0.0,
+                    object.bounds.size.height,
+                    object.bounds.origin.x,
+                    object.bounds.origin.y,
+                ],
+                angle_degrees: 0.0,
+                width_px: None,
+                height_px: None,
+                color_space: None,
+                bits_per_component: None,
+                filters: vec![object.format],
+                byte_len: object.byte_len,
+                z_index,
+            })
+            .collect();
+        Ok(PageStructure {
+            page: page_info,
+            text,
+            images,
+            watermarks: Vec::new(),
+            annotations: Vec::new(),
+            bookmarks: self
+                .bookmarks()?
+                .into_iter()
+                .filter(|bookmark| bookmark.page == Some(page))
+                .collect(),
+        })
+    }
     fn render_page(&self, page: PageIndex, scale: f32, max_pixels: u64)
         -> CoreResult<RenderedPage>;
     fn add_text_object(
