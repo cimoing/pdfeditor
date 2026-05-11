@@ -163,7 +163,6 @@ button:disabled {
 }
 
 .background,
-.image-object,
 .text-object {
   position: absolute;
 }
@@ -172,36 +171,19 @@ button:disabled {
   inset: 0;
   width: 100%;
   height: 100%;
-}
-
-.image-object {
-  object-fit: fill;
+  display: block;
   pointer-events: none;
 }
 
 .text-object {
-  overflow: hidden;
+  display: block;
+  overflow: visible;
   padding: 0;
   border: 1px solid transparent;
   background: transparent;
+  color: transparent;
   cursor: pointer;
-  font-family: Arial, "Helvetica Neue", "Noto Sans", sans-serif;
-  text-align: left;
-  white-space: pre;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: geometricPrecision;
   appearance: none;
-}
-
-.text-object {
-  display: inline-block;
-  transform-box: border-box;
-}
-
-.text-object span {
-  display: inline-block;
-  transform: scaleX(var(--text-scale-x, 1));
-  transform-origin: left center;
 }
 
 .text-object:hover,
