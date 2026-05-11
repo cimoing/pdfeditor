@@ -1508,22 +1508,22 @@ fn draw_type3_char_proc(
                 }
             }
             "m" => {
-                if let Some((x, y)) = operation_point(operation, 0) {
+                if let Some((x, y)) = type3_operation_point(operation, 0, 2) {
                     let point = transform_point(state.transform, x, y);
                     path.move_to(point.0, point.1);
                 }
             }
             "l" => {
-                if let Some((x, y)) = operation_point(operation, 0) {
+                if let Some((x, y)) = type3_operation_point(operation, 0, 2) {
                     let point = transform_point(state.transform, x, y);
                     path.line_to(point.0, point.1);
                 }
             }
             "c" => {
                 if let (Some(p1), Some(p2), Some(p3)) = (
-                    operation_point(operation, 0),
-                    operation_point(operation, 2),
-                    operation_point(operation, 4),
+                    type3_operation_point(operation, 0, 6),
+                    type3_operation_point(operation, 2, 6),
+                    type3_operation_point(operation, 4, 6),
                 ) {
                     path.curve_to(
                         transform_point(state.transform, p1.0, p1.1),
@@ -1533,9 +1533,10 @@ fn draw_type3_char_proc(
                 }
             }
             "v" => {
-                if let (Some(p2), Some(p3)) =
-                    (operation_point(operation, 0), operation_point(operation, 2))
-                {
+                if let (Some(p2), Some(p3)) = (
+                    type3_operation_point(operation, 0, 4),
+                    type3_operation_point(operation, 2, 4),
+                ) {
                     let current = path.current_point().unwrap_or((0.0, 0.0));
                     path.curve_to(
                         current,
@@ -1545,21 +1546,17 @@ fn draw_type3_char_proc(
                 }
             }
             "y" => {
-                if let (Some(p1), Some(p3)) =
-                    (operation_point(operation, 0), operation_point(operation, 2))
-                {
+                if let (Some(p1), Some(p3)) = (
+                    type3_operation_point(operation, 0, 4),
+                    type3_operation_point(operation, 2, 4),
+                ) {
                     let p1 = transform_point(state.transform, p1.0, p1.1);
                     let p3 = transform_point(state.transform, p3.0, p3.1);
                     path.curve_to(p1, p3, p3);
                 }
             }
             "re" => {
-                if let (Some(x), Some(y), Some(w), Some(h)) = (
-                    operation.operands.first().and_then(object_to_f32),
-                    operation.operands.get(1).and_then(object_to_f32),
-                    operation.operands.get(2).and_then(object_to_f32),
-                    operation.operands.get(3).and_then(object_to_f32),
-                ) {
+                if let Some([x, y, w, h]) = type3_operation_operands::<4>(operation) {
                     let p0 = transform_point(state.transform, x, y);
                     let p1 = transform_point(state.transform, x + w, y);
                     let p2 = transform_point(state.transform, x + w, y + h);
@@ -1577,13 +1574,17 @@ fn draw_type3_char_proc(
                 if matches!(operation.operator.as_str(), "s" | "b" | "b*") {
                     path.close();
                 }
-                if matches!(operation.operator.as_str(), "f" | "F" | "f*" | "B" | "B*" | "b" | "b*")
-                    && fill_type3_path(pixmap, &path, color, page_height, scale)
+                if matches!(
+                    operation.operator.as_str(),
+                    "f" | "F" | "f*" | "B" | "B*" | "b" | "b*"
+                ) && fill_type3_path(pixmap, &path, color, page_height, scale)
                 {
                     drew = true;
                 }
-                if matches!(operation.operator.as_str(), "S" | "s" | "B" | "B*" | "b" | "b*")
-                    && stroke_type3_path(pixmap, &path, &state, color, page_height, scale)
+                if matches!(
+                    operation.operator.as_str(),
+                    "S" | "s" | "B" | "B*" | "b" | "b*"
+                ) && stroke_type3_path(pixmap, &path, &state, color, page_height, scale)
                 {
                     drew = true;
                 }
@@ -1613,6 +1614,38 @@ impl Type3GraphicsState {
             line_width: 1.0,
         }
     }
+}
+
+fn type3_operation_point(
+    operation: &Operation,
+    offset: usize,
+    expected_operands: usize,
+) -> Option<(f32, f32)> {
+    let operands = type3_operation_operand_slice(operation, expected_operands)?;
+    Some((
+        operands.get(offset).and_then(object_to_f32)?,
+        operands.get(offset + 1).and_then(object_to_f32)?,
+    ))
+}
+
+fn type3_operation_operands<const N: usize>(operation: &Operation) -> Option<[f32; N]> {
+    let operands = type3_operation_operand_slice(operation, N)?;
+    let mut values = [0.0; N];
+    for (index, value) in values.iter_mut().enumerate() {
+        *value = operands.get(index).and_then(object_to_f32)?;
+    }
+    Some(values)
+}
+
+fn type3_operation_operand_slice(
+    operation: &Operation,
+    expected_operands: usize,
+) -> Option<&[Object]> {
+    if operation.operands.len() < expected_operands {
+        return None;
+    }
+    let start = operation.operands.len() - expected_operands;
+    Some(&operation.operands[start..])
 }
 
 fn fill_type3_path(
@@ -2197,10 +2230,7 @@ fn advance_page_text_state(
         return;
     };
     let user_advance = advance * state.text.font_size.abs().max(1.0);
-    state.text_matrix = multiply_matrix(
-        state.text_matrix,
-        [1.0, 0.0, 0.0, 1.0, user_advance, 0.0],
-    );
+    state.text_matrix = multiply_matrix(state.text_matrix, [1.0, 0.0, 0.0, 1.0, user_advance, 0.0]);
     state.text.x = state.text_matrix[4];
     state.text.y = state.text_matrix[5];
 }
