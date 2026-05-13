@@ -31,8 +31,8 @@ pub use lopdf_backend::{
 pub use page_writer::write_page_structure_pdf;
 pub use resource::ResourceBudget;
 pub use types::{
-    BookmarkItem, Color, ImageObject, ImageObjectId, PageIndex, PageInfo, PageStructure,
-    PdfObjectId, Point, Rect, RenderedPage, Size, StructuredAnnotation, StructuredImageObject,
-    StructuredTextObject, StructuredVisualTextObject, StructuredWatermark, TextObject,
-    TextObjectId, TextRun,
+    BookmarkItem, Color, HitTestResult, ImageObject, ImageObjectId, LayoutGlyph, PageIndex,
+    PageInfo, PageStructure, PdfObjectId, Point, Rect, RenderedPage, Size, StructuredAnnotation,
+    StructuredImageObject, StructuredTextObject, StructuredVisualTextObject, StructuredWatermark,
+    TextEditSessionInfo, TextLayoutPreview, TextObject, TextObjectId, TextRun,
 };

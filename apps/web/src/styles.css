@@ -5,7 +5,7 @@
 body {
   margin: 0;
   color: #202124;
-  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  font-family: "Noto Sans SC", Inter, "Segoe UI", system-ui, sans-serif;
   background: #eef1f4;
 }
 
@@ -99,6 +99,22 @@ h2 {
   font-size: 12px;
 }
 
+.font-meta {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 10px;
+  color: #475467;
+  font-size: 12px;
+}
+
+.font-fallback {
+  color: #b42318;
+}
+
+.font-embedded {
+  color: #027a48;
+}
+
 textarea {
   width: 100%;
   min-height: 140px;
@@ -163,7 +179,10 @@ button:disabled {
 }
 
 .background,
-.text-object {
+.text-visible,
+.text-object,
+.inline-text-editor,
+.layout-preview {
   position: absolute;
 }
 
@@ -173,6 +192,21 @@ button:disabled {
   height: 100%;
   display: block;
   pointer-events: none;
+}
+
+.text-visible {
+  display: block;
+  overflow: hidden;
+  padding: 0;
+  margin: 0;
+  color: #111827;
+  white-space: pre;
+  word-break: normal;
+  pointer-events: none;
+}
+
+.text-visible.editing {
+  visibility: hidden;
 }
 
 .text-object {
@@ -195,6 +229,52 @@ button:disabled {
 .text-object::-moz-focus-inner {
   border: 0;
   padding: 0;
+}
+
+.layout-preview {
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.layout-preview-box {
+  fill: rgba(31, 111, 235, 0.08);
+  stroke: #1f6feb;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.layout-preview.overflow .layout-preview-box {
+  fill: rgba(217, 45, 32, 0.08);
+  stroke: #d92d20;
+}
+
+.layout-preview-glyph {
+  fill: transparent;
+  stroke: rgba(31, 111, 235, 0.38);
+  stroke-width: 0.75;
+  vector-effect: non-scaling-stroke;
+}
+
+.layout-preview.overflow .layout-preview-glyph {
+  stroke: rgba(217, 45, 32, 0.42);
+}
+
+.inline-text-editor {
+  z-index: 3;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 1px solid #1f6feb;
+  outline: 2px solid rgba(31, 111, 235, 0.2);
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.86);
+  color: #111827;
+  resize: none;
+  transform-origin: left top;
+  white-space: pre;
 }
 
 .empty-state {

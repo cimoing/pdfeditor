@@ -2,9 +2,17 @@ import init, {
   pdf_apply_text_edits,
   pdf_apply_text_edits_by_handle,
   pdf_close_document,
+  pdf_commit_text_edit,
+  pdf_commit_text_edit_by_handle,
+  pdf_hit_test,
+  pdf_hit_test_by_handle,
   pdf_open_document,
   pdf_page_bundle,
-  pdf_page_bundle_by_handle
+  pdf_page_bundle_by_handle,
+  pdf_preview_text_layout,
+  pdf_preview_text_layout_by_handle,
+  pdf_start_text_edit,
+  pdf_start_text_edit_by_handle
 } from "./wasm/pdfeditor_core";
 
 export interface Point {
@@ -25,6 +33,7 @@ export interface Rect {
 export interface PageInfo {
   index: number;
   size: Size;
+  rotation?: number;
 }
 
 export interface StructuredTextObject {
@@ -37,6 +46,7 @@ export interface StructuredTextObject {
   transform: [number, number, number, number, number, number];
   angle_degrees: number;
   z_index: number;
+  glyphs?: LayoutGlyph[];
 }
 
 export interface StructuredVisualTextObject {
@@ -70,6 +80,46 @@ export interface PageStructure {
   images: StructuredImageObject[];
 }
 
+export interface HitTestResult {
+  object_id: number;
+  object_type: "text" | "image" | string;
+  page: number;
+  local_position: Point;
+  text_run_index: number | null;
+  glyph_index: number | null;
+  bbox: Rect;
+  matrix: [number, number, number, number, number, number];
+}
+
+export interface LayoutGlyph {
+  ch: string;
+  glyph_id: number | null;
+  x: number;
+  y: number;
+  advance: number;
+  bbox: Rect;
+}
+
+export interface TextEditSessionInfo {
+  object_id: number;
+  page: number;
+  original_text: string;
+  bbox: Rect;
+  matrix: [number, number, number, number, number, number];
+  font_id: string | null;
+  font_size: number;
+  writing_mode: string | null;
+  glyphs: LayoutGlyph[];
+}
+
+export interface TextLayoutPreview {
+  object_id: number;
+  text: string;
+  glyphs: LayoutGlyph[];
+  bbox: Rect;
+  overflow: boolean;
+}
+
 export interface EmbeddedFontInfo {
   resource_name: string;
   family_name: string;
@@ -78,10 +128,15 @@ export interface EmbeddedFontInfo {
   format: string;
 }
 
+export interface LoadedFontAsset extends EmbeddedFontInfo {
+  data: ArrayBuffer;
+}
+
 export interface LoadedPage {
   structure: PageStructure;
   backgroundUrl: string;
   fontFamilies: Record<string, string>;
+  fontAssets: LoadedFontAsset[];
 }
 
 interface BinaryAssetInfo {
@@ -160,6 +215,14 @@ export async function loadPdfPage(
   const { metadata, payload } = parsePageBundle(bundleBytes);
   const structure = metadata.structure;
   const fontFamilies = await loadEmbeddedFonts(metadata.fonts, payload);
+  const fontAssets = metadata.fonts.map((font) => ({
+    resource_name: font.resource_name,
+    family_name: font.family_name,
+    file_name: font.file_name,
+    mime_type: font.mime_type,
+    format: font.format,
+    data: assetBlobPart(payload, font.asset)
+  }));
   const backgroundUrl = URL.createObjectURL(
     new Blob([assetBlobPart(payload, metadata.background_png)], { type: metadata.background_png.mime_type })
   );
@@ -171,7 +234,7 @@ export async function loadPdfPage(
     image.objectUrl = URL.createObjectURL(new Blob([assetBlobPart(payload, asset)], { type: asset.mime_type }));
   }
 
-  return { structure, backgroundUrl, fontFamilies };
+  return { structure, backgroundUrl, fontFamilies, fontAssets };
 }
 
 export async function applyTextEdits(
@@ -196,8 +259,69 @@ export async function applyTextEdits(
   return pdf_apply_text_edits(pdfBytes, JSON.stringify(request));
 }
 
+export async function hitTestPdf(
+  pdfBytes: Uint8Array | null,
+  pageNumber: number,
+  pdfX: number,
+  pdfY: number,
+  handle?: number | null
+): Promise<HitTestResult | null> {
+  await ensureWasm();
+  const json =
+    handle == null
+      ? pdf_hit_test(requirePdfBytes(pdfBytes), pageNumber, pdfX, pdfY)
+      : pdf_hit_test_by_handle(handle, pageNumber, pdfX, pdfY);
+  return JSON.parse(json) as HitTestResult | null;
+}
+
+export async function startTextEdit(
+  pdfBytes: Uint8Array | null,
+  objectId: number,
+  handle?: number | null
+): Promise<TextEditSessionInfo> {
+  await ensureWasm();
+  const json =
+    handle == null
+      ? pdf_start_text_edit(requirePdfBytes(pdfBytes), BigInt(objectId))
+      : pdf_start_text_edit_by_handle(handle, BigInt(objectId));
+  return JSON.parse(json) as TextEditSessionInfo;
+}
+
+export async function previewTextLayout(
+  pdfBytes: Uint8Array | null,
+  objectId: number,
+  text: string,
+  handle?: number | null
+): Promise<TextLayoutPreview> {
+  await ensureWasm();
+  const json =
+    handle == null
+      ? pdf_preview_text_layout(requirePdfBytes(pdfBytes), BigInt(objectId), text)
+      : pdf_preview_text_layout_by_handle(handle, BigInt(objectId), text);
+  return JSON.parse(json) as TextLayoutPreview;
+}
+
+export async function commitTextEdit(
+  pdfBytes: Uint8Array | null,
+  objectId: number,
+  text: string,
+  handle?: number | null
+): Promise<Uint8Array> {
+  await ensureWasm();
+  return handle == null
+    ? pdf_commit_text_edit(requirePdfBytes(pdfBytes), BigInt(objectId), text)
+    : pdf_commit_text_edit_by_handle(handle, BigInt(objectId), text);
+}
+
 export function asBlobPart(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function requirePdfBytes(pdfBytes: Uint8Array | null): Uint8Array {
+  if (!pdfBytes) {
+    throw new Error("Missing PDF bytes");
+  }
+  return pdfBytes;
 }
 
 function parsePageBundle(bytes: Uint8Array): { metadata: PageBundleInfo; payload: Uint8Array } {
@@ -229,6 +353,61 @@ export function resolvePdfFontFamily(fontName: string | null, embeddedFonts: Rec
   return withFallbackFonts(mappedFallbackForFont(fontName));
 }
 
+export interface PdfFontUsageInfo {
+  requestedFont: string | null;
+  displayFamily: string;
+  cssFontFamily: string;
+  fellBack: boolean;
+  fallbackReason: string | null;
+}
+
+export function describePdfFontUsage(
+  fontName: string | null,
+  embeddedFonts: Record<string, string>
+): PdfFontUsageInfo {
+  const cssFontFamily = resolvePdfFontFamily(fontName, embeddedFonts);
+  const displayFamily = firstCssFamilyName(cssFontFamily);
+  const hasEmbedded = fontName ? Boolean(embeddedFonts[fontName]?.includes("PdfEmbedded_")) : false;
+
+  if (!fontName) {
+    return {
+      requestedFont: null,
+      displayFamily,
+      cssFontFamily,
+      fellBack: true,
+      fallbackReason: "PDF 对象未提供字体资源名，使用浏览器回退字体链"
+    };
+  }
+
+  if (!embeddedFonts[fontName]) {
+    return {
+      requestedFont: fontName,
+      displayFamily,
+      cssFontFamily,
+      fellBack: true,
+      fallbackReason: "未找到对应的嵌入字体映射，使用浏览器回退字体链"
+    };
+  }
+
+  if (!hasEmbedded) {
+    return {
+      requestedFont: fontName,
+      displayFamily,
+      cssFontFamily,
+      fellBack: true,
+      fallbackReason: "嵌入字体未成功加载，使用浏览器回退字体链"
+    };
+  }
+
+  return {
+    requestedFont: fontName,
+    displayFamily,
+    cssFontFamily,
+    fellBack: false,
+    fallbackReason: null
+  };
+}
+
 async function loadEmbeddedFonts(fonts: FontBundleInfo[], payload: Uint8Array): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
 
@@ -241,7 +420,9 @@ async function loadEmbeddedFonts(fonts: FontBundleInfo[], payload: Uint8Array): 
       }
       blobUrl = URL.createObjectURL(new Blob([assetBlobPart(payload, font.asset)], { type: font.mime_type }));
       const family = `PdfEmbedded_${sanitizeCssName(font.resource_name)}_${fontLoadSequence++}`;
-      const source = `url(${blobUrl}) format("${font.format}")`;
+      // Use the CSS-compatible format hint. CFF data is exposed as "opentype"
+      // because browsers handle CFF outlines inside OpenType containers.
+      const source = `url(${blobUrl}) format("${cssFontFormat(font.format)}")`;
       const face = new FontFace(family, source);
       await face.load();
       document.fonts.add(face);
@@ -294,6 +475,31 @@ function quoteCssFamily(value: string): string {
   return JSON.stringify(value);
 }
 
+function firstCssFamilyName(value: string): string {
+  const [first] = value.split(",");
+  return first?.trim().replace(/^['"]|['"]$/g, "") || "sans-serif";
+}
+
+/**
+ * Returns true for font formats the browser's FontFace API can load.
+ * CFF (Type1C / CIDFontType0C) is included because browsers can parse
+ * CFF glyph data when it is referenced with the "opentype" CSS hint.
+ */
 function isBrowserLoadableFont(format: string): boolean {
-  return format === "truetype" || format === "opentype";
+  return (
+    format === "truetype" ||
+    format === "opentype" ||
+    format === "cff" ||
+    format === "woff" ||
+    format === "woff2"
+  );
+}
+
+/**
+ * Maps the backend format name to the CSS @font-face format() hint.
+ * Pure CFF data uses the same "opentype" hint since browsers treat them
+ * equivalently when loading via FontFace.
+ */
+function cssFontFormat(format: string): string {
+  return format === "cff" ? "opentype" : format;
 }

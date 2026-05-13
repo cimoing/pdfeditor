@@ -74,24 +74,19 @@ console.log(page.page.size);
 
 ## Web 编辑流程
 
-推荐前端按三层组织页面：
+推荐前端把可视页面内容交给 CanvasKit/Skia 绘制，DOM 只保留控件和透明交互层：
 
 ```text
-background layer: pdf_page_background_png()
-image layer:      pdf_image_object_png()
-text layer:       pdf_page_to_json().text
+skia page layer:    pdf_page_bundle() 中的 background_png、字体资源和结构化文本
+interaction layer:  hit test、文本编辑预览与提交 API
 ```
 
 页面加载：
 
 ```js
-const json = JSON.parse(pdf_page_to_json(bytes, 1));
-const backgroundPng = pdf_page_background_png(bytes, 1);
-
-for (const image of json.images) {
-  const png = pdf_image_object_png(bytes, 1, image.id);
-  image.sourceBlobUrl = URL.createObjectURL(new Blob([png], { type: "image/png" }));
-}
+const bundle = pdf_page_bundle(bytes, 1);
+const { structure, background_png, fonts } = parsePageBundle(bundle);
+await skiaRenderer.render({ structure, background_png, fonts });
 ```
 
 文本编辑后保存：

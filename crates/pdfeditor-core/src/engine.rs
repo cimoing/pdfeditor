@@ -44,6 +44,7 @@ pub trait EngineDocument {
                 ],
                 angle_degrees: 0.0,
                 z_index,
+                glyphs: Vec::new(),
                 runs: object.runs,
             })
             .collect();
@@ -149,6 +150,7 @@ impl PdfEngine for MockPdfEngine {
             pages.push(PageInfo {
                 index: page,
                 size: Size::new(595.0, 842.0),
+                rotation: 0,
             });
             text_objects.insert(page, sample_text(page));
             image_objects.insert(page, sample_images(page));

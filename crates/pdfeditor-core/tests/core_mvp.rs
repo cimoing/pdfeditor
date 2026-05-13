@@ -352,6 +352,77 @@ fn lopdf_backend_structures_page_content_from_bytes_for_wasm() {
 }
 
 #[test]
+fn lopdf_backend_reports_page_rotation() {
+    let source = write_rotated_pdf("lopdf-rotated-page", 90);
+    let engine = LopdfEngine;
+    let session = DocumentSession::open(&engine, &source, OpenOptions::default()).unwrap();
+
+    let page = session.page_info(PageIndex(0)).unwrap();
+
+    assert_eq!(page.rotation, 90);
+}
+
+#[test]
+fn lopdf_backend_hit_test_returns_structured_result() {
+    let source = write_lopdf_text_pdf("lopdf-structured-hit-test", "Hello");
+    let bytes = fs::read(source).unwrap();
+    let document = open_lopdf_document_from_bytes(&bytes).unwrap();
+
+    let hit = document
+        .hit_test(PageIndex(0), Point::new(75.0, 75.0))
+        .unwrap()
+        .expect("text object hit");
+
+    assert_eq!(hit.object_type, "text");
+    assert_eq!(hit.page, PageIndex(0));
+    assert_eq!(hit.text_run_index, Some(0));
+    assert!(hit.local_position.x >= 0.0);
+    assert!(hit.local_position.y >= 0.0);
+}
+
+#[test]
+fn lopdf_backend_previews_text_layout_without_committing() {
+    let source = write_lopdf_text_pdf("lopdf-text-preview", "Hello");
+    let bytes = fs::read(source).unwrap();
+    let document = open_lopdf_document_from_bytes(&bytes).unwrap();
+    let object = document.text_objects(PageIndex(0)).unwrap()[0].clone();
+
+    let session = document.start_text_edit(object.id).unwrap();
+    let preview = document
+        .preview_text_layout(object.id, "Hello world".to_string())
+        .unwrap();
+    let unchanged = document.text_objects(PageIndex(0)).unwrap()[0].clone();
+
+    assert_eq!(session.original_text, "Hello");
+    assert_eq!(preview.text, "Hello world");
+    assert_eq!(preview.glyphs.len(), "Hello world".chars().count());
+    assert!(preview.bbox.size.width >= session.bbox.size.width);
+    assert_eq!(unchanged.content, "Hello");
+}
+
+#[test]
+fn lopdf_backend_commits_text_after_preview() {
+    let source = write_lopdf_text_pdf("lopdf-text-preview-commit", "Hello");
+    let bytes = fs::read(source).unwrap();
+    let mut document = open_lopdf_document_from_bytes(&bytes).unwrap();
+    let object = document.text_objects(PageIndex(0)).unwrap()[0].clone();
+
+    let preview = document
+        .preview_text_layout(object.id, "World".to_string())
+        .unwrap();
+    let committed = document
+        .update_text_object(object.id, preview.text.clone(), None)
+        .unwrap();
+
+    assert_eq!(committed.content, "World");
+    assert!(document
+        .text_objects(PageIndex(0))
+        .unwrap()
+        .iter()
+        .any(|object| object.content == "World"));
+}
+
+#[test]
 fn lopdf_backend_advances_consecutive_structured_text_runs() {
     let source = write_lopdf_consecutive_text_runs_pdf("lopdf-consecutive-runs");
     let engine = LopdfEngine;
@@ -499,6 +570,7 @@ fn writes_single_page_pdf_from_page_structure() {
         page: PageInfo {
             index: PageIndex(42),
             size: Size::new(300.0, 300.0),
+            rotation: 0,
         },
         text: vec![StructuredTextObject {
             id: pdfeditor_core::TextObjectId(pdfeditor_core::PdfObjectId(1)),
@@ -510,6 +582,7 @@ fn writes_single_page_pdf_from_page_structure() {
             transform: [12.0, 0.0, 0.0, 12.0, 72.0, 72.0],
             angle_degrees: 0.0,
             z_index: 0,
+            glyphs: Vec::new(),
             runs: Vec::new(),
         }],
         visual_text: Vec::new(),
@@ -542,6 +615,7 @@ fn writes_single_page_pdf_from_page_structure_with_chinese_text() {
         page: PageInfo {
             index: PageIndex(0),
             size: Size::new(300.0, 300.0),
+            rotation: 0,
         },
         text: vec![StructuredTextObject {
             id: pdfeditor_core::TextObjectId(pdfeditor_core::PdfObjectId(1)),
@@ -553,6 +627,7 @@ fn writes_single_page_pdf_from_page_structure_with_chinese_text() {
             transform: [14.0, 0.0, 0.0, 14.0, 72.0, 120.0],
             angle_degrees: 0.0,
             z_index: 0,
+            glyphs: Vec::new(),
             runs: Vec::new(),
         }],
         visual_text: Vec::new(),
@@ -601,6 +676,34 @@ endobj
 %%EOF",
     )
     .unwrap();
+    path
+}
+
+fn write_rotated_pdf(name: &str, rotation: i32) -> PathBuf {
+    let path = temp_path(name, "pdf");
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(595), Object::Integer(842)],
+        "Rotate" => rotation,
+    });
+    document.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    document.save(&path).expect("save generated PDF");
     path
 }
 

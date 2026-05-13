@@ -4,7 +4,7 @@ use crate::{
     page_font_assets_from_pdf_bytes, page_image_png_from_pdf_bytes,
     page_load_bundle_from_pdf_bytes, page_structure_from_pdf_bytes, save_pdf_document_to_bytes,
     BackgroundRenderOptions, CoreError, EngineDocument, ImageObjectId, PageIndex, PdfObjectId,
-    TextObjectId,
+    Point, TextObjectId,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -81,6 +81,144 @@ pub fn pdf_page_bundle_by_handle(handle: u32, page_number: u32) -> Result<Vec<u8
             .page_load_bundle(page, BackgroundRenderOptions::default())
             .map_err(core_error_to_js)?;
         encode_page_bundle(bundle)
+    })
+}
+
+#[wasm_bindgen]
+pub fn pdf_hit_test(
+    pdf_bytes: &[u8],
+    page_number: u32,
+    pdf_x: f64,
+    pdf_y: f64,
+) -> Result<String, JsValue> {
+    let page = wasm_page_index(page_number)?;
+    let document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
+    let result = document
+        .hit_test(page, Point::new(pdf_x as f32, pdf_y as f32))
+        .map_err(core_error_to_js)?;
+    serde_json::to_string(&result)
+        .map_err(|error| JsValue::from_str(&format!("failed to serialize hit-test JSON: {error}")))
+}
+
+#[wasm_bindgen]
+pub fn pdf_hit_test_by_handle(
+    handle: u32,
+    page_number: u32,
+    pdf_x: f64,
+    pdf_y: f64,
+) -> Result<String, JsValue> {
+    let page = wasm_page_index(page_number)?;
+    DOCUMENT_STORE.with(|store| {
+        let store = store.borrow();
+        let document = store
+            .documents
+            .get(&handle)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        let result = document
+            .hit_test(page, Point::new(pdf_x as f32, pdf_y as f32))
+            .map_err(core_error_to_js)?;
+        serde_json::to_string(&result).map_err(|error| {
+            JsValue::from_str(&format!("failed to serialize hit-test JSON: {error}"))
+        })
+    })
+}
+
+#[wasm_bindgen]
+pub fn pdf_start_text_edit(pdf_bytes: &[u8], object_id: u64) -> Result<String, JsValue> {
+    let document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
+    let result = document
+        .start_text_edit(TextObjectId(PdfObjectId(object_id)))
+        .map_err(core_error_to_js)?;
+    serde_json::to_string(&result).map_err(|error| {
+        JsValue::from_str(&format!(
+            "failed to serialize text edit session JSON: {error}"
+        ))
+    })
+}
+
+#[wasm_bindgen]
+pub fn pdf_start_text_edit_by_handle(handle: u32, object_id: u64) -> Result<String, JsValue> {
+    DOCUMENT_STORE.with(|store| {
+        let store = store.borrow();
+        let document = store
+            .documents
+            .get(&handle)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        let result = document
+            .start_text_edit(TextObjectId(PdfObjectId(object_id)))
+            .map_err(core_error_to_js)?;
+        serde_json::to_string(&result).map_err(|error| {
+            JsValue::from_str(&format!(
+                "failed to serialize text edit session JSON: {error}"
+            ))
+        })
+    })
+}
+
+#[wasm_bindgen]
+pub fn pdf_preview_text_layout(
+    pdf_bytes: &[u8],
+    object_id: u64,
+    text: &str,
+) -> Result<String, JsValue> {
+    let document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
+    let result = document
+        .preview_text_layout(TextObjectId(PdfObjectId(object_id)), text.to_string())
+        .map_err(core_error_to_js)?;
+    serde_json::to_string(&result)
+        .map_err(|error| JsValue::from_str(&format!("failed to serialize preview JSON: {error}")))
+}
+
+#[wasm_bindgen]
+pub fn pdf_preview_text_layout_by_handle(
+    handle: u32,
+    object_id: u64,
+    text: &str,
+) -> Result<String, JsValue> {
+    DOCUMENT_STORE.with(|store| {
+        let store = store.borrow();
+        let document = store
+            .documents
+            .get(&handle)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        let result = document
+            .preview_text_layout(TextObjectId(PdfObjectId(object_id)), text.to_string())
+            .map_err(core_error_to_js)?;
+        serde_json::to_string(&result).map_err(|error| {
+            JsValue::from_str(&format!("failed to serialize preview JSON: {error}"))
+        })
+    })
+}
+
+#[wasm_bindgen]
+pub fn pdf_commit_text_edit(
+    pdf_bytes: &[u8],
+    object_id: u64,
+    text: &str,
+) -> Result<Vec<u8>, JsValue> {
+    let mut document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
+    document
+        .update_text_object(TextObjectId(PdfObjectId(object_id)), text.to_string(), None)
+        .map_err(core_error_to_js)?;
+    save_pdf_document_to_bytes(&document).map_err(core_error_to_js)
+}
+
+#[wasm_bindgen]
+pub fn pdf_commit_text_edit_by_handle(
+    handle: u32,
+    object_id: u64,
+    text: &str,
+) -> Result<Vec<u8>, JsValue> {
+    DOCUMENT_STORE.with(|store| {
+        let mut store = store.borrow_mut();
+        let document = store
+            .documents
+            .get_mut(&handle)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        document
+            .update_text_object(TextObjectId(PdfObjectId(object_id)), text.to_string(), None)
+            .map_err(core_error_to_js)?;
+        save_pdf_document_to_bytes(document).map_err(core_error_to_js)
     })
 }
 

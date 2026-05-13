@@ -1,8 +1,9 @@
 use crate::{
-    BookmarkItem, Color, CoreError, CoreResult, EngineDocument, ImageObject, ImageObjectId,
-    PageIndex, PageInfo, PageStructure, PdfEngine, PdfObjectId, Rect, RenderedPage, Size,
-    StructuredAnnotation, StructuredImageObject, StructuredTextObject, StructuredVisualTextObject,
-    StructuredWatermark, TextObject, TextObjectId, TextRun, TextStyle,
+    BookmarkItem, Color, CoreError, CoreResult, EngineDocument, HitTestResult, ImageObject,
+    ImageObjectId, LayoutGlyph, PageIndex, PageInfo, PageStructure, PdfEngine, PdfObjectId, Point,
+    Rect, RenderedPage, Size, StructuredAnnotation, StructuredImageObject, StructuredTextObject,
+    StructuredVisualTextObject, StructuredWatermark, TextEditSessionInfo, TextLayoutPreview,
+    TextObject, TextObjectId, TextRun, TextStyle,
 };
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
@@ -200,7 +201,12 @@ impl EngineDocument for LopdfDocument {
     fn page_info(&self, page: PageIndex) -> CoreResult<PageInfo> {
         let page_id = self.page_id(page)?;
         let size = self.page_size(page_id).unwrap_or(Size::new(595.0, 842.0));
-        Ok(PageInfo { index: page, size })
+        let rotation = self.page_rotation(page_id);
+        Ok(PageInfo {
+            index: page,
+            size,
+            rotation,
+        })
     }
 
     fn text_objects(&self, page: PageIndex) -> CoreResult<Vec<TextObject>> {
@@ -429,6 +435,83 @@ impl LopdfDocument {
         })
     }
 
+    pub fn hit_test(&self, page: PageIndex, point: Point) -> CoreResult<Option<HitTestResult>> {
+        self.ensure_page(page)?;
+        let mut text = self.structured_text(page)?;
+        text.sort_by_key(|object| object.z_index);
+        for object in text.into_iter().rev() {
+            if !object.bounds.contains(point) {
+                continue;
+            }
+            return Ok(Some(HitTestResult {
+                object_id: object.id.0,
+                object_type: "text".to_string(),
+                page,
+                local_position: inverse_transform_point(object.transform, point),
+                text_run_index: Some(0),
+                glyph_index: None,
+                bbox: object.bounds,
+                matrix: object.transform,
+            }));
+        }
+
+        let mut images = self.structured_images(page)?;
+        images.sort_by_key(|object| object.z_index);
+        for object in images.into_iter().rev() {
+            if !object.bounds.contains(point) {
+                continue;
+            }
+            return Ok(Some(HitTestResult {
+                object_id: object.id.0,
+                object_type: "image".to_string(),
+                page,
+                local_position: inverse_transform_point(object.transform, point),
+                text_run_index: None,
+                glyph_index: None,
+                bbox: object.bounds,
+                matrix: object.transform,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    pub fn start_text_edit(&self, id: TextObjectId) -> CoreResult<TextEditSessionInfo> {
+        let context = self.text_layout_context(id)?;
+        let (glyphs, _) = layout_glyphs(&context.object.content, &context);
+        Ok(TextEditSessionInfo {
+            object_id: id,
+            page: context.page,
+            original_text: context.object.content,
+            bbox: context.object.bounds,
+            matrix: context.object.transform,
+            font_id: context.object.font_name,
+            font_size: context.object.font_size,
+            writing_mode: Some("horizontal".to_string()),
+            glyphs,
+        })
+    }
+
+    pub fn preview_text_layout(
+        &self,
+        id: TextObjectId,
+        text: String,
+    ) -> CoreResult<TextLayoutPreview> {
+        let context = self.text_layout_context(id)?;
+        let (glyphs, width) = layout_glyphs(&text, &context);
+        let bbox = bounds_for_text_width(width, context.object.transform);
+        let overflow = bbox.size.width > context.object.bounds.size.width
+            || bbox.size.height > context.object.bounds.size.height;
+
+        Ok(TextLayoutPreview {
+            object_id: id,
+            text,
+            glyphs,
+            bbox,
+            overflow,
+        })
+    }
+
     fn extract_text_objects(&mut self) -> CoreResult<()> {
         self.text_objects.clear();
         self.text_refs.clear();
@@ -519,6 +602,50 @@ impl LopdfDocument {
         Err(CoreError::NotFound(format!("text object {}", (id.0).0)))
     }
 
+    fn text_layout_context(&self, id: TextObjectId) -> CoreResult<TextLayoutContext> {
+        let text_ref = self
+            .text_refs
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound(format!("text object {}", (id.0).0)))?;
+        let object = self
+            .structured_text(text_ref.page)?
+            .into_iter()
+            .find(|object| object.id == id)
+            .ok_or_else(|| CoreError::NotFound(format!("text object {}", (id.0).0)))?;
+        let page_id = self.page_id(text_ref.page)?;
+        let content = self.decoded_page_content(page_id)?;
+        let mut page_state = PageParseState::default();
+        for (index, operation) in content.operations.iter().enumerate() {
+            update_page_state(&mut page_state, operation);
+            if index == text_ref.operation_index {
+                break;
+            }
+        }
+        let font_maps = self.page_font_maps(page_id);
+        let font_metrics = self.page_font_metrics(page_id);
+        let font_map = page_state
+            .text
+            .font_name
+            .as_ref()
+            .and_then(|name| font_maps.get(name))
+            .cloned();
+        let metrics = page_state
+            .text
+            .font_name
+            .as_ref()
+            .and_then(|name| font_metrics.get(name))
+            .cloned();
+
+        Ok(TextLayoutContext {
+            page: text_ref.page,
+            object,
+            state: page_state.text,
+            font_map,
+            metrics,
+        })
+    }
+
     fn page_size(&self, page_id: ObjectId) -> Option<Size> {
         let page = self.document.get_object(page_id).ok()?.as_dict().ok()?;
         let media_box = page.get(b"MediaBox").ok()?.as_array().ok()?;
@@ -531,6 +658,23 @@ impl LopdfDocument {
         let x1 = object_to_f32(&media_box[2])?;
         let y1 = object_to_f32(&media_box[3])?;
         Some(Size::new((x1 - x0).abs(), (y1 - y0).abs()))
+    }
+
+    fn page_rotation(&self, page_id: ObjectId) -> i32 {
+        let rotation = self
+            .document
+            .get_object(page_id)
+            .ok()
+            .and_then(|object| object.as_dict().ok())
+            .and_then(|page| page.get(b"Rotate").ok())
+            .and_then(object_to_i64)
+            .unwrap_or(0);
+        match rotation.rem_euclid(360) {
+            90 => 90,
+            180 => 180,
+            270 => 270,
+            _ => 0,
+        }
     }
 
     fn page_font_maps(&self, page_id: ObjectId) -> HashMap<String, ToUnicodeMap> {
@@ -573,11 +717,12 @@ impl LopdfDocument {
         let mut assets = Vec::new();
         for (name, font) in fonts {
             let resource_name = String::from_utf8_lossy(&name).into_owned();
+            let to_unicode = parse_font_to_unicode(&self.document, font);
             let Some(descriptor) = font_descriptor(&self.document, font) else {
                 continue;
             };
             let Some((bytes, mime_type, format, extension)) =
-                font_file_bytes(&self.document, descriptor)
+                font_file_bytes(&self.document, font, descriptor, to_unicode.as_ref())
             else {
                 continue;
             };
@@ -626,7 +771,28 @@ impl LopdfDocument {
                     operation_index as u32,
                 )));
                 let transform = text_render_transform(&state);
+                let layout_context = TextLayoutContext {
+                    page,
+                    object: StructuredTextObject {
+                        id: object_id,
+                        bounds: Rect::new(0.0, 0.0, 0.0, 0.0),
+                        content: text.clone(),
+                        font_name: state.text.font_name.clone(),
+                        font_size: state.text.font_size,
+                        color: state.text.color,
+                        transform,
+                        angle_degrees: matrix_angle_degrees(transform),
+                        z_index: operation_index,
+                        glyphs: Vec::new(),
+                        runs: Vec::new(),
+                    },
+                    state: state.text.clone(),
+                    font_map: font_map.cloned(),
+                    metrics: metrics.cloned(),
+                };
+                let (glyphs, width) = layout_glyphs(&text, &layout_context);
                 let bounds = operation_text_advance(operation, metrics, &state.text)
+                    .or_else(|| (!glyphs.is_empty()).then_some(width))
                     .map(|width| bounds_for_text_width(width, transform))
                     .unwrap_or_else(|| bounds_for_text(&text, state.text.font_size, transform));
                 objects.push(StructuredTextObject {
@@ -639,6 +805,7 @@ impl LopdfDocument {
                     transform,
                     angle_degrees: matrix_angle_degrees(transform),
                     z_index: operation_index,
+                    glyphs,
                     runs: vec![TextRun::new(
                         text,
                         state.text.font_name.clone(),
@@ -2047,6 +2214,15 @@ struct PageParseState {
     text_line_matrix: [f32; 6],
 }
 
+#[derive(Debug, Clone)]
+struct TextLayoutContext {
+    page: PageIndex,
+    object: StructuredTextObject,
+    state: TextParseState,
+    font_map: Option<ToUnicodeMap>,
+    metrics: Option<FontMetrics>,
+}
+
 impl Default for PageParseState {
     fn default() -> Self {
         Self {
@@ -2295,6 +2471,57 @@ fn bounds_for_text_width(width: f32, transform: [f32; 6]) -> Rect {
     transformed_rect_bounds(transform, width.max(0.0), 1.2)
 }
 
+fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, f32) {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut glyphs = Vec::with_capacity(chars.len());
+    let mut cursor = 0.0f32;
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        let encoded = context
+            .font_map
+            .as_ref()
+            .and_then(|font_map| font_map.encode(&ch.to_string()));
+        let glyph_id = encoded.as_deref().and_then(|bytes| {
+            context
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.codes(bytes).first().copied())
+        });
+        let mut advance = encoded
+            .as_deref()
+            .and_then(|bytes| {
+                context
+                    .metrics
+                    .as_ref()
+                    .map(|metrics| metrics.text_advance(bytes, &context.state))
+            })
+            .unwrap_or_else(|| {
+                estimate_text_width(&ch.to_string(), context.object.font_size)
+                    / context.object.font_size.max(1.0)
+            });
+
+        if index + 1 < chars.len() {
+            advance += (context.state.char_spacing / context.object.font_size.max(1.0))
+                * (context.state.horizontal_scaling / 100.0);
+        }
+
+        let (x, y) = transform_point(context.object.transform, cursor, 0.0);
+        let glyph_transform =
+            multiply_matrix(context.object.transform, [1.0, 0.0, 0.0, 1.0, cursor, 0.0]);
+        glyphs.push(LayoutGlyph {
+            ch: ch.to_string(),
+            glyph_id,
+            x,
+            y,
+            advance,
+            bbox: transformed_rect_bounds(glyph_transform, advance.max(0.0), 1.2),
+        });
+        cursor += advance;
+    }
+
+    (glyphs, cursor)
+}
+
 fn unit_bounds_after_transform(transform: [f32; 6]) -> Rect {
     transformed_rect_bounds(transform, 1.0, 1.0)
 }
@@ -2329,6 +2556,20 @@ fn transform_point(transform: [f32; 6], x: f32, y: f32) -> (f32, f32) {
     (
         transform[0] * x + transform[2] * y + transform[4],
         transform[1] * x + transform[3] * y + transform[5],
+    )
+}
+
+fn inverse_transform_point(transform: [f32; 6], point: Point) -> Point {
+    let [a, b, c, d, e, f] = transform;
+    let determinant = a * d - b * c;
+    if determinant.abs() <= f32::EPSILON {
+        return Point::new(point.x, point.y);
+    }
+    let x = point.x - e;
+    let y = point.y - f;
+    Point::new(
+        (d * x - c * y) / determinant,
+        (-b * x + a * y) / determinant,
     )
 }
 
@@ -2664,7 +2905,10 @@ fn parse_cid_font_metrics(
     font: &Dictionary,
     to_unicode: Option<&ToUnicodeMap>,
 ) -> Option<FontMetrics> {
-    let descendants = font.get(b"DescendantFonts").ok()?.as_array().ok()?;
+    let descendants = font
+        .get(b"DescendantFonts")
+        .ok()
+        .and_then(|object| array_from_object(document, object))?;
     let descendant = descendants
         .first()
         .and_then(|object| dictionary_from_object(document, object))?;
@@ -2759,7 +3003,10 @@ fn font_descriptor<'a>(document: &'a Document, font: &'a Dictionary) -> Option<&
         return Some(descriptor);
     }
 
-    let descendants = font.get(b"DescendantFonts").ok()?.as_array().ok()?;
+    let descendants = font
+        .get(b"DescendantFonts")
+        .ok()
+        .and_then(|object| array_from_object(document, object))?;
     let descendant = descendants
         .first()
         .and_then(|object| dictionary_from_object(document, object))?;
@@ -2771,7 +3018,9 @@ fn font_descriptor<'a>(document: &'a Document, font: &'a Dictionary) -> Option<&
 
 fn font_file_bytes(
     document: &Document,
+    _font: &Dictionary,
     descriptor: &Dictionary,
+    to_unicode: Option<&ToUnicodeMap>,
 ) -> Option<(Vec<u8>, &'static str, &'static str, &'static str)> {
     if let Some(bytes) = descriptor
         .get(b"FontFile2")
@@ -2802,6 +3051,11 @@ fn font_file_bytes(
             _ => ("application/octet-stream", "unknown", "font"),
         };
         if let Some(bytes) = stream_content_bytes(stream) {
+            if matches!(subtype.as_str(), "Type1C" | "CIDFontType0C") {
+                if let Some(otf) = cff_otf_wrap::wrap_cff_as_otf(&bytes, to_unicode) {
+                    return Some((otf, "font/otf", "opentype", "otf"));
+                }
+            }
             if matches!(format, "opentype") && !sfnt_has_usable_cmap(&bytes) {
                 return Some((bytes, "application/octet-stream", "unknown", "font"));
             }
@@ -2860,7 +3114,10 @@ fn sfnt_has_usable_cmap(bytes: &[u8]) -> bool {
 mod cff_otf_wrap {
     use super::*;
 
-    fn wrap_cff_as_otf(cff: &[u8], to_unicode: Option<&ToUnicodeMap>) -> Option<Vec<u8>> {
+    pub(super) fn wrap_cff_as_otf(
+        cff: &[u8],
+        to_unicode: Option<&ToUnicodeMap>,
+    ) -> Option<Vec<u8>> {
         let (sid_map, cff_glyph_count) = parse_cff_unicode_map(cff)?;
         let glyph_count = cff_glyph_count.max(1);
 
@@ -3608,12 +3865,23 @@ fn font_base_name(document: &Document, font: &Dictionary) -> Option<String> {
         return Some(name);
     }
 
-    let descendants = font.get(b"DescendantFonts").ok()?.as_array().ok()?;
+    let descendants = font
+        .get(b"DescendantFonts")
+        .ok()
+        .and_then(|object| array_from_object(document, object))?;
     descendants
         .first()
         .and_then(|object| dictionary_from_object(document, object))
         .and_then(|dict| dict.get(b"BaseFont").ok())
         .and_then(object_plain_text)
+}
+
+fn array_from_object<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Vec<Object>> {
+    match object {
+        Object::Reference(id) => document.get_object(*id).ok()?.as_array().ok(),
+        Object::Array(array) => Some(array),
+        _ => None,
+    }
 }
 
 fn dictionary_from_object<'a>(

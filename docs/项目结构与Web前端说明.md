@@ -20,9 +20,8 @@ Demo 支持：
 
 - 选择本地 PDF 文件。
 - 指定页码并解析页面。
-- 显示背景 PNG 层。
-- 显示独立图片对象层。
-- 显示并选择文本对象。
+- 使用 CanvasKit/Skia 渲染页面背景 PNG 和结构化文本。
+- 通过透明交互层选择文本对象。
 - 修改指定文本对象内容。
 - 保存并下载更新后的 PDF。
 
@@ -67,12 +66,11 @@ npm run web:build
 
 ## 前端分层
 
-Web 编辑器按三层绘制：
+Web 编辑器的可视页面内容由 CanvasKit/Skia 统一绘制，DOM 只负责控件、文件选择和透明交互热区：
 
 ```text
-background layer: 页面基础背景，来自 pdf_page_background_png()
-image layer:      图片对象，来自 pdf_image_object_png()
-text layer:       文本对象，来自 pdf_page_to_json()
+skia page layer:    页面基础背景 PNG + 结构化文本对象
+interaction layer:  透明文本对象热区、内联编辑框、布局预览
 ```
 
 保存时，前端把文本修改整理为 JSON，调用：

@@ -85,6 +85,8 @@ impl Color {
 pub struct PageInfo {
     pub index: PageIndex,
     pub size: Size,
+    #[serde(default)]
+    pub rotation: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -159,6 +161,8 @@ pub struct StructuredTextObject {
     pub transform: [f32; 6],
     pub angle_degrees: f32,
     pub z_index: usize,
+    #[serde(default)]
+    pub glyphs: Vec<LayoutGlyph>,
     pub runs: Vec<TextRun>,
 }
 
@@ -188,6 +192,50 @@ pub struct StructuredImageObject {
     pub filters: Vec<String>,
     pub byte_len: usize,
     pub z_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct HitTestResult {
+    pub object_id: PdfObjectId,
+    pub object_type: String,
+    pub page: PageIndex,
+    pub local_position: Point,
+    pub text_run_index: Option<usize>,
+    pub glyph_index: Option<usize>,
+    pub bbox: Rect,
+    pub matrix: [f32; 6],
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct LayoutGlyph {
+    pub ch: String,
+    pub glyph_id: Option<u32>,
+    pub x: f32,
+    pub y: f32,
+    pub advance: f32,
+    pub bbox: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct TextEditSessionInfo {
+    pub object_id: TextObjectId,
+    pub page: PageIndex,
+    pub original_text: String,
+    pub bbox: Rect,
+    pub matrix: [f32; 6],
+    pub font_id: Option<String>,
+    pub font_size: f32,
+    pub writing_mode: Option<String>,
+    pub glyphs: Vec<LayoutGlyph>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct TextLayoutPreview {
+    pub object_id: TextObjectId,
+    pub text: String,
+    pub glyphs: Vec<LayoutGlyph>,
+    pub bbox: Rect,
+    pub overflow: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
