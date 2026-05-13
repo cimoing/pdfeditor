@@ -158,12 +158,22 @@ pub struct StructuredTextObject {
     pub font_name: Option<String>,
     pub font_size: f32,
     pub color: Color,
+    #[serde(default = "default_stroke_color")]
+    pub stroke_color: Color,
+    #[serde(default)]
+    pub stroke_width: f32,
+    #[serde(default)]
+    pub rendering_mode: i32,
     pub transform: [f32; 6],
     pub angle_degrees: f32,
     pub z_index: usize,
     #[serde(default)]
     pub glyphs: Vec<LayoutGlyph>,
     pub runs: Vec<TextRun>,
+}
+
+const fn default_stroke_color() -> Color {
+    Color::BLACK
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

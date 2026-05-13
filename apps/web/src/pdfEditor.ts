@@ -43,6 +43,9 @@ export interface StructuredTextObject {
   font_name: string | null;
   font_size: number;
   color: { r: number; g: number; b: number; a: number };
+  stroke_color: { r: number; g: number; b: number; a: number };
+  stroke_width: number;
+  rendering_mode: number;
   transform: [number, number, number, number, number, number];
   angle_degrees: number;
   z_index: number;
@@ -123,6 +126,8 @@ export interface TextLayoutPreview {
 export interface EmbeddedFontInfo {
   resource_name: string;
   family_name: string;
+  font_weight: number;
+  is_bold: boolean;
   file_name: string;
   mime_type: string;
   format: string;
@@ -218,6 +223,8 @@ export async function loadPdfPage(
   const fontAssets = metadata.fonts.map((font) => ({
     resource_name: font.resource_name,
     family_name: font.family_name,
+    font_weight: font.font_weight,
+    is_bold: font.is_bold,
     file_name: font.file_name,
     mime_type: font.mime_type,
     format: font.format,
@@ -423,7 +430,9 @@ async function loadEmbeddedFonts(fonts: FontBundleInfo[], payload: Uint8Array): 
       // Use the CSS-compatible format hint. CFF data is exposed as "opentype"
       // because browsers handle CFF outlines inside OpenType containers.
       const source = `url(${blobUrl}) format("${cssFontFormat(font.format)}")`;
-      const face = new FontFace(family, source);
+      const face = new FontFace(family, source, {
+        weight: `${font.font_weight || 400}`
+      });
       await face.load();
       document.fonts.add(face);
       loadedFontFaces.push(face);

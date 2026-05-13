@@ -34,6 +34,9 @@ pub trait EngineDocument {
                 font_name: object.font_name,
                 font_size: object.font_size,
                 color: object.color,
+                stroke_color: object.color,
+                stroke_width: 0.0,
+                rendering_mode: 0,
                 transform: [
                     object.font_size,
                     0.0,

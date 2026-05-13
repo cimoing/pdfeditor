@@ -247,6 +247,8 @@ fn encode_page_bundle(bundle: crate::PageLoadBundle) -> Result<Vec<u8>, JsValue>
         .map(|font| FontAssetBundleInfo {
             resource_name: font.resource_name,
             family_name: font.family_name,
+            font_weight: font.font_weight,
+            is_bold: font.is_bold,
             file_name: font.file_name.clone(),
             mime_type: font.mime_type.clone(),
             format: font.format,
@@ -304,6 +306,8 @@ pub fn pdf_page_fonts_to_json(pdf_bytes: &[u8], page_number: u32) -> Result<Stri
         .map(|font| FontAssetInfo {
             resource_name: font.resource_name,
             family_name: font.family_name,
+            font_weight: font.font_weight,
+            is_bold: font.is_bold,
             file_name: font.file_name,
             mime_type: font.mime_type,
             format: font.format,
@@ -399,6 +403,8 @@ struct TextEdit {
 struct FontAssetInfo {
     resource_name: String,
     family_name: String,
+    font_weight: u16,
+    is_bold: bool,
     file_name: String,
     mime_type: String,
     format: String,
@@ -425,6 +431,8 @@ struct ImageAssetInfo {
 struct FontAssetBundleInfo {
     resource_name: String,
     family_name: String,
+    font_weight: u16,
+    is_bold: bool,
     file_name: String,
     mime_type: String,
     format: String,

@@ -58,6 +58,8 @@ pub struct PageImageBytesExport {
 pub struct PageFontAsset {
     pub resource_name: String,
     pub family_name: String,
+    pub font_weight: u16,
+    pub is_bold: bool,
     pub file_name: String,
     pub mime_type: String,
     pub format: String,
@@ -727,10 +729,13 @@ impl LopdfDocument {
                 continue;
             };
             let family_name = font_family_name(&self.document, font, &resource_name);
+            let font_weight = font_weight(&self.document, font).unwrap_or(400);
             let file_name = format!("{}.{}", sanitize_file_stem(&resource_name), extension);
             assets.push(PageFontAsset {
                 resource_name,
                 family_name,
+                font_weight,
+                is_bold: font_weight >= 600,
                 file_name,
                 mime_type: mime_type.to_string(),
                 format: format.to_string(),
@@ -780,6 +785,9 @@ impl LopdfDocument {
                         font_name: state.text.font_name.clone(),
                         font_size: state.text.font_size,
                         color: state.text.color,
+                        stroke_color: state.text.stroke_color,
+                        stroke_width: state.text.stroke_width,
+                        rendering_mode: state.text.rendering_mode,
                         transform,
                         angle_degrees: matrix_angle_degrees(transform),
                         z_index: operation_index,
@@ -802,6 +810,9 @@ impl LopdfDocument {
                     font_name: state.text.font_name.clone(),
                     font_size: state.text.font_size,
                     color: state.text.color,
+                    stroke_color: state.text.stroke_color,
+                    stroke_width: state.text.stroke_width,
+                    rendering_mode: state.text.rendering_mode,
                     transform,
                     angle_degrees: matrix_angle_degrees(transform),
                     z_index: operation_index,
@@ -2203,6 +2214,9 @@ struct TextParseState {
     word_spacing: f32,
     horizontal_scaling: f32,
     color: Color,
+    stroke_color: Color,
+    stroke_width: f32,
+    rendering_mode: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -2246,6 +2260,9 @@ impl Default for TextParseState {
             word_spacing: 0.0,
             horizontal_scaling: 100.0,
             color: Color::BLACK,
+            stroke_color: Color::BLACK,
+            stroke_width: 1.0,
+            rendering_mode: 0,
         }
     }
 }
@@ -2332,6 +2349,40 @@ fn update_page_state(state: &mut PageParseState, operation: &Operation) {
                 );
             }
         }
+        "g" => {
+            if let Some(color) = gray_color(operation) {
+                state.text.color = color;
+            }
+        }
+        "RG" => {
+            if let (Some(r), Some(g), Some(b)) = (
+                operation.operands.first().and_then(object_to_f32),
+                operation.operands.get(1).and_then(object_to_f32),
+                operation.operands.get(2).and_then(object_to_f32),
+            ) {
+                state.text.stroke_color = Color::rgba(
+                    normalized_color_channel(r),
+                    normalized_color_channel(g),
+                    normalized_color_channel(b),
+                    255,
+                );
+            }
+        }
+        "G" => {
+            if let Some(color) = gray_color(operation) {
+                state.text.stroke_color = color;
+            }
+        }
+        "w" => {
+            if let Some(width) = operation.operands.first().and_then(object_to_f32) {
+                state.text.stroke_width = width.max(0.0);
+            }
+        }
+        "Tr" => {
+            if let Some(mode) = operation.operands.first().and_then(object_to_i64) {
+                state.text.rendering_mode = mode.clamp(0, 7) as i32;
+            }
+        }
         _ => {}
     }
 }
@@ -2391,6 +2442,40 @@ fn update_text_state(state: &mut TextParseState, operation: &Operation) {
                     normalized_color_channel(b),
                     255,
                 );
+            }
+        }
+        "g" => {
+            if let Some(color) = gray_color(operation) {
+                state.color = color;
+            }
+        }
+        "RG" => {
+            if let (Some(r), Some(g), Some(b)) = (
+                operation.operands.first().and_then(object_to_f32),
+                operation.operands.get(1).and_then(object_to_f32),
+                operation.operands.get(2).and_then(object_to_f32),
+            ) {
+                state.stroke_color = Color::rgba(
+                    normalized_color_channel(r),
+                    normalized_color_channel(g),
+                    normalized_color_channel(b),
+                    255,
+                );
+            }
+        }
+        "G" => {
+            if let Some(color) = gray_color(operation) {
+                state.stroke_color = color;
+            }
+        }
+        "w" => {
+            if let Some(width) = operation.operands.first().and_then(object_to_f32) {
+                state.stroke_width = width.max(0.0);
+            }
+        }
+        "Tr" => {
+            if let Some(mode) = operation.operands.first().and_then(object_to_i64) {
+                state.rendering_mode = mode.clamp(0, 7) as i32;
             }
         }
         _ => {}
@@ -2921,7 +3006,7 @@ fn parse_cid_font_metrics(
     if let Some(width_entries) = descendant
         .get(b"W")
         .ok()
-        .and_then(|object| object.as_array().ok())
+        .and_then(|object| array_from_object(document, object))
     {
         parse_cid_widths(width_entries, &mut widths);
     }
@@ -3028,6 +3113,12 @@ fn font_file_bytes(
         .and_then(|object| stream_from_object(document, object))
         .and_then(stream_content_bytes)
     {
+        if let Some(to_unicode) = to_unicode {
+            if let Some(remapped) = cff_otf_wrap::wrap_sfnt_with_tounicode_cmap(&bytes, to_unicode)
+            {
+                return Some((remapped, "font/ttf", "truetype", "ttf"));
+            }
+        }
         if !sfnt_has_usable_cmap(&bytes) {
             return Some((bytes, "application/octet-stream", "unknown", "font"));
         }
@@ -3113,6 +3204,29 @@ fn sfnt_has_usable_cmap(bytes: &[u8]) -> bool {
 #[allow(dead_code)]
 mod cff_otf_wrap {
     use super::*;
+
+    pub(super) fn wrap_sfnt_with_tounicode_cmap(
+        sfnt: &[u8],
+        to_unicode: &ToUnicodeMap,
+    ) -> Option<Vec<u8>> {
+        let version = sfnt.get(0..4)?.try_into().ok()?;
+        let mut tables = read_sfnt_tables(sfnt)?;
+        let cmap_entries = build_sfnt_tounicode_cmap_entries(sfnt, to_unicode)?;
+        let cmap = build_cmap_table(&cmap_entries)?;
+
+        let mut replaced = false;
+        for (tag, data) in &mut tables {
+            if tag == b"cmap" {
+                *data = cmap.clone();
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            tables.push((*b"cmap", cmap));
+        }
+        build_sfnt(version, tables)
+    }
 
     pub(super) fn wrap_cff_as_otf(
         cff: &[u8],
@@ -3488,6 +3602,149 @@ mod cff_otf_wrap {
         Some(table)
     }
 
+    fn build_sfnt_tounicode_cmap_entries(
+        sfnt: &[u8],
+        to_unicode: &ToUnicodeMap,
+    ) -> Option<Vec<(u16, u16)>> {
+        let cmap = find_sfnt_table(sfnt, b"cmap")?;
+        let mut entries = Vec::new();
+        for (source, unicode_str) in &to_unicode.forward {
+            let char_code = bytes_to_u32(source)?;
+            let glyph_id = lookup_sfnt_glyph_id(cmap, char_code)?;
+            let ch = unicode_str.chars().next()?;
+            let codepoint = ch as u32;
+            if glyph_id != 0 && codepoint > 0 && codepoint <= 0xFFFF {
+                entries.push((codepoint as u16, glyph_id));
+            }
+        }
+        if entries.is_empty() {
+            None
+        } else {
+            entries.sort_by_key(|(cp, _)| *cp);
+            entries.dedup_by_key(|(cp, _)| *cp);
+            Some(entries)
+        }
+    }
+
+    fn read_sfnt_tables(sfnt: &[u8]) -> Option<Vec<([u8; 4], Vec<u8>)>> {
+        if sfnt.len() < 12 {
+            return None;
+        }
+        let num_tables = usize::from(read_u16(sfnt, 4)?);
+        let mut tables = Vec::with_capacity(num_tables);
+        for index in 0..num_tables {
+            let record_offset = 12 + index * 16;
+            let tag: [u8; 4] = sfnt.get(record_offset..record_offset + 4)?.try_into().ok()?;
+            let table_offset = read_u32(sfnt, record_offset + 8)? as usize;
+            let table_length = read_u32(sfnt, record_offset + 12)? as usize;
+            let data = sfnt.get(table_offset..table_offset + table_length)?.to_vec();
+            tables.push((tag, data));
+        }
+        Some(tables)
+    }
+
+    fn find_sfnt_table<'a>(sfnt: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
+        if sfnt.len() < 12 {
+            return None;
+        }
+        let num_tables = usize::from(read_u16(sfnt, 4)?);
+        for index in 0..num_tables {
+            let record_offset = 12 + index * 16;
+            if sfnt.get(record_offset..record_offset + 4)? != tag {
+                continue;
+            }
+            let table_offset = read_u32(sfnt, record_offset + 8)? as usize;
+            let table_length = read_u32(sfnt, record_offset + 12)? as usize;
+            return sfnt.get(table_offset..table_offset + table_length);
+        }
+        None
+    }
+
+    fn lookup_sfnt_glyph_id(cmap: &[u8], char_code: u32) -> Option<u16> {
+        if cmap.len() < 4 {
+            return None;
+        }
+        let subtable_count = usize::from(read_u16(cmap, 2)?);
+        for index in 0..subtable_count {
+            let record_offset = 4 + index * 8;
+            let subtable_offset = read_u32(cmap, record_offset + 4)? as usize;
+            let subtable = cmap.get(subtable_offset..)?;
+            let format = read_u16(subtable, 0)?;
+            let glyph_id = match format {
+                4 => lookup_cmap_format4(subtable, char_code),
+                12 => lookup_cmap_format12(subtable, char_code),
+                _ => None,
+            };
+            if let Some(glyph_id) = glyph_id {
+                if glyph_id != 0 {
+                    return Some(glyph_id);
+                }
+            }
+        }
+        None
+    }
+
+    fn lookup_cmap_format4(subtable: &[u8], char_code: u32) -> Option<u16> {
+        let code = u16::try_from(char_code).ok()?;
+        let seg_count = usize::from(read_u16(subtable, 6)?) / 2;
+        let end_codes_offset = 14usize;
+        let start_codes_offset = end_codes_offset + seg_count * 2 + 2;
+        let id_delta_offset = start_codes_offset + seg_count * 2;
+        let id_range_offset_offset = id_delta_offset + seg_count * 2;
+        for index in 0..seg_count {
+            let end_code = read_u16(subtable, end_codes_offset + index * 2)?;
+            let start_code = read_u16(subtable, start_codes_offset + index * 2)?;
+            if code < start_code || code > end_code {
+                continue;
+            }
+            let id_delta = read_u16(subtable, id_delta_offset + index * 2)?;
+            let id_range_offset = read_u16(subtable, id_range_offset_offset + index * 2)?;
+            if id_range_offset == 0 {
+                return Some(code.wrapping_add(id_delta));
+            }
+            let ro_pos = id_range_offset_offset + index * 2;
+            let glyph_offset =
+                ro_pos + usize::from(id_range_offset) + usize::from(code - start_code) * 2;
+            let glyph_id = read_u16(subtable, glyph_offset)?;
+            if glyph_id == 0 {
+                return Some(0);
+            }
+            return Some(glyph_id.wrapping_add(id_delta));
+        }
+        None
+    }
+
+    fn lookup_cmap_format12(subtable: &[u8], char_code: u32) -> Option<u16> {
+        let groups = read_u32(subtable, 12)? as usize;
+        for index in 0..groups {
+            let group_offset = 16 + index * 12;
+            let start_char = read_u32(subtable, group_offset)?;
+            let end_char = read_u32(subtable, group_offset + 4)?;
+            if char_code < start_char || char_code > end_char {
+                continue;
+            }
+            let start_glyph = read_u32(subtable, group_offset + 8)?;
+            return u16::try_from(start_glyph + (char_code - start_char)).ok();
+        }
+        None
+    }
+
+    fn bytes_to_u32(bytes: &[u8]) -> Option<u32> {
+        if bytes.is_empty() || bytes.len() > 4 {
+            return None;
+        }
+        Some(
+            bytes
+                .iter()
+                .fold(0u32, |value, byte| (value << 8) | u32::from(*byte)),
+        )
+    }
+
+    fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+        let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+        Some(u32::from_be_bytes(bytes))
+    }
+
     fn parse_cff_unicode_map(cff: &[u8]) -> Option<(Vec<(u16, u16)>, u16)> {
         let header_size = usize::from(*cff.get(2)?);
         let (_, name_end) = read_cff_index(cff, header_size)?;
@@ -3858,6 +4115,36 @@ fn font_family_name(document: &Document, font: &Dictionary, resource_name: &str)
         .map(|name| strip_subset_prefix(&name).to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| resource_name.to_string())
+}
+
+fn font_weight(document: &Document, font: &Dictionary) -> Option<u16> {
+    let name = font_family_name(document, font, "");
+    let inferred = infer_font_weight_from_name(&name);
+    let descriptor_weight = font_descriptor(document, font)
+        .and_then(|descriptor| descriptor.get(b"FontWeight").ok())
+        .and_then(object_to_f32)
+        .map(|value| value.round().clamp(1.0, 1000.0) as u16);
+    descriptor_weight.or(inferred)
+}
+
+fn infer_font_weight_from_name(name: &str) -> Option<u16> {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("extrablack") || lower.contains("ultrablack") {
+        return Some(950);
+    }
+    if lower.contains("black") || lower.contains("heavy") {
+        return Some(900);
+    }
+    if lower.contains("extrabold") || lower.contains("ultrabold") {
+        return Some(800);
+    }
+    if lower.contains("semibold") || lower.contains("demibold") {
+        return Some(600);
+    }
+    if lower.contains("bold") {
+        return Some(700);
+    }
+    None
 }
 
 fn font_base_name(document: &Document, font: &Dictionary) -> Option<String> {

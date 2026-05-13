@@ -11,7 +11,7 @@ import canvasKitWasmUrl from "canvaskit-wasm/bin/canvaskit.wasm?url";
 import notoSansScChineseSimplifiedUrl from "@fontsource/noto-sans-sc/files/noto-sans-sc-chinese-simplified-400-normal.woff?url";
 import notoSansScLatinUrl from "@fontsource/noto-sans-sc/files/noto-sans-sc-latin-400-normal.woff?url";
 import type { LayoutGlyph, LoadedFontAsset, StructuredTextObject } from "./pdfEditor";
-import { pdfToViewport, type PageViewport, type ViewportRect } from "./viewport";
+import { pdfToViewport, type PageViewport } from "./viewport";
 
 interface RenderInput {
   canvas: HTMLCanvasElement;
@@ -19,7 +19,6 @@ interface RenderInput {
   backgroundUrl: string;
   texts: StructuredTextObject[];
   fonts: LoadedFontAsset[];
-  hiddenTextIds?: Set<number>;
 }
 
 let canvasKitReady: Promise<CanvasKit> | null = null;
@@ -39,12 +38,13 @@ export class SkiaPageRenderer {
   private backgroundImage: Image | null = null;
   private backgroundUrl: string | null = null;
   private typefaces = new Map<string, Typeface>();
+  private fontInfo = new Map<string, LoadedFontAsset>();
   private fallbackTypefaces: Typeface[] = [];
   private fallbackLoadStarted = false;
   private defaultTypeface: Typeface | null = null;
   private loggedFontDiagnostics = new Set<string>();
 
-  async render(input: RenderInput): Promise<Map<number, ViewportRect>> {
+  async render(input: RenderInput): Promise<void> {
     const canvasKit = await ensureCanvasKit();
     this.defaultTypeface ??= canvasKit.Typeface.GetDefault();
     this.resizeCanvas(input.canvas, input.viewport);
@@ -58,16 +58,14 @@ export class SkiaPageRenderer {
     skiaCanvas.save();
     skiaCanvas.scale(input.viewport.devicePixelRatio, input.viewport.devicePixelRatio);
     this.drawBackground(canvasKit, skiaCanvas, background, input.viewport);
-    const measuredTextRects = this.drawStructuredText(
+    this.drawStructuredText(
       canvasKit,
       skiaCanvas,
       input.viewport,
-      input.texts,
-      input.hiddenTextIds ?? new Set()
+      input.texts
     );
     skiaCanvas.restore();
     surface.flush();
-    return measuredTextRects;
   }
 
   dispose() {
@@ -81,6 +79,7 @@ export class SkiaPageRenderer {
     }
     this.backgroundImage = null;
     this.backgroundUrl = null;
+    this.fontInfo.clear();
     this.surface = null;
     this.surfaceCanvas = null;
     this.surfaceWidth = 0;
@@ -138,10 +137,12 @@ export class SkiaPageRenderer {
       if (!nextKeys.has(key)) {
         typeface.delete();
         this.typefaces.delete(key);
+        this.fontInfo.delete(key);
       }
     }
 
     for (const font of fonts) {
+      this.fontInfo.set(font.resource_name, font);
       if (this.typefaces.has(font.resource_name)) continue;
       const typeface = canvasKit.Typeface.MakeTypefaceFromData(font.data.slice(0));
       if (typeface) {
@@ -203,13 +204,8 @@ export class SkiaPageRenderer {
     canvasKit: CanvasKit,
     canvas: Canvas,
     viewport: PageViewport,
-    texts: StructuredTextObject[],
-    hiddenTextIds: Set<number>
-  ): Map<number, ViewportRect> {
-    const paint = new canvasKit.Paint();
-    paint.setAntiAlias(true);
-    const measuredTextRects = new Map<number, ViewportRect>();
-
+    texts: StructuredTextObject[]
+  ) {
     for (const text of [...texts].sort((left, right) => left.z_index - right.z_index)) {
       if (!text.content) continue;
 
@@ -223,32 +219,70 @@ export class SkiaPageRenderer {
       const scaleX = Math.hypot(xAxisEnd.x - origin.x, xAxisEnd.y - origin.y) / Math.max(fontSize, 1);
       const angle = (Math.atan2(xAxisEnd.y - origin.y, xAxisEnd.x - origin.x) * 180) / Math.PI;
       const lines = text.content.split("\n");
-      const lineHeight = fontSize * 1.2;
       const glyphLines = splitGlyphsByLine(text);
-      const lineWidths = lines.map((line, index) =>
-        this.measureLineWidth(canvasKit, text, fontSize, line, paint, glyphLines?.[index])
-      );
-      measuredTextRects.set(
-        text.id,
-        measuredViewportRect(origin, angle, scaleX || 1, Math.max(...lineWidths, 1), fontSize, lineHeight, lines.length)
-      );
-      if (hiddenTextIds.has(text.id)) continue;
+      const trustGlyphPositions = glyphLines ? shouldTrustGlyphPositions(glyphLines) : false;
+      const paints = createTextPaints(canvasKit, text, viewport.zoom);
+      try {
+        for (const paint of paints) {
+          if (glyphLines && trustGlyphPositions) {
+            this.drawGlyphLinesAbsolute(canvasKit, canvas, viewport, text, fontSize, angle, paint, glyphLines);
+            continue;
+          }
 
-      paint.setColor(canvasKit.Color(text.color.r, text.color.g, text.color.b, text.color.a / 255));
-      canvas.save();
-      canvas.translate(origin.x, origin.y);
-      canvas.rotate(angle, 0, 0);
-      canvas.scale(scaleX || 1, 1);
-      this.clipToTextBounds(canvasKit, canvas, viewport, text, scaleX || 1, fontSize, lineHeight);
+          canvas.save();
+          canvas.translate(origin.x, origin.y);
+          canvas.rotate(angle, 0, 0);
+          canvas.scale(scaleX || 1, 1);
+          const targetLineWidth = Math.max((text.bounds.size.width * viewport.zoom) / Math.max(scaleX || 1, 0.001), 1);
 
-      for (const [index, line] of lines.entries()) {
-        this.drawLine(canvasKit, canvas, text, fontSize, line, index * lineHeight, paint, glyphLines?.[index]);
+          for (const [index, line] of lines.entries()) {
+            this.drawLine(
+              canvasKit,
+              canvas,
+              text,
+              fontSize,
+              line,
+              index * fontSize * 1.2,
+              paint,
+              glyphLines?.[index],
+              targetLineWidth
+            );
+          }
+          canvas.restore();
+        }
+      } finally {
+        for (const paint of paints) {
+          paint.delete();
+        }
       }
-      canvas.restore();
     }
+  }
 
-    paint.delete();
-    return measuredTextRects;
+  private drawGlyphLinesAbsolute(
+    canvasKit: CanvasKit,
+    canvas: Canvas,
+    viewport: PageViewport,
+    text: StructuredTextObject,
+    size: number,
+    angle: number,
+    paint: Paint,
+    glyphLines: LayoutGlyph[][]
+  ) {
+    for (const line of glyphLines) {
+      for (const glyph of line) {
+        const plan = this.resolveGlyphPlan(canvasKit, text, size, glyph.ch, paint, glyph);
+        const point = pdfToViewport(viewport, glyph.x, glyph.y);
+        canvas.save();
+        canvas.translate(point.x, point.y);
+        canvas.rotate(angle, 0, 0);
+        if (plan.drawScaleX !== 1) {
+          canvas.scale(plan.drawScaleX, 1);
+        }
+        canvas.drawText(glyph.ch, plan.drawOffsetX, 0, paint, plan.font);
+        canvas.restore();
+        plan.font.delete();
+      }
+    }
   }
 
   private drawLine(
@@ -259,35 +293,34 @@ export class SkiaPageRenderer {
     line: string,
     y: number,
     paint: Paint,
-    glyphs?: LayoutGlyph[]
+    glyphs?: LayoutGlyph[],
+    targetWidth?: number
   ) {
-    let x = 0;
     const chars = Array.from(line);
-    for (const [index, char] of chars.entries()) {
-      const glyph = glyphs?.[index];
-      const plan = this.resolveGlyphPlan(canvasKit, text, size, char, paint, glyph);
-      canvas.drawText(char, x, y, paint, plan.font);
+    const plans = chars.map((char, index) => this.resolveGlyphPlan(canvasKit, text, size, char, paint, glyphs?.[index]));
+    const lineWidth = plans.reduce((sum, plan) => sum + plan.advance, 0);
+    const fitScale =
+      targetWidth && lineWidth > 0
+        ? Math.min(targetWidth / lineWidth, 1)
+        : 1;
+
+    canvas.save();
+    if (fitScale !== 1) {
+      canvas.scale(fitScale, 1);
+    }
+    let x = 0;
+    for (const [index, plan] of plans.entries()) {
+      canvas.save();
+      canvas.translate(x, 0);
+      if (plan.drawScaleX !== 1) {
+        canvas.scale(plan.drawScaleX, 1);
+      }
+      canvas.drawText(chars[index], plan.drawOffsetX, y, paint, plan.font);
+      canvas.restore();
       x += plan.advance;
       plan.font.delete();
     }
-  }
-
-  private measureLineWidth(
-    canvasKit: CanvasKit,
-    text: StructuredTextObject,
-    size: number,
-    line: string,
-    paint: Paint,
-    glyphs?: LayoutGlyph[]
-  ) {
-    let width = 0;
-    const chars = Array.from(line);
-    for (const [index, char] of chars.entries()) {
-      const plan = this.resolveGlyphPlan(canvasKit, text, size, char, paint, glyphs?.[index]);
-      width += plan.advance;
-      plan.font.delete();
-    }
-    return width;
+    canvas.restore();
   }
 
   private resolveGlyphPlan(
@@ -298,58 +331,62 @@ export class SkiaPageRenderer {
     paint: Paint,
     glyph?: LayoutGlyph
   ) {
-    const resolved = this.fontForText(canvasKit, text, size, content, glyph);
+    const resolved = this.fontForText(canvasKit, text, size, content);
+    const measuredWidth = measureGlyphWidth(resolved.font, content, paint);
     const advance =
       resolved.source === "embedded"
-        ? glyphAdvance(resolved.font, content, size, paint, glyph?.advance, content)
-        : glyphAdvance(resolved.font, content, size, paint);
+        ? glyphAdvance(measuredWidth, size, glyph?.advance, content)
+        : measuredWidth > 0
+          ? measuredWidth
+          : size * 0.5;
+    const fit = fitGlyphWidth(advance, measuredWidth);
     if (resolved.source !== "embedded") {
       this.logFontFallback(text, content, resolved.source);
     }
-    return { font: resolved.font, advance };
+    return {
+      font: resolved.font,
+      advance,
+      drawScaleX: fit.scaleX,
+      drawOffsetX: fit.offsetX
+    };
   }
 
   private fontForText(
     canvasKit: CanvasKit,
     text: StructuredTextObject,
     size: number,
-    content: string,
-    glyph?: LayoutGlyph
+    content: string
   ) {
     const embedded = text.font_name ? this.typefaces.get(text.font_name) : null;
     if (embedded) {
       const font = new canvasKit.Font(embedded, size);
+      configureFont(font, this.isBoldText(text));
       if (fontHasGlyphs(font, content)) return { font, source: "embedded" as const };
       font.delete();
     }
 
     for (const typeface of this.fallbackTypefaces) {
       const font = new canvasKit.Font(typeface, size);
+      configureFont(font, this.isBoldText(text));
       if (fontHasGlyphs(font, content)) {
         return { font, source: "fallback" as const };
       }
       font.delete();
     }
 
-    return { font: new canvasKit.Font(this.defaultTypeface, size), source: "default" as const };
+    const font = new canvasKit.Font(this.defaultTypeface, size);
+    configureFont(font, this.isBoldText(text));
+    return { font, source: "default" as const };
   }
 
-  private clipToTextBounds(
-    canvasKit: CanvasKit,
-    canvas: Canvas,
-    viewport: PageViewport,
-    text: StructuredTextObject,
-    scaleX: number,
-    fontSize: number,
-    lineHeight: number
-  ) {
-    const clipWidth = Math.max((text.bounds.size.width * viewport.zoom) / Math.max(scaleX, 0.001), 1);
-    const clipHeight = Math.max(text.bounds.size.height * viewport.zoom, lineHeight);
-    const rect = canvasKit.XYWHRect(-2, -fontSize - 2, clipWidth + 4, clipHeight + 4);
-    canvas.clipRect(rect, canvasKit.ClipOp.Intersect, true);
+  private isBoldText(text: StructuredTextObject) {
+    const fontInfo = text.font_name ? this.fontInfo.get(text.font_name) : undefined;
+    return Boolean(fontInfo?.is_bold || (fontInfo?.font_weight ?? 400) >= 600);
   }
 
   private logFontFallback(text: StructuredTextObject, content: string, source: "fallback" | "default") {
+    if (isIgnorableForGlyphCheck(content)) return;
+    if (!text.font_name || !this.fontInfo.has(text.font_name)) return;
     const key = `${text.id}:${text.font_name ?? "none"}:${content}:${source}`;
     if (this.loggedFontDiagnostics.has(key)) return;
     this.loggedFontDiagnostics.add(key);
@@ -361,34 +398,111 @@ export class SkiaPageRenderer {
 
 function fontHasGlyphs(font: Font, content: string) {
   if (!content) return true;
-  return Array.from(font.getGlyphIDs(content)).every((glyphId) => glyphId !== 0);
+  if (isIgnorableForGlyphCheck(content)) return true;
+  const chars = Array.from(content).filter((char) => !isIgnorableForGlyphCheck(char));
+  if (chars.length === 0) return true;
+  return Array.from(font.getGlyphIDs(chars.join(""))).every((glyphId) => glyphId !== 0);
+}
+
+function configureFont(font: Font, embolden: boolean) {
+  font.setSubpixel(true);
+  font.setEmbolden(embolden);
+}
+
+function createTextPaints(canvasKit: CanvasKit, text: StructuredTextObject, zoom: number) {
+  const paints: Paint[] = [];
+  if (shouldFillText(text.rendering_mode)) {
+    const paint = new canvasKit.Paint();
+    paint.setAntiAlias(true);
+    paint.setStyle(canvasKit.PaintStyle.Fill);
+    paint.setColor(canvasKit.Color(text.color.r, text.color.g, text.color.b, text.color.a / 255));
+    paints.push(paint);
+  }
+  if (shouldStrokeText(text.rendering_mode)) {
+    const paint = new canvasKit.Paint();
+    paint.setAntiAlias(true);
+    paint.setStyle(canvasKit.PaintStyle.Stroke);
+    paint.setColor(
+      canvasKit.Color(
+        text.stroke_color.r,
+        text.stroke_color.g,
+        text.stroke_color.b,
+        text.stroke_color.a / 255
+      )
+    );
+    paint.setStrokeWidth(Math.max(text.stroke_width * zoom, 0.6));
+    paints.push(paint);
+  }
+  if (paints.length === 0) {
+    const paint = new canvasKit.Paint();
+    paint.setAntiAlias(true);
+    paint.setStyle(canvasKit.PaintStyle.Fill);
+    paint.setColor(canvasKit.Color(text.color.r, text.color.g, text.color.b, text.color.a / 255));
+    paints.push(paint);
+  }
+  return paints;
+}
+
+function shouldFillText(renderingMode: number) {
+  return renderingMode === 0 || renderingMode === 2 || renderingMode === 4 || renderingMode === 6;
+}
+
+function shouldStrokeText(renderingMode: number) {
+  return renderingMode === 1 || renderingMode === 2 || renderingMode === 5 || renderingMode === 6;
+}
+
+function isIgnorableForGlyphCheck(content: string) {
+  return /^[\s\u00A0\u2000-\u200F\u2028-\u202F\u205F\u3000]+$/u.test(content);
 }
 
 function glyphAdvance(
-  font: Font,
-  content: string,
+  measuredWidth: number,
   size: number,
-  paint: Paint,
   pdfAdvance?: number,
   originalText?: string
 ) {
-  const useMeasuredWidth = shouldUseMeasuredAdvance(originalText ?? content, pdfAdvance);
+  const useMeasuredWidth = shouldUseMeasuredAdvance(originalText ?? "", pdfAdvance);
   if (!useMeasuredWidth && typeof pdfAdvance === "number" && Number.isFinite(pdfAdvance) && pdfAdvance >= 0) {
     return pdfAdvance * size;
   }
+  return measuredWidth > 0 ? measuredWidth : size * 0.5;
+}
+
+function measureGlyphWidth(font: Font, content: string, paint: Paint) {
   const glyphs = font.getGlyphIDs(content);
   const widths = font.getGlyphWidths(glyphs, paint);
-  const width = Array.from(widths).reduce((sum, item) => sum + item, 0);
-  return width > 0 ? width : size * 0.5;
+  return Array.from(widths).reduce((sum, item) => sum + item, 0);
+}
+
+function fitGlyphWidth(expectedWidth: number, measuredWidth: number) {
+  if (!(expectedWidth > 0) || !(measuredWidth > 0)) {
+    return { scaleX: 1, offsetX: 0 };
+  }
+  if (measuredWidth > expectedWidth) {
+    return { scaleX: expectedWidth / measuredWidth, offsetX: 0 };
+  }
+  if (Math.abs(measuredWidth - expectedWidth) < 0.01) {
+    return { scaleX: 1, offsetX: 0 };
+  }
+  return { scaleX: 1, offsetX: (expectedWidth - measuredWidth) / 2 };
 }
 
 function shouldUseMeasuredAdvance(content: string, pdfAdvance?: number) {
   if (!content || typeof pdfAdvance !== "number" || !Number.isFinite(pdfAdvance)) {
     return false;
   }
-  // PDF CID metrics for embedded Latin subset fonts in this project often collapse
-  // to 1em advances, which makes halfwidth ASCII look like fullwidth text.
+  // PDF CID metrics in this project often collapse ASCII and punctuation
+  // to coarse 1em advances, which makes halfwidth text too loose and
+  // can push punctuation into neighboring objects.
+  return isAsciiSingleChar(content) || isSinglePunctuation(content);
+}
+
+function isAsciiSingleChar(content: string) {
   return /^[\x20-\x7E]$/.test(content);
+}
+
+function isSinglePunctuation(content: string) {
+  return /^[\p{P}\u3000-\u303F\uFF00-\uFF65]$/u.test(content);
 }
 
 function splitGlyphsByLine(text: StructuredTextObject): LayoutGlyph[][] | null {
@@ -412,44 +526,12 @@ function splitGlyphsByLine(text: StructuredTextObject): LayoutGlyph[][] | null {
   return result;
 }
 
-function measuredViewportRect(
-  origin: { x: number; y: number },
-  angleDegrees: number,
-  scaleX: number,
-  width: number,
-  fontSize: number,
-  lineHeight: number,
-  lineCount: number
-): ViewportRect {
-  const angle = (angleDegrees * Math.PI) / 180;
-  const cos = Math.cos(angle);
-  const sin = Math.sin(angle);
-  const top = -fontSize;
-  const bottom = Math.max(fontSize * 0.25, (lineCount - 1) * lineHeight + fontSize * 0.25);
-  const points = [
-    localToViewport(origin, cos, sin, scaleX, 0, top),
-    localToViewport(origin, cos, sin, scaleX, width, top),
-    localToViewport(origin, cos, sin, scaleX, 0, bottom),
-    localToViewport(origin, cos, sin, scaleX, width, bottom)
-  ];
-  const padding = 2;
-  const left = Math.min(...points.map((point) => point.x)) - padding;
-  const right = Math.max(...points.map((point) => point.x)) + padding;
-  const rectTop = Math.min(...points.map((point) => point.y)) - padding;
-  const rectBottom = Math.max(...points.map((point) => point.y)) + padding;
-  return { left, top: rectTop, width: right - left, height: rectBottom - rectTop };
+function shouldTrustGlyphPositions(glyphLines: LayoutGlyph[][]) {
+  const glyphs = glyphLines.flat();
+  if (glyphs.length <= 1) {
+    return true;
+  }
+  const unitAdvanceCount = glyphs.filter((glyph) => Math.abs(glyph.advance - 1) < 0.001).length;
+  return unitAdvanceCount / glyphs.length < 0.8;
 }
 
-function localToViewport(
-  origin: { x: number; y: number },
-  cos: number,
-  sin: number,
-  scaleX: number,
-  x: number,
-  y: number
-) {
-  return {
-    x: origin.x + cos * x * scaleX - sin * y,
-    y: origin.y + sin * x * scaleX + cos * y
-  };
-}
