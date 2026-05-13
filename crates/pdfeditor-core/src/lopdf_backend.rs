@@ -7,7 +7,7 @@ use crate::{
 };
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use tiny_skia::{Color as SkiaColor, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
@@ -3235,11 +3235,13 @@ mod cff_otf_wrap {
         let (sid_map, cff_glyph_count) = parse_cff_unicode_map(cff)?;
         let glyph_count = cff_glyph_count.max(1);
 
-        // Prefer ToUnicode-derived cmap over SID-based cmap.
-        // ToUnicode gives char_code → unicode; CFF Encoding gives char_code → GID.
-        let cmap_entries = to_unicode
-            .and_then(|tu| build_tounicode_cmap_entries(cff, tu))
-            .unwrap_or(sid_map);
+        // For subset Latin CFF fonts, the charset/SID map is the most reliable
+        // source of unicode->gid. ToUnicode+Encoding is used as a supplement
+        // because some PDFs omit useful glyph names but still provide ToUnicode.
+        let mut cmap_entries = filter_cmap_entries_by_glyph_count(sid_map, glyph_count);
+        if let Some(extra_entries) = to_unicode.and_then(|tu| build_tounicode_cmap_entries(cff, tu, glyph_count)) {
+            merge_cmap_entries(&mut cmap_entries, extra_entries);
+        }
 
         let cmap = if cmap_entries.is_empty() {
             build_cmap_table(&[(0x0020, 0)])?
@@ -3269,6 +3271,7 @@ mod cff_otf_wrap {
     fn build_tounicode_cmap_entries(
         cff: &[u8],
         to_unicode: &ToUnicodeMap,
+        glyph_count: u16,
     ) -> Option<Vec<(u16, u16)>> {
         let encoding = parse_cff_encoding(cff)?;
         if encoding.is_empty() {
@@ -3280,7 +3283,7 @@ mod cff_otf_wrap {
             if let Some(unicode_str) = to_unicode.forward.get(&key) {
                 if let Some(ch) = unicode_str.chars().next() {
                     let cp = ch as u32;
-                    if cp > 0 && cp <= 0xFFFF {
+                    if cp > 0 && cp <= 0xFFFF && glyph_id != 0 && glyph_id < glyph_count {
                         entries.push((cp as u16, glyph_id));
                     }
                 }
@@ -3293,7 +3296,7 @@ mod cff_otf_wrap {
                 if let Some(unicode_str) = to_unicode.forward.get(&key) {
                     if let Some(ch) = unicode_str.chars().next() {
                         let cp = ch as u32;
-                        if cp > 0 && cp <= 0xFFFF {
+                        if cp > 0 && cp <= 0xFFFF && glyph_id != 0 && glyph_id < glyph_count {
                             entries.push((cp as u16, glyph_id));
                         }
                     }
@@ -3303,8 +3306,30 @@ mod cff_otf_wrap {
         if entries.is_empty() {
             None
         } else {
+            entries.sort_by_key(|(cp, _)| *cp);
+            entries.dedup_by_key(|(cp, _)| *cp);
             Some(entries)
         }
+    }
+
+    fn filter_cmap_entries_by_glyph_count(
+        mut entries: Vec<(u16, u16)>,
+        glyph_count: u16,
+    ) -> Vec<(u16, u16)> {
+        entries.retain(|(_, glyph_id)| *glyph_id != 0 && *glyph_id < glyph_count);
+        entries.sort_by_key(|(cp, _)| *cp);
+        entries.dedup_by_key(|(cp, _)| *cp);
+        entries
+    }
+
+    fn merge_cmap_entries(base: &mut Vec<(u16, u16)>, extra: Vec<(u16, u16)>) {
+        let mut seen = base.iter().map(|(cp, _)| *cp).collect::<HashSet<_>>();
+        for (cp, glyph_id) in extra {
+            if seen.insert(cp) {
+                base.push((cp, glyph_id));
+            }
+        }
+        base.sort_by_key(|(cp, _)| *cp);
     }
 
     /// Parse the CFF Encoding table to get character_code → glyph_index mappings.
@@ -3607,13 +3632,18 @@ mod cff_otf_wrap {
         to_unicode: &ToUnicodeMap,
     ) -> Option<Vec<(u16, u16)>> {
         let cmap = find_sfnt_table(sfnt, b"cmap")?;
+        let glyph_count = read_sfnt_num_glyphs(sfnt)?;
         let mut entries = Vec::new();
         for (source, unicode_str) in &to_unicode.forward {
             let char_code = bytes_to_u32(source)?;
             let glyph_id = lookup_sfnt_glyph_id(cmap, char_code)?;
             let ch = unicode_str.chars().next()?;
             let codepoint = ch as u32;
-            if glyph_id != 0 && codepoint > 0 && codepoint <= 0xFFFF {
+            if glyph_id != 0
+                && glyph_id < glyph_count
+                && codepoint > 0
+                && codepoint <= 0xFFFF
+            {
                 entries.push((codepoint as u16, glyph_id));
             }
         }
@@ -3624,6 +3654,11 @@ mod cff_otf_wrap {
             entries.dedup_by_key(|(cp, _)| *cp);
             Some(entries)
         }
+    }
+
+    fn read_sfnt_num_glyphs(sfnt: &[u8]) -> Option<u16> {
+        let maxp = find_sfnt_table(sfnt, b"maxp")?;
+        read_u16(maxp, 4)
     }
 
     fn read_sfnt_tables(sfnt: &[u8]) -> Option<Vec<([u8; 4], Vec<u8>)>> {

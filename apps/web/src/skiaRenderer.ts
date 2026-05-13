@@ -137,12 +137,18 @@ export class SkiaPageRenderer {
       if (!nextKeys.has(key)) {
         typeface.delete();
         this.typefaces.delete(key);
+      }
+    }
+    for (const key of [...this.fontInfo.keys()]) {
+      if (!nextKeys.has(key)) {
         this.fontInfo.delete(key);
       }
     }
 
     for (const font of fonts) {
-      this.fontInfo.set(font.resource_name, font);
+      if (!this.fontInfo.has(font.resource_name)) {
+        this.fontInfo.set(font.resource_name, font);
+      }
       if (this.typefaces.has(font.resource_name)) continue;
       const typeface = canvasKit.Typeface.MakeTypefaceFromData(font.data.slice(0));
       if (typeface) {
@@ -209,7 +215,7 @@ export class SkiaPageRenderer {
     for (const text of [...texts].sort((left, right) => left.z_index - right.z_index)) {
       if (!text.content) continue;
 
-      const fontSize = Math.max(text.font_size * viewport.zoom, 1);
+      const fontSize = Math.max(effectiveFontSize(text) * viewport.zoom, 1);
       const origin = pdfToViewport(viewport, text.transform[4], text.transform[5]);
       const xAxisEnd = pdfToViewport(
         viewport,
@@ -386,7 +392,7 @@ export class SkiaPageRenderer {
 
   private logFontFallback(text: StructuredTextObject, content: string, source: "fallback" | "default") {
     if (isIgnorableForGlyphCheck(content)) return;
-    if (!text.font_name || !this.fontInfo.has(text.font_name)) return;
+    if (!text.font_name || !this.typefaces.has(text.font_name)) return;
     const key = `${text.id}:${text.font_name ?? "none"}:${content}:${source}`;
     if (this.loggedFontDiagnostics.has(key)) return;
     this.loggedFontDiagnostics.add(key);
@@ -407,6 +413,14 @@ function fontHasGlyphs(font: Font, content: string) {
 function configureFont(font: Font, embolden: boolean) {
   font.setSubpixel(true);
   font.setEmbolden(embolden);
+}
+
+function effectiveFontSize(text: StructuredTextObject) {
+  const yAxisScale = Math.hypot(text.transform[2], text.transform[3]);
+  if (yAxisScale > 0.01) return yAxisScale;
+  const xAxisScale = Math.hypot(text.transform[0], text.transform[1]);
+  if (xAxisScale > 0.01) return xAxisScale;
+  return text.font_size > 0 ? text.font_size : 1;
 }
 
 function createTextPaints(canvasKit: CanvasKit, text: StructuredTextObject, zoom: number) {
