@@ -6,7 +6,7 @@ use crate::{
     TextObject, TextObjectId, TextRun, TextStyle,
 };
 use lopdf::content::{Content, Operation};
-use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
+use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, StringFormat};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
@@ -156,6 +156,7 @@ pub fn open_lopdf_document_from_bytes(bytes: &[u8]) -> CoreResult<LopdfDocument>
         pages,
         text_objects: HashMap::new(),
         text_refs: HashMap::new(),
+        text_edit_groups: HashMap::new(),
     };
     result.extract_text_objects()?;
     Ok(result)
@@ -167,6 +168,7 @@ pub struct LopdfDocument {
     pages: Vec<ObjectId>,
     text_objects: HashMap<PageIndex, Vec<TextObject>>,
     text_refs: HashMap<TextObjectId, TextObjectRef>,
+    text_edit_groups: HashMap<TextObjectId, TextEditGroup>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +176,27 @@ struct TextObjectRef {
     page: PageIndex,
     operation_index: usize,
     font_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TextEditGroup {
+    page: PageIndex,
+    member_ids: Vec<TextObjectId>,
+    bounds: Rect,
+    matrix: [f32; 6],
+    font_name: Option<String>,
+    font_size: f32,
+}
+
+#[derive(Debug, Clone)]
+struct GroupMemberPlan {
+    id: TextObjectId,
+    original_content: String,
+    original_char_count: usize,
+    font_name: Option<String>,
+    font_size: f32,
+    font_map: Option<ToUnicodeMap>,
+    template: Object,
 }
 
 impl PdfEngine for LopdfEngine {
@@ -189,6 +212,7 @@ impl PdfEngine for LopdfEngine {
             pages,
             text_objects: HashMap::new(),
             text_refs: HashMap::new(),
+            text_edit_groups: HashMap::new(),
         };
         result.extract_text_objects()?;
         Ok(result)
@@ -238,7 +262,7 @@ impl EngineDocument for LopdfDocument {
     fn page_structure(&self, page: PageIndex) -> CoreResult<PageStructure> {
         self.ensure_page(page)?;
         let page_info = self.page_info(page)?;
-        let text = self.structured_text(page)?;
+        let text = self.merged_structured_text(page)?;
         let visual_text = self.structured_visual_text(page)?;
         let images = self.structured_images(page)?;
         let mut watermarks = text
@@ -348,12 +372,8 @@ impl EngineDocument for LopdfDocument {
         id: TextObjectId,
         runs: Vec<TextRun>,
     ) -> CoreResult<TextObject> {
-        let text_ref = self
-            .text_refs
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| CoreError::NotFound(format!("text object {}", (id.0).0)))?;
-        let page_id = self.page_id(text_ref.page)?;
+        let edit_group = self.text_edit_group(id)?;
+        let page_id = self.page_id(edit_group.page)?;
         let font_maps = self.page_font_maps(page_id);
         let content_bytes = self.document.get_page_content(page_id).map_err(|err| {
             CoreError::Engine(format!("failed to read page content stream: {err}"))
@@ -364,16 +384,141 @@ impl EngineDocument for LopdfDocument {
             .iter()
             .map(|run| run.content.as_str())
             .collect::<String>();
+        let current_objects = self
+            .text_objects
+            .get(&edit_group.page)
+            .cloned()
+            .unwrap_or_default();
+        let member_plans = edit_group
+            .member_ids
+            .iter()
+            .map(|member_id| {
+                let text_ref = self
+                    .text_refs
+                    .get(member_id)
+                    .cloned()
+                    .ok_or_else(|| CoreError::NotFound(format!("text object {}", ((member_id.0).0))))?;
+                let object = current_objects
+                    .iter()
+                    .find(|object| object.id == *member_id)
+                    .cloned()
+                    .ok_or_else(|| CoreError::NotFound(format!("text object {}", ((member_id.0).0))))?;
+                let operation = content
+                    .operations
+                    .get(text_ref.operation_index)
+                    .ok_or_else(|| CoreError::NotFound("text drawing operation".to_string()))?;
+                let font_map = text_ref
+                    .font_name
+                    .as_ref()
+                    .and_then(|name| font_maps.get(name))
+                    .cloned();
+                Ok(GroupMemberPlan {
+                    id: *member_id,
+                    original_content: object.content.clone(),
+                    original_char_count: object.content.chars().count(),
+                    font_name: text_ref.font_name.clone(),
+                    font_size: object.font_size,
+                    font_map,
+                    template: operation
+                        .operands
+                        .first()
+                        .cloned()
+                        .unwrap_or(Object::Null),
+                })
+            })
+            .collect::<CoreResult<Vec<_>>>()?;
+        let original_group_text = member_plans
+            .iter()
+            .map(|plan| plan.original_content.as_str())
+            .collect::<String>();
+        let segments = repartition_group_text(&original_group_text, &replacement, &member_plans)?;
+        let fallback_font_name = if member_plans
+            .iter()
+            .zip(segments.iter())
+            .any(|(member, segment)| needs_cjk_fallback_font(member, segment))
+        {
+            Some(self.ensure_page_cjk_fallback_font(page_id)?)
+        } else {
+            None
+        };
+        let segment_map = member_plans
+            .iter()
+            .zip(segments)
+            .map(|(member, replacement)| (member.id, replacement))
+            .collect::<HashMap<_, _>>();
+        let member_map = member_plans
+            .iter()
+            .map(|member| (member.id, member))
+            .collect::<HashMap<_, _>>();
+        let targeted_operation_indexes = edit_group
+            .member_ids
+            .iter()
+            .filter_map(|member_id| {
+                self.text_refs
+                    .get(member_id)
+                    .map(|text_ref| (text_ref.operation_index, *member_id))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut rebuilt_operations = Vec::with_capacity(content.operations.len() + targeted_operation_indexes.len() * 2);
+        let mut updated_member_ids = HashMap::new();
 
-        let operation = content
-            .operations
-            .get_mut(text_ref.operation_index)
-            .ok_or_else(|| CoreError::NotFound("text drawing operation".to_string()))?;
-        let font_map = text_ref
-            .font_name
-            .as_ref()
-            .and_then(|name| font_maps.get(name));
-        replace_operation_text(operation, replacement, font_map)?;
+        for (operation_index, operation) in content.operations.into_iter().enumerate() {
+            if let Some(member_id) = targeted_operation_indexes.get(&operation_index) {
+                let member_plan = member_map.get(member_id).ok_or_else(|| {
+                    CoreError::NotFound(format!("text object {}", (((*member_id).0).0)))
+                })?;
+                let replacement_segment = segment_map.get(member_id).cloned().ok_or_else(|| {
+                    CoreError::Engine("missing replacement segment for grouped text".to_string())
+                })?;
+                let use_fallback = fallback_font_name
+                    .as_deref()
+                    .is_some_and(|_| needs_cjk_fallback_font(member_plan, &replacement_segment));
+
+                if use_fallback {
+                    let fallback_font_name = fallback_font_name.as_deref().ok_or_else(|| {
+                        CoreError::Engine("missing fallback font resource".to_string())
+                    })?;
+                    rebuilt_operations.push(font_set_operation(
+                        fallback_font_name,
+                        member_plan.font_size,
+                    ));
+                }
+
+                updated_member_ids.insert(
+                    *member_id,
+                    TextObjectId(PdfObjectId(encode_text_object_id(
+                        edit_group.page.0,
+                        rebuilt_operations.len() as u32,
+                    ))),
+                );
+                let mut updated_operation = operation;
+                if use_fallback {
+                    replace_operation_text_with_direct_utf16(
+                        &mut updated_operation,
+                        replacement_segment,
+                    )?;
+                } else {
+                    replace_operation_text(
+                        &mut updated_operation,
+                        replacement_segment,
+                        member_plan.font_map.as_ref(),
+                    )?;
+                }
+                rebuilt_operations.push(updated_operation);
+
+                if use_fallback {
+                    if let Some(original_font_name) = member_plan.font_name.as_deref() {
+                        rebuilt_operations.push(font_set_operation(
+                            original_font_name,
+                            member_plan.font_size,
+                        ));
+                    }
+                }
+            } else {
+                rebuilt_operations.push(operation);
+            }
+        }
+        content.operations = rebuilt_operations;
 
         let encoded = content
             .encode()
@@ -383,7 +528,7 @@ impl EngineDocument for LopdfDocument {
             .map_err(|err| CoreError::Engine(format!("failed to write page content: {err}")))?;
 
         self.extract_text_objects()?;
-        self.find_text_object(id)
+        self.group_text_object(updated_member_ids.get(&id).copied().unwrap_or(id))
     }
 
     fn update_text_object_bounds(
@@ -403,6 +548,7 @@ impl EngineDocument for LopdfDocument {
 
     fn save_to(&self, path: &Path) -> CoreResult<()> {
         let mut document = self.document.clone();
+        prepare_document_for_full_save(&mut document);
         document
             .save(path)
             .map_err(|err| CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err)))?;
@@ -413,11 +559,86 @@ impl EngineDocument for LopdfDocument {
 impl LopdfDocument {
     pub fn save_to_bytes(&self) -> CoreResult<Vec<u8>> {
         let mut document = self.document.clone();
+        prepare_document_for_full_save(&mut document);
         let mut output = Vec::new();
         document
             .save_to(&mut output)
             .map_err(|err| CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, err)))?;
         Ok(output)
+    }
+
+    fn ensure_page_cjk_fallback_font(&mut self, page_id: ObjectId) -> CoreResult<String> {
+        const FALLBACK_FONT_NAME: &str = "PdfEditorFallbackCjk";
+        if self.page_has_font_resource(page_id, FALLBACK_FONT_NAME)? {
+            return Ok(FALLBACK_FONT_NAME.to_string());
+        }
+
+        let cid_font_id = self.document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType0",
+            "BaseFont" => "STSong-Light",
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal("GB1"),
+                "Supplement" => 2,
+            },
+        });
+        let cjk_font_id = self.document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "STSong-Light",
+            "Encoding" => "UniGB-UCS2-H",
+            "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+        });
+        let page_dict = self
+            .document
+            .get_dictionary(page_id)
+            .map_err(|err| CoreError::Engine(format!("failed to access page dictionary: {err}")))?;
+        let mut resources = page_dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|object| cloned_dictionary_from_object(&self.document, object))
+            .unwrap_or_default();
+        let mut fonts = resources
+            .get(b"Font")
+            .ok()
+            .and_then(|object| cloned_dictionary_from_object(&self.document, object))
+            .unwrap_or_default();
+        fonts.set(FALLBACK_FONT_NAME, Object::Reference(cjk_font_id));
+        resources.set("Font", Object::Dictionary(fonts));
+
+        let page = self
+            .document
+            .get_object_mut(page_id)
+            .map_err(|err| CoreError::Engine(format!("failed to access page object: {err}")))?;
+        let page_dict = page
+            .as_dict_mut()
+            .map_err(|err| CoreError::InvalidPdf(format!("page object is not a dictionary: {err}")))?;
+        page_dict.set("Resources", Object::Dictionary(resources));
+
+        Ok(FALLBACK_FONT_NAME.to_string())
+    }
+
+    fn page_has_font_resource(&self, page_id: ObjectId, font_name: &str) -> CoreResult<bool> {
+        let page = self
+            .document
+            .get_dictionary(page_id)
+            .map_err(|err| CoreError::Engine(format!("failed to access page dictionary: {err}")))?;
+        let Some(resources) = page
+            .get(b"Resources")
+            .ok()
+            .and_then(|object| cloned_dictionary_from_object(&self.document, object))
+        else {
+            return Ok(false);
+        };
+        let Some(fonts) = resources
+            .get(b"Font")
+            .ok()
+            .and_then(|object| cloned_dictionary_from_object(&self.document, object))
+        else {
+            return Ok(false);
+        };
+        Ok(fonts.has(font_name.as_bytes()))
     }
 
     pub fn page_load_bundle(
@@ -439,7 +660,7 @@ impl LopdfDocument {
 
     pub fn hit_test(&self, page: PageIndex, point: Point) -> CoreResult<Option<HitTestResult>> {
         self.ensure_page(page)?;
-        let mut text = self.structured_text(page)?;
+        let mut text = self.merged_structured_text(page)?;
         text.sort_by_key(|object| object.z_index);
         for object in text.into_iter().rev() {
             if !object.bounds.contains(point) {
@@ -479,12 +700,14 @@ impl LopdfDocument {
     }
 
     pub fn start_text_edit(&self, id: TextObjectId) -> CoreResult<TextEditSessionInfo> {
+        let edit_group = self.text_edit_group(id)?;
         let context = self.text_layout_context(id)?;
-        let (glyphs, _) = layout_glyphs(&context.object.content, &context);
+        let (glyphs, _) = self.layout_preview_glyphs(id, &context.object.content)?;
         Ok(TextEditSessionInfo {
             object_id: id,
             page: context.page,
             original_text: context.object.content,
+            group_object_ids: edit_group.member_ids,
             bbox: context.object.bounds,
             matrix: context.object.transform,
             font_id: context.object.font_name,
@@ -499,24 +722,65 @@ impl LopdfDocument {
         id: TextObjectId,
         text: String,
     ) -> CoreResult<TextLayoutPreview> {
+        let edit_group = self.text_edit_group(id)?;
         let context = self.text_layout_context(id)?;
-        let (glyphs, width) = layout_glyphs(&text, &context);
-        let bbox = bounds_for_text_width(width, context.object.transform);
+        let (glyphs, bbox) = self.layout_preview_glyphs(id, &text)?;
         let overflow = bbox.size.width > context.object.bounds.size.width
             || bbox.size.height > context.object.bounds.size.height;
 
         Ok(TextLayoutPreview {
             object_id: id,
             text,
+            group_object_ids: edit_group.member_ids,
             glyphs,
             bbox,
             overflow,
         })
     }
 
+    fn layout_preview_glyphs(&self, id: TextObjectId, text: &str) -> CoreResult<(Vec<LayoutGlyph>, Rect)> {
+        let edit_group = self.text_edit_group(id)?;
+        if edit_group.member_ids.len() <= 1 {
+            let context = self.text_layout_context(id)?;
+            let (glyphs, width) = layout_glyphs(text, &context);
+            return Ok((glyphs, bounds_for_text_width(width, context.object.transform)));
+        }
+
+        let member_contexts = edit_group
+            .member_ids
+            .iter()
+            .map(|member_id| self.single_text_layout_context(*member_id))
+            .collect::<CoreResult<Vec<_>>>()?;
+        let original_text = member_contexts
+            .iter()
+            .map(|context| context.object.content.as_str())
+            .collect::<String>();
+        let members = member_contexts
+            .iter()
+            .map(|context| GroupMemberPlan {
+                id: context.object.id,
+                original_content: context.object.content.clone(),
+                original_char_count: context.object.content.chars().count(),
+                font_name: context.object.font_name.clone(),
+                font_size: context.object.font_size,
+                font_map: context.font_map.clone(),
+                template: Object::String(Vec::new(), StringFormat::Hexadecimal),
+            })
+            .collect::<Vec<_>>();
+        let segments = repartition_group_text(&original_text, text, &members)?;
+        let mut glyphs = Vec::new();
+        for (context, segment) in member_contexts.iter().zip(segments.iter()) {
+            let (mut segment_glyphs, _) = layout_glyphs(segment, context);
+            glyphs.append(&mut segment_glyphs);
+        }
+        let bbox = glyph_bounds(&glyphs).unwrap_or(edit_group.bounds);
+        Ok((glyphs, bbox))
+    }
+
     fn extract_text_objects(&mut self) -> CoreResult<()> {
         self.text_objects.clear();
         self.text_refs.clear();
+        self.text_edit_groups.clear();
 
         for page_index in 0..self.pages.len() {
             let page = PageIndex(page_index as u32);
@@ -579,6 +843,8 @@ impl LopdfDocument {
             }
 
             self.text_objects.insert(page, objects);
+            let structured = self.structured_text(page)?;
+            self.register_text_edit_groups(page, &structured);
         }
 
         Ok(())
@@ -604,14 +870,137 @@ impl LopdfDocument {
         Err(CoreError::NotFound(format!("text object {}", (id.0).0)))
     }
 
+    fn text_edit_group(&self, id: TextObjectId) -> CoreResult<TextEditGroup> {
+        if let Some(group) = self.text_edit_groups.get(&id) {
+            return Ok(group.clone());
+        }
+
+        let object = self.find_text_object(id)?;
+        let matrix = [
+            object.font_size,
+            0.0,
+            0.0,
+            object.font_size,
+            object.bounds.origin.x,
+            object.bounds.origin.y,
+        ];
+        Ok(TextEditGroup {
+            page: object.page,
+            member_ids: vec![id],
+            bounds: object.bounds,
+            matrix,
+            font_name: object.font_name,
+            font_size: object.font_size,
+        })
+    }
+
+    fn group_text_object(&self, id: TextObjectId) -> CoreResult<TextObject> {
+        let group = self.text_edit_group(id)?;
+        let objects = self
+            .text_objects
+            .get(&group.page)
+            .cloned()
+            .unwrap_or_default();
+        let members = group
+            .member_ids
+            .iter()
+            .filter_map(|member_id| objects.iter().find(|object| object.id == *member_id).cloned())
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            return self.find_text_object(id);
+        }
+
+        let first = members.first().cloned().unwrap();
+        Ok(TextObject {
+            id,
+            page: group.page,
+            bounds: group.bounds,
+            content: members
+                .iter()
+                .map(|member| member.content.as_str())
+                .collect::<String>(),
+            font_name: group.font_name.clone().or(first.font_name),
+            font_size: group.font_size,
+            color: first.color,
+            runs: vec![TextRun::new(
+                members
+                    .iter()
+                    .map(|member| member.content.as_str())
+                    .collect::<String>(),
+                group.font_name,
+                group.font_size,
+                first.color,
+            )],
+        })
+    }
+
     fn text_layout_context(&self, id: TextObjectId) -> CoreResult<TextLayoutContext> {
+        let edit_group = self.text_edit_group(id)?;
+        let primary_id = edit_group
+            .member_ids
+            .first()
+            .copied()
+            .unwrap_or(id);
+        let text_ref = self
+            .text_refs
+            .get(&primary_id)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound(format!("text object {}", (primary_id.0).0)))?;
+        let structured = self.structured_text(text_ref.page)?;
+        let members = edit_group
+            .member_ids
+            .iter()
+            .filter_map(|member_id| structured.iter().find(|object| object.id == *member_id).cloned())
+            .collect::<Vec<_>>();
+        let object = if members.is_empty() {
+            structured
+                .into_iter()
+                .find(|object| object.id == primary_id)
+                .ok_or_else(|| CoreError::NotFound(format!("text object {}", (primary_id.0).0)))?
+        } else {
+            merge_text_group_objects(&edit_group, &members)
+        };
+        let page_id = self.page_id(text_ref.page)?;
+        let content = self.decoded_page_content(page_id)?;
+        let mut page_state = PageParseState::default();
+        for (index, operation) in content.operations.iter().enumerate() {
+            update_page_state(&mut page_state, operation);
+            if index == text_ref.operation_index {
+                break;
+            }
+        }
+        let font_maps = self.page_font_maps(page_id);
+        let font_metrics = self.page_font_metrics(page_id);
+        let font_map = page_state
+            .text
+            .font_name
+            .as_ref()
+            .and_then(|name| font_maps.get(name))
+            .cloned();
+        let metrics = page_state
+            .text
+            .font_name
+            .as_ref()
+            .and_then(|name| font_metrics.get(name))
+            .cloned();
+
+        Ok(TextLayoutContext {
+            page: text_ref.page,
+            object,
+            state: page_state.text,
+            font_map,
+            metrics,
+        })
+    }
+
+    fn single_text_layout_context(&self, id: TextObjectId) -> CoreResult<TextLayoutContext> {
         let text_ref = self
             .text_refs
             .get(&id)
             .cloned()
             .ok_or_else(|| CoreError::NotFound(format!("text object {}", (id.0).0)))?;
-        let object = self
-            .structured_text(text_ref.page)?
+        let structured = self.structured_text(text_ref.page)?;
+        let object = structured
             .into_iter()
             .find(|object| object.id == id)
             .ok_or_else(|| CoreError::NotFound(format!("text object {}", (id.0).0)))?;
@@ -646,6 +1035,14 @@ impl LopdfDocument {
             font_map,
             metrics,
         })
+    }
+
+    fn register_text_edit_groups(&mut self, page: PageIndex, objects: &[StructuredTextObject]) {
+        for group in detect_text_edit_groups(page, objects) {
+            for member_id in &group.member_ids {
+                self.text_edit_groups.insert(*member_id, group.clone());
+            }
+        }
     }
 
     fn page_size(&self, page_id: ObjectId) -> Option<Size> {
@@ -829,6 +1226,40 @@ impl LopdfDocument {
         }
 
         Ok(objects)
+    }
+
+    fn merged_structured_text(&self, page: PageIndex) -> CoreResult<Vec<StructuredTextObject>> {
+        let objects = self.structured_text(page)?;
+        let groups = detect_text_edit_groups(page, &objects);
+        if groups.is_empty() {
+            return Ok(objects);
+        }
+
+        let mut grouped_ids = HashSet::new();
+        let mut merged = Vec::new();
+        for group in groups {
+            if group.member_ids.len() <= 1 {
+                continue;
+            }
+            let members = group
+                .member_ids
+                .iter()
+                .filter_map(|member_id| objects.iter().find(|object| object.id == *member_id).cloned())
+                .collect::<Vec<_>>();
+            if members.len() <= 1 {
+                continue;
+            }
+            grouped_ids.extend(group.member_ids.iter().copied());
+            merged.push(merge_text_group_objects(&group, &members));
+        }
+
+        let mut result = objects
+            .into_iter()
+            .filter(|object| !grouped_ids.contains(&object.id))
+            .collect::<Vec<_>>();
+        result.extend(merged);
+        result.sort_by_key(|object| object.z_index);
+        Ok(result)
     }
 
     fn structured_visual_text(
@@ -2667,6 +3098,176 @@ fn bounds_for_text_width(width: f32, transform: [f32; 6]) -> Rect {
     transformed_rect_bounds(transform, width.max(0.0), 1.2)
 }
 
+fn merge_text_group_objects(
+    group: &TextEditGroup,
+    members: &[StructuredTextObject],
+) -> StructuredTextObject {
+    let primary = members.first().cloned().unwrap_or(StructuredTextObject {
+        id: group.member_ids[0],
+        bounds: group.bounds,
+        content: String::new(),
+        font_name: group.font_name.clone(),
+        font_size: group.font_size,
+        color: Color::BLACK,
+        stroke_color: Color::BLACK,
+        stroke_width: 0.0,
+        rendering_mode: 0,
+        transform: group.matrix,
+        angle_degrees: matrix_angle_degrees(group.matrix),
+        z_index: 0,
+        glyphs: Vec::new(),
+        runs: Vec::new(),
+    });
+    let content = members
+        .iter()
+        .map(|member| member.content.as_str())
+        .collect::<String>();
+    let glyphs = members
+        .iter()
+        .flat_map(|member| member.glyphs.iter().cloned())
+        .collect::<Vec<_>>();
+    let bounds = glyph_bounds(&glyphs).unwrap_or(group.bounds);
+    StructuredTextObject {
+        id: primary.id,
+        bounds,
+        content: content.clone(),
+        font_name: group.font_name.clone().or(primary.font_name),
+        font_size: group.font_size,
+        color: primary.color,
+        stroke_color: primary.stroke_color,
+        stroke_width: primary.stroke_width,
+        rendering_mode: primary.rendering_mode,
+        transform: group.matrix,
+        angle_degrees: matrix_angle_degrees(group.matrix),
+        z_index: primary.z_index,
+        glyphs,
+        runs: members
+            .iter()
+            .flat_map(|member| member.runs.iter().cloned())
+            .collect(),
+    }
+}
+
+fn detect_text_edit_groups(page: PageIndex, objects: &[StructuredTextObject]) -> Vec<TextEditGroup> {
+    let mut sorted = objects
+        .iter()
+        .filter(|object| object.angle_degrees.abs() < 1.0)
+        .cloned()
+        .collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        left.bounds
+            .origin
+            .y
+            .partial_cmp(&right.bounds.origin.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.bounds
+                    .origin
+                    .x
+                    .partial_cmp(&right.bounds.origin.x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let mut groups = Vec::new();
+    let mut current = Vec::<StructuredTextObject>::new();
+    let mut baseline_gap: Option<f32> = None;
+
+    for object in sorted {
+        let Some(previous) = current.last() else {
+            current.push(object);
+            continue;
+        };
+
+        if can_join_text_edit_group(previous, &object, baseline_gap) {
+            let gap = text_group_gap(previous, &object);
+            baseline_gap = Some(baseline_gap.unwrap_or(gap));
+            current.push(object);
+            continue;
+        }
+
+        if current.len() > 1 {
+            groups.push(build_text_edit_group(page, &current));
+        }
+        current = vec![object];
+        baseline_gap = None;
+    }
+
+    if current.len() > 1 {
+        groups.push(build_text_edit_group(page, &current));
+    }
+
+    groups
+}
+
+fn build_text_edit_group(page: PageIndex, members: &[StructuredTextObject]) -> TextEditGroup {
+    let first = &members[0];
+    let left = members
+        .iter()
+        .map(|member| member.bounds.origin.x)
+        .fold(f32::INFINITY, f32::min);
+    let bottom = members
+        .iter()
+        .map(|member| member.bounds.origin.y)
+        .fold(f32::INFINITY, f32::min);
+    let right = members
+        .iter()
+        .map(|member| member.bounds.origin.x + member.bounds.size.width)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let top = members
+        .iter()
+        .map(|member| member.bounds.origin.y + member.bounds.size.height)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let font_name = members
+        .iter()
+        .find_map(|member| member.font_name.clone())
+        .or_else(|| first.font_name.clone());
+    let font_size = members
+        .iter()
+        .map(|member| member.font_size)
+        .fold(first.font_size, f32::max);
+
+    TextEditGroup {
+        page,
+        member_ids: members.iter().map(|member| member.id).collect(),
+        bounds: Rect::new(left, bottom, (right - left).max(0.0), (top - bottom).max(0.0)),
+        matrix: first.transform,
+        font_name,
+        font_size,
+    }
+}
+
+fn can_join_text_edit_group(
+    previous: &StructuredTextObject,
+    next: &StructuredTextObject,
+    baseline_gap: Option<f32>,
+) -> bool {
+    let y_tolerance = previous.font_size.max(next.font_size) * 0.35 + 1.0;
+    if (previous.transform[5] - next.transform[5]).abs() > y_tolerance {
+        return false;
+    }
+    if (previous.font_size - next.font_size).abs() > 1.0 {
+        return false;
+    }
+    let gap = text_group_gap(previous, next);
+    if gap < -1.0 {
+        return false;
+    }
+    let max_gap = previous.font_size.max(next.font_size) * 2.0;
+    if gap > max_gap {
+        return false;
+    }
+    if let Some(expected_gap) = baseline_gap {
+        let tolerance = previous.font_size.max(next.font_size) * 0.4 + 1.0;
+        return (gap - expected_gap).abs() <= tolerance;
+    }
+    true
+}
+
+fn text_group_gap(previous: &StructuredTextObject, next: &StructuredTextObject) -> f32 {
+    next.bounds.origin.x - (previous.bounds.origin.x + previous.bounds.size.width)
+}
+
 fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, f32) {
     let chars = text.chars().collect::<Vec<_>>();
     let mut glyphs = Vec::with_capacity(chars.len());
@@ -2707,6 +3308,7 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
         glyphs.push(LayoutGlyph {
             ch: ch.to_string(),
             glyph_id,
+            font_name: context.object.font_name.clone(),
             x,
             y,
             advance,
@@ -2720,6 +3322,22 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
 
 fn unit_bounds_after_transform(transform: [f32; 6]) -> Rect {
     transformed_rect_bounds(transform, 1.0, 1.0)
+}
+
+fn glyph_bounds(glyphs: &[LayoutGlyph]) -> Option<Rect> {
+    let mut iter = glyphs.iter();
+    let first = iter.next()?;
+    let mut min_x = first.bbox.origin.x;
+    let mut min_y = first.bbox.origin.y;
+    let mut max_x = first.bbox.origin.x + first.bbox.size.width;
+    let mut max_y = first.bbox.origin.y + first.bbox.size.height;
+    for glyph in iter {
+        min_x = min_x.min(glyph.bbox.origin.x);
+        min_y = min_y.min(glyph.bbox.origin.y);
+        max_x = max_x.max(glyph.bbox.origin.x + glyph.bbox.size.width);
+        max_y = max_y.max(glyph.bbox.origin.y + glyph.bbox.size.height);
+    }
+    Some(Rect::new(min_x, min_y, max_x - min_x, max_y - min_y))
 }
 
 fn transformed_rect_bounds(transform: [f32; 6], width: f32, height: f32) -> Rect {
@@ -2858,13 +3476,12 @@ fn replace_operation_text(
     replacement: String,
     font_map: Option<&ToUnicodeMap>,
 ) -> CoreResult<()> {
-    let encoded_replacement = font_map.and_then(|map| map.encode(&replacement));
     match operation.operator.as_str() {
         "Tj" | "'" | "\"" => {
             let operand = operation.operands.last_mut().ok_or_else(|| {
                 CoreError::InvalidPdf("text operation has no operand".to_string())
             })?;
-            *operand = encoded_text_object(replacement, encoded_replacement);
+            *operand = replacement_text_object(operand, replacement, font_map)?;
             Ok(())
         }
         "TJ" => {
@@ -2872,7 +3489,11 @@ fn replace_operation_text(
                 .operands
                 .first_mut()
                 .ok_or_else(|| CoreError::InvalidPdf("TJ operation has no operand".to_string()))?;
-            *operand = Object::Array(vec![encoded_text_object(replacement, encoded_replacement)]);
+            *operand = Object::Array(vec![replacement_text_object(
+                operand,
+                replacement,
+                font_map,
+            )?]);
             Ok(())
         }
         operator => Err(CoreError::Unsupported(format!(
@@ -2881,10 +3502,107 @@ fn replace_operation_text(
     }
 }
 
-fn encoded_text_object(replacement: String, encoded_replacement: Option<Vec<u8>>) -> Object {
-    match encoded_replacement {
-        Some(bytes) => Object::String(bytes, StringFormat::Hexadecimal),
-        None => Object::string_literal(replacement),
+fn replace_operation_text_with_direct_utf16(
+    operation: &mut Operation,
+    replacement: String,
+) -> CoreResult<()> {
+    match operation.operator.as_str() {
+        "Tj" | "'" | "\"" => {
+            let operand = operation.operands.last_mut().ok_or_else(|| {
+                CoreError::InvalidPdf("text operation has no operand".to_string())
+            })?;
+            *operand = Object::String(utf16be_bytes(&replacement), StringFormat::Hexadecimal);
+            Ok(())
+        }
+        "TJ" => {
+            let operand = operation
+                .operands
+                .first_mut()
+                .ok_or_else(|| CoreError::InvalidPdf("TJ operation has no operand".to_string()))?;
+            *operand = Object::Array(vec![Object::String(
+                utf16be_bytes(&replacement),
+                StringFormat::Hexadecimal,
+            )]);
+            Ok(())
+        }
+        operator => Err(CoreError::Unsupported(format!(
+            "unsupported text operation {operator}"
+        ))),
+    }
+}
+
+fn font_set_operation(font_name: &str, font_size: f32) -> Operation {
+    Operation::new(
+        "Tf",
+        vec![
+            Object::Name(font_name.as_bytes().to_vec()),
+            Object::Real(font_size),
+        ],
+    )
+}
+
+fn needs_cjk_fallback_font(member: &GroupMemberPlan, replacement: &str) -> bool {
+    !replacement.is_empty()
+        && replacement != member.original_content
+        && template_string_format(&member.template) == Some(StringFormat::Hexadecimal)
+        && member
+            .font_map
+            .as_ref()
+            .is_some_and(ToUnicodeMap::supports_direct_utf16)
+}
+
+fn replacement_text_object(
+    template: &Object,
+    replacement: String,
+    font_map: Option<&ToUnicodeMap>,
+) -> CoreResult<Object> {
+    if let Some(bytes) = font_map.and_then(|map| map.encode(&replacement)) {
+        return Ok(Object::String(bytes, StringFormat::Hexadecimal));
+    }
+
+    match template_string_format(template) {
+        Some(StringFormat::Hexadecimal) if font_map.is_some_and(ToUnicodeMap::supports_direct_utf16) => {
+            Ok(Object::String(
+                utf16be_bytes(&replacement),
+                StringFormat::Hexadecimal,
+            ))
+        }
+        Some(StringFormat::Literal) | None if replacement.is_ascii() => {
+            Ok(Object::string_literal(replacement))
+        }
+        _ => Err(CoreError::Unsupported(
+            "replacement text cannot be encoded by the original PDF font".to_string(),
+        )),
+    }
+}
+
+fn template_string_format(object: &Object) -> Option<StringFormat> {
+    match object {
+        Object::String(_, format) => Some(*format),
+        Object::Array(items) => items.iter().find_map(template_string_format),
+        _ => None,
+    }
+}
+
+fn utf16be_bytes(content: &str) -> Vec<u8> {
+    content
+        .encode_utf16()
+        .flat_map(|unit| unit.to_be_bytes())
+        .collect()
+}
+
+fn prepare_document_for_full_save(document: &mut Document) {
+    for key in [
+        b"Prev".as_slice(),
+        b"XRefStm".as_slice(),
+        b"Type".as_slice(),
+        b"W".as_slice(),
+        b"Index".as_slice(),
+        b"Filter".as_slice(),
+        b"Length".as_slice(),
+        b"DecodeParms".as_slice(),
+    ] {
+        document.trailer.remove(key);
     }
 }
 
@@ -2919,6 +3637,7 @@ fn object_name_bytes(object: &Object) -> Option<String> {
 
 fn object_plain_text(object: &Object) -> Option<String> {
     match object {
+        Object::String(value, StringFormat::Hexadecimal) => Some(utf16be_to_string(value)),
         Object::String(value, _) => Some(String::from_utf8_lossy(value).into_owned()),
         Object::Name(value) => Some(String::from_utf8_lossy(value).into_owned()),
         _ => None,
@@ -2960,11 +3679,11 @@ fn object_color_space(object: &Object) -> Option<String> {
 
 fn object_text(object: &Object, font_map: Option<&ToUnicodeMap>) -> Option<String> {
     match object {
-        Object::String(value, _) => Some(
-            font_map
-                .map(|map| map.decode(value))
-                .unwrap_or_else(|| String::from_utf8_lossy(value).into_owned()),
-        ),
+        Object::String(value, format) => Some(match font_map {
+            Some(map) => map.decode(value),
+            None if *format == StringFormat::Hexadecimal => utf16be_to_string(value),
+            None => String::from_utf8_lossy(value).into_owned(),
+        }),
         _ => None,
     }
 }
@@ -2982,6 +3701,208 @@ fn normalized_color_channel(value: f32) -> u8 {
 
 fn estimate_text_width(content: &str, font_size: f32) -> f32 {
     content.chars().count() as f32 * font_size.max(1.0) * 0.6
+}
+
+fn repartition_group_text(
+    original_text: &str,
+    replacement_text: &str,
+    members: &[GroupMemberPlan],
+) -> CoreResult<Vec<String>> {
+    if members.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(aligned) = repartition_group_text_by_alignment(original_text, replacement_text, members) {
+        return Ok(aligned);
+    }
+
+    repartition_group_text_by_dp(replacement_text, members)
+}
+
+fn can_write_replacement_with_template(
+    template: &Object,
+    replacement: &str,
+    font_map: Option<&ToUnicodeMap>,
+) -> bool {
+    if font_map.and_then(|map| map.encode(replacement)).is_some() {
+        return true;
+    }
+
+    match template_string_format(template) {
+        Some(StringFormat::Hexadecimal) => font_map.is_some_and(ToUnicodeMap::supports_direct_utf16),
+        Some(StringFormat::Literal) | None => replacement.is_ascii(),
+    }
+}
+
+fn repartition_group_text_by_alignment(
+    original_text: &str,
+    replacement_text: &str,
+    members: &[GroupMemberPlan],
+) -> Option<Vec<String>> {
+    let original_chars = original_text.chars().collect::<Vec<_>>();
+    let replacement_chars = replacement_text.chars().collect::<Vec<_>>();
+    let original_segments = members
+        .iter()
+        .enumerate()
+        .flat_map(|(segment_index, plan)| {
+            plan.original_content
+                .chars()
+                .map(move |_| segment_index)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    if original_chars.len() != original_segments.len() {
+        return None;
+    }
+
+    let matched_segments =
+        longest_common_subsequence_segments(&original_chars, &replacement_chars, &original_segments);
+    let mut result = vec![String::new(); members.len()];
+
+    for (index, ch) in replacement_chars.iter().copied().enumerate() {
+        let segment_index = if let Some(segment) = matched_segments[index] {
+            segment
+        } else {
+            choose_insertion_segment(index, &matched_segments, ch, members)?
+        };
+        result[segment_index].push(ch);
+    }
+
+    result
+        .iter()
+        .zip(members.iter())
+        .all(|(segment, member)| {
+            can_write_replacement_with_template(&member.template, segment, member.font_map.as_ref())
+        })
+        .then_some(result)
+}
+
+fn longest_common_subsequence_segments(
+    original_chars: &[char],
+    replacement_chars: &[char],
+    original_segments: &[usize],
+) -> Vec<Option<usize>> {
+    let mut dp = vec![vec![0usize; replacement_chars.len() + 1]; original_chars.len() + 1];
+    for original_index in 0..original_chars.len() {
+        for replacement_index in 0..replacement_chars.len() {
+            dp[original_index + 1][replacement_index + 1] = if original_chars[original_index]
+                == replacement_chars[replacement_index]
+            {
+                dp[original_index][replacement_index] + 1
+            } else {
+                dp[original_index][replacement_index + 1]
+                    .max(dp[original_index + 1][replacement_index])
+            };
+        }
+    }
+
+    let mut result = vec![None; replacement_chars.len()];
+    let mut original_index = original_chars.len();
+    let mut replacement_index = replacement_chars.len();
+    while original_index > 0 && replacement_index > 0 {
+        if original_chars[original_index - 1] == replacement_chars[replacement_index - 1] {
+            result[replacement_index - 1] = Some(original_segments[original_index - 1]);
+            original_index -= 1;
+            replacement_index -= 1;
+        } else if dp[original_index - 1][replacement_index] >= dp[original_index][replacement_index - 1] {
+            original_index -= 1;
+        } else {
+            replacement_index -= 1;
+        }
+    }
+    result
+}
+
+fn choose_insertion_segment(
+    replacement_index: usize,
+    matched_segments: &[Option<usize>],
+    ch: char,
+    members: &[GroupMemberPlan],
+) -> Option<usize> {
+    let previous_segment = matched_segments[..replacement_index]
+        .iter()
+        .rev()
+        .find_map(|segment| *segment);
+    let next_segment = matched_segments[replacement_index + 1..]
+        .iter()
+        .find_map(|segment| *segment);
+
+    let lower = previous_segment.unwrap_or(0);
+    let upper = next_segment.unwrap_or(members.len().saturating_sub(1));
+    let mut candidates = (lower..=upper).collect::<Vec<_>>();
+    if let Some(previous) = previous_segment {
+        candidates.sort_by_key(|candidate| candidate.abs_diff(previous));
+    }
+
+    candidates.into_iter().find(|candidate| {
+        can_write_replacement_with_template(
+            &members[*candidate].template,
+            &ch.to_string(),
+            members[*candidate].font_map.as_ref(),
+        )
+    })
+}
+
+fn repartition_group_text_by_dp(
+    replacement_text: &str,
+    members: &[GroupMemberPlan],
+) -> CoreResult<Vec<String>> {
+    let chars = replacement_text.chars().collect::<Vec<_>>();
+    let char_len = chars.len();
+    let member_len = members.len();
+    let inf = usize::MAX / 8;
+    let mut dp = vec![vec![inf; char_len + 1]; member_len + 1];
+    let mut backtrack = vec![vec![None; char_len + 1]; member_len + 1];
+    dp[0][0] = 0;
+
+    for member_index in 0..member_len {
+        for start in 0..=char_len {
+            let current_cost = dp[member_index][start];
+            if current_cost >= inf {
+                continue;
+            }
+            let end_range = if member_index + 1 == member_len {
+                char_len..=char_len
+            } else {
+                start..=char_len
+            };
+            for end in end_range {
+                let segment = chars[start..end].iter().collect::<String>();
+                if !can_write_replacement_with_template(
+                    &members[member_index].template,
+                    &segment,
+                    members[member_index].font_map.as_ref(),
+                ) {
+                    continue;
+                }
+                let deviation = end.abs_diff(start + members[member_index].original_char_count);
+                let next_cost = current_cost.saturating_add(deviation * deviation + deviation);
+                if next_cost < dp[member_index + 1][end] {
+                    dp[member_index + 1][end] = next_cost;
+                    backtrack[member_index + 1][end] = Some(start);
+                }
+            }
+        }
+    }
+
+    if dp[member_len][char_len] >= inf {
+        return Err(CoreError::Unsupported(
+            "replacement text cannot be partitioned across the original PDF font runs".to_string(),
+        ));
+    }
+
+    let mut result = vec![String::new(); member_len];
+    let mut end = char_len;
+    for member_index in (0..member_len).rev() {
+        let start = backtrack[member_index + 1][end].ok_or_else(|| {
+            CoreError::Engine("missing grouped text repartition backtrack".to_string())
+        })?;
+        result[member_index] = chars[start..end].iter().collect();
+        end = start;
+    }
+
+    Ok(result)
 }
 
 fn encode_text_object_id(page: u32, operation_index: u32) -> u64 {
@@ -4335,6 +5256,14 @@ fn dictionary_from_inline_object(object: &Object) -> Option<&Dictionary> {
     }
 }
 
+fn cloned_dictionary_from_object(document: &Document, object: &Object) -> Option<Dictionary> {
+    match object {
+        Object::Reference(id) => document.get_dictionary(*id).ok().cloned(),
+        Object::Dictionary(dictionary) => Some(dictionary.clone()),
+        _ => None,
+    }
+}
+
 fn stream_from_object<'a>(document: &'a Document, object: &'a Object) -> Option<&'a lopdf::Stream> {
     match object {
         Object::Reference(id) => document
@@ -4385,6 +5314,7 @@ struct ToUnicodeMap {
     forward: HashMap<Vec<u8>, String>,
     reverse: HashMap<String, Vec<u8>>,
     max_code_len: usize,
+    identity_utf16: bool,
 }
 
 impl ToUnicodeMap {
@@ -4417,6 +5347,9 @@ impl ToUnicodeMap {
             if let Some((len, value)) = matched {
                 output.push_str(value);
                 index += len;
+            } else if self.identity_utf16 && index + 1 < bytes.len() {
+                output.push_str(&utf16be_to_string(&bytes[index..index + 2]));
+                index += 2;
             } else {
                 output.push(char::REPLACEMENT_CHARACTER);
                 index += 1;
@@ -4429,14 +5362,31 @@ impl ToUnicodeMap {
         let mut output = Vec::new();
         for character in text.chars() {
             let key = character.to_string();
-            let encoded = self.reverse.get(&key)?;
-            output.extend_from_slice(encoded);
+            if let Some(encoded) = self.reverse.get(&key) {
+                output.extend_from_slice(encoded);
+            } else if self.identity_utf16 {
+                let unit = u16::try_from(character as u32).ok()?;
+                output.extend_from_slice(&unit.to_be_bytes());
+            } else {
+                return None;
+            }
         }
         Some(output)
+    }
+
+    fn supports_direct_utf16(&self) -> bool {
+        self.identity_utf16
     }
 }
 
 fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUnicodeMap> {
+    let identity_utf16 = font
+        .get(b"Encoding")
+        .ok()
+        .and_then(object_name_bytes)
+        .as_deref()
+        .is_some_and(uses_direct_utf16_encoding);
+
     if let Ok(to_unicode) = font.get(b"ToUnicode") {
         if let Some(stream) = match to_unicode {
             Object::Reference(id) => document
@@ -4447,7 +5397,9 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
             _ => None,
         } {
             if let Ok(content) = stream.decompressed_content() {
-                return Some(parse_to_unicode_cmap(&content));
+                let mut map = parse_to_unicode_cmap(&content);
+                map.identity_utf16 = identity_utf16;
+                return Some(map);
             }
         }
     }
@@ -4474,7 +5426,7 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
     }
 
     // Fallback: Check Encoding entry
-    let mut use_win_ansi = true; // Default to WinAnsi for simple fonts without ToUnicode
+    let mut use_win_ansi = !identity_utf16; // Default to WinAnsi for simple fonts without ToUnicode
     if let Ok(encoding_obj) = font.get(b"Encoding") {
         let encoding_name = match encoding_obj {
             Object::Name(name) => Some(name.as_slice()),
@@ -4482,7 +5434,9 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
             _ => None, // If it's a dict, it might be BaseEncoding WinAnsi
         };
         if let Some(name) = encoding_name {
-            if name == b"MacRomanEncoding" {
+            if uses_direct_utf16_encoding(&String::from_utf8_lossy(name)) {
+                use_win_ansi = false;
+            } else if name == b"MacRomanEncoding" {
                 use_win_ansi = false; // We don't support MacRoman fallback yet
             }
         }
@@ -4500,7 +5454,21 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
         return Some(map);
     }
 
+    if identity_utf16 {
+        return Some(ToUnicodeMap {
+            identity_utf16: true,
+            ..ToUnicodeMap::default()
+        });
+    }
+
     None
+}
+
+fn uses_direct_utf16_encoding(name: &str) -> bool {
+    name == "Identity-H"
+        || name == "Identity-V"
+        || (name.starts_with("Uni") && name.contains("UCS2"))
+        || name.contains("UTF16")
 }
 
 fn win_ansi_to_unicode(code: u8) -> Option<u16> {

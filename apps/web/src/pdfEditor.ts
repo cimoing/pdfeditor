@@ -50,6 +50,19 @@ export interface StructuredTextObject {
   angle_degrees: number;
   z_index: number;
   glyphs?: LayoutGlyph[];
+  runs?: Array<{
+    content: string;
+    font_name: string | null;
+    font_size: number;
+    color: { r: number; g: number; b: number; a: number };
+  }>;
+}
+
+export interface TextRunInfo {
+  content: string;
+  font_name: string | null;
+  font_size: number;
+  color: { r: number; g: number; b: number; a: number };
 }
 
 export interface StructuredVisualTextObject {
@@ -97,6 +110,7 @@ export interface HitTestResult {
 export interface LayoutGlyph {
   ch: string;
   glyph_id: number | null;
+  font_name?: string | null;
   x: number;
   y: number;
   advance: number;
@@ -107,6 +121,7 @@ export interface TextEditSessionInfo {
   object_id: number;
   page: number;
   original_text: string;
+  group_object_ids: number[];
   bbox: Rect;
   matrix: [number, number, number, number, number, number];
   font_id: string | null;
@@ -118,6 +133,7 @@ export interface TextEditSessionInfo {
 export interface TextLayoutPreview {
   object_id: number;
   text: string;
+  group_object_ids: number[];
   glyphs: LayoutGlyph[];
   bbox: Rect;
   overflow: boolean;
@@ -291,7 +307,7 @@ export async function startTextEdit(
     handle == null
       ? pdf_start_text_edit(requirePdfBytes(pdfBytes), BigInt(objectId))
       : pdf_start_text_edit_by_handle(handle, BigInt(objectId));
-  return JSON.parse(json) as TextEditSessionInfo;
+  return normalizeTextEditSession(JSON.parse(json) as TextEditSessionInfo);
 }
 
 export async function previewTextLayout(
@@ -305,7 +321,7 @@ export async function previewTextLayout(
     handle == null
       ? pdf_preview_text_layout(requirePdfBytes(pdfBytes), BigInt(objectId), text)
       : pdf_preview_text_layout_by_handle(handle, BigInt(objectId), text);
-  return JSON.parse(json) as TextLayoutPreview;
+  return normalizeTextLayoutPreview(JSON.parse(json) as TextLayoutPreview);
 }
 
 export async function commitTextEdit(
@@ -355,12 +371,39 @@ function normalizePageStructure(structure: PageStructure): PageStructure {
     text: structure.text.map((text) => ({
       ...text,
       content: normalizeCompatibilityText(text.content),
-      glyphs: text.glyphs?.map((glyph) => ({
-        ...glyph,
-        ch: normalizeCompatibilityText(glyph.ch)
-      }))
+      glyphs: normalizeLayoutGlyphs(text.glyphs),
+      runs: text.runs?.map((run) => ({
+        ...run,
+        content: normalizeCompatibilityText(run.content)
+      })) ?? []
     }))
   };
+}
+
+function normalizeTextEditSession(session: TextEditSessionInfo): TextEditSessionInfo {
+  return {
+    ...session,
+    original_text: normalizeCompatibilityText(session.original_text),
+    group_object_ids: session.group_object_ids ?? [session.object_id],
+    glyphs: normalizeLayoutGlyphs(session.glyphs)
+  };
+}
+
+function normalizeTextLayoutPreview(preview: TextLayoutPreview): TextLayoutPreview {
+  return {
+    ...preview,
+    text: normalizeCompatibilityText(preview.text),
+    group_object_ids: preview.group_object_ids ?? [preview.object_id],
+    glyphs: normalizeLayoutGlyphs(preview.glyphs)
+  };
+}
+
+function normalizeLayoutGlyphs(glyphs: LayoutGlyph[] | undefined): LayoutGlyph[] {
+  return glyphs?.map((glyph) => ({
+    ...glyph,
+    font_name: glyph.font_name ?? null,
+    ch: normalizeCompatibilityText(glyph.ch)
+  })) ?? [];
 }
 
 function normalizeCompatibilityText(value: string): string {

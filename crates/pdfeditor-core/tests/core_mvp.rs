@@ -423,6 +423,48 @@ fn lopdf_backend_commits_text_after_preview() {
 }
 
 #[test]
+fn lopdf_backend_groups_consecutive_text_for_editing() {
+    let source = write_lopdf_consecutive_text_runs_pdf("lopdf-group-text-edit");
+    let bytes = fs::read(source).unwrap();
+    let document = open_lopdf_document_from_bytes(&bytes).unwrap();
+    let objects = document.text_objects(PageIndex(0)).unwrap();
+
+    let session = document.start_text_edit(objects[1].id).unwrap();
+    let preview = document
+        .preview_text_layout(objects[1].id, "Go to openai.com now".to_string())
+        .unwrap();
+
+    assert_eq!(session.group_object_ids.len(), 3);
+    assert_eq!(session.original_text, "Go to www.example.test now");
+    assert_eq!(preview.group_object_ids.len(), 3);
+    assert_eq!(preview.text, "Go to openai.com now");
+    assert_eq!(
+        preview.glyphs.len(),
+        "Go to openai.com now".chars().count()
+    );
+}
+
+#[test]
+fn lopdf_backend_commits_grouped_text_edits_across_operations() {
+    let source = write_lopdf_consecutive_text_runs_pdf("lopdf-group-commit");
+    let bytes = fs::read(source).unwrap();
+    let mut document = open_lopdf_document_from_bytes(&bytes).unwrap();
+    let objects = document.text_objects(PageIndex(0)).unwrap();
+    let replacement = "Go to openai.com now".to_string();
+
+    document
+        .update_text_object(objects[0].id, replacement.clone(), None)
+        .unwrap();
+
+    let updated_objects = document.text_objects(PageIndex(0)).unwrap();
+    let combined = updated_objects
+        .iter()
+        .map(|object| object.content.as_str())
+        .collect::<String>();
+    assert_eq!(combined, replacement);
+}
+
+#[test]
 fn lopdf_backend_advances_consecutive_structured_text_runs() {
     let source = write_lopdf_consecutive_text_runs_pdf("lopdf-consecutive-runs");
     let engine = LopdfEngine;
@@ -430,12 +472,10 @@ fn lopdf_backend_advances_consecutive_structured_text_runs() {
 
     let structure = session.page_structure(PageIndex(0)).unwrap();
 
-    assert_eq!(structure.text.len(), 3);
-    assert_eq!(structure.text[0].content, "Go to ");
-    assert_eq!(structure.text[1].content, "www.example.test ");
-    assert_eq!(structure.text[2].content, "now");
-    assert!(structure.text[1].transform[4] > structure.text[0].transform[4]);
-    assert!(structure.text[2].transform[4] > structure.text[1].transform[4]);
+    assert_eq!(structure.text.len(), 1);
+    assert_eq!(structure.text[0].content, "Go to www.example.test now");
+    assert!(structure.text[0].bounds.size.width > 0.0);
+    assert_eq!(structure.text[0].glyphs.len(), "Go to www.example.test now".chars().count());
 }
 
 #[test]
@@ -653,6 +693,53 @@ fn writes_single_page_pdf_from_page_structure_with_chinese_text() {
         .unwrap()
         .iter()
         .any(|object| object.content == "你好，PDF"));
+}
+
+#[test]
+fn lopdf_backend_preserves_hex_unicode_text_when_updating_chinese() {
+    let target = temp_path("lopdf-update-chinese-hex", "pdf");
+    let structure = PageStructure {
+        page: PageInfo {
+            index: PageIndex(0),
+            size: Size::new(300.0, 300.0),
+            rotation: 0,
+        },
+        text: vec![StructuredTextObject {
+            id: pdfeditor_core::TextObjectId(pdfeditor_core::PdfObjectId(1)),
+            bounds: Rect::new(72.0, 120.0, 160.0, 24.0),
+            content: "你好，PDF".to_string(),
+            font_name: Some("STSong-Light".to_string()),
+            font_size: 14.0,
+            color: Color::BLACK,
+            stroke_color: Color::BLACK,
+            stroke_width: 0.0,
+            rendering_mode: 0,
+            transform: [14.0, 0.0, 0.0, 14.0, 72.0, 120.0],
+            angle_degrees: 0.0,
+            z_index: 0,
+            glyphs: Vec::new(),
+            runs: Vec::new(),
+        }],
+        visual_text: Vec::new(),
+        images: Vec::new(),
+        watermarks: Vec::new(),
+        annotations: Vec::new(),
+        bookmarks: Vec::new(),
+    };
+    write_page_structure_pdf(&structure, &target).unwrap();
+
+    let bytes = fs::read(&target).unwrap();
+    let mut document = open_lopdf_document_from_bytes(&bytes).unwrap();
+    let object = document.text_objects(PageIndex(0)).unwrap()[0].clone();
+
+    document
+        .update_text_object(object.id, "你好，世界".to_string(), None)
+        .unwrap();
+    let updated_bytes = save_pdf_document_to_bytes(&document).unwrap();
+
+    let reopened = open_lopdf_document_from_bytes(&updated_bytes).unwrap();
+    let texts = reopened.text_objects(PageIndex(0)).unwrap();
+    assert!(texts.iter().any(|item| item.content == "你好，世界"));
 }
 
 fn rendered(page: PageIndex, byte_len: usize) -> RenderedPage {

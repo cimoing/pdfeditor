@@ -220,6 +220,7 @@ pub struct HitTestResult {
 pub struct LayoutGlyph {
     pub ch: String,
     pub glyph_id: Option<u32>,
+    pub font_name: Option<String>,
     pub x: f32,
     pub y: f32,
     pub advance: f32,
@@ -231,6 +232,8 @@ pub struct TextEditSessionInfo {
     pub object_id: TextObjectId,
     pub page: PageIndex,
     pub original_text: String,
+    #[serde(default)]
+    pub group_object_ids: Vec<TextObjectId>,
     pub bbox: Rect,
     pub matrix: [f32; 6],
     pub font_id: Option<String>,
@@ -243,6 +246,8 @@ pub struct TextEditSessionInfo {
 pub struct TextLayoutPreview {
     pub object_id: TextObjectId,
     pub text: String,
+    #[serde(default)]
+    pub group_object_ids: Vec<TextObjectId>,
     pub glyphs: Vec<LayoutGlyph>,
     pub bbox: Rect,
     pub overflow: bool,
