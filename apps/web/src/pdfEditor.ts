@@ -218,7 +218,7 @@ export async function loadPdfPage(
   const bundleBytes =
     handle == null ? pdf_page_bundle(pdfBytes, pageNumber) : pdf_page_bundle_by_handle(handle, pageNumber);
   const { metadata, payload } = parsePageBundle(bundleBytes);
-  const structure = metadata.structure;
+  const structure = normalizePageStructure(metadata.structure);
   const fontFamilies = await loadEmbeddedFonts(metadata.fonts, payload);
   const fontAssets = metadata.fonts.map((font) => ({
     resource_name: font.resource_name,
@@ -347,6 +347,24 @@ function parsePageBundle(bytes: Uint8Array): { metadata: PageBundleInfo; payload
     metadata: JSON.parse(json) as PageBundleInfo,
     payload: bytes.subarray(jsonEnd)
   };
+}
+
+function normalizePageStructure(structure: PageStructure): PageStructure {
+  return {
+    ...structure,
+    text: structure.text.map((text) => ({
+      ...text,
+      content: normalizeCompatibilityText(text.content),
+      glyphs: text.glyphs?.map((glyph) => ({
+        ...glyph,
+        ch: normalizeCompatibilityText(glyph.ch)
+      }))
+    }))
+  };
+}
+
+function normalizeCompatibilityText(value: string): string {
+  return value ? value.normalize("NFKC") : value;
 }
 
 function assetBlobPart(payload: Uint8Array, asset: BinaryAssetInfo): ArrayBuffer {
