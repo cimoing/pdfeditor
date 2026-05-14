@@ -1,63 +1,61 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref } from "vue";
-import type {
-  LoadedFontAsset,
-  PageStructure,
-  StructuredTextObject,
-  TextEditSessionInfo,
-  TextLayoutPreview
-} from "./pdfEditor";
+import type { StructuredTextObject } from "./pdfEditor";
 import {
-  closePdfDocument,
   commitTextEdit,
   describePdfFontUsage,
-  loadPdfPage,
-  openPdfDocument,
   previewTextLayout,
-  startTextEdit
+  startTextEdit,
+  hitTestPdf
 } from "./pdfEditor";
 import { SkiaPageRenderer } from "./skiaRenderer";
-import { composePageTransform, pdfRectToViewportRect, type PageViewport } from "./viewport";
+import { pdfRectToViewportRect, viewportToPdf } from "./viewport";
+import { usePdfDocument } from "./composables/usePdfDocument";
+import { usePdfEditor } from "./composables/usePdfEditor";
 
-const pdfBytes = ref<Uint8Array | null>(null);
-const pdfHandle = ref<number | null>(null);
-const pdfFileName = ref("document.pdf");
-const pageNumber = ref(1);
-const status = ref("选择 PDF 后加载页面");
-const page = ref<PageStructure | null>(null);
-const backgroundUrl = ref<string | null>(null);
+const {
+  pdfBytes,
+  pdfHandle,
+  pdfFileName,
+  pageNumber,
+  status,
+  page,
+  backgroundUrl,
+  zoom,
+  fontFamilies,
+  fontAssets,
+  currentViewport,
+  cleanup: cleanupPdf,
+  openFile,
+  loadCurrentPage
+} = usePdfDocument();
+
+const {
+  selectedTextId,
+  editSession,
+  draftText,
+  layoutPreview,
+  isPreparingEdit,
+  isSavingEdit,
+  clearPreviewTimer,
+  clearEditingState,
+  getSelectionToken,
+  incrementSelection,
+  getPreviewToken,
+  incrementPreviewToken,
+  setPreviewTimer
+} = usePdfEditor();
+
 const skiaCanvas = ref<HTMLCanvasElement | null>(null);
-const zoom = ref(1);
-const selectedTextId = ref<number | null>(null);
-const editSession = ref<TextEditSessionInfo | null>(null);
-const draftText = ref("");
-const layoutPreview = ref<TextLayoutPreview | null>(null);
-const fontFamilies = ref<Record<string, string>>({});
-const isPreparingEdit = ref(false);
-const isSavingEdit = ref(false);
-
 const skiaRenderer = new SkiaPageRenderer();
-let currentFontAssets: LoadedFontAsset[] = [];
-let previewTimer: number | null = null;
-let previewRequestSequence = 0;
-let selectionSequence = 0;
 
-const currentViewport = computed<PageViewport | null>(() => {
-  if (!page.value) return null;
-  return composePageTransform({
-    pageIndex: page.value.page.index,
-    pageWidth: page.value.page.size.width,
-    pageHeight: page.value.page.size.height,
-    zoom: zoom.value,
-    rotation: page.value.page.rotation ?? 0,
-    devicePixelRatio: window.devicePixelRatio || 1
-  });
-});
-
+// Viewport bindings
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 const textCount = computed(() => page.value?.text.length ?? 0);
 const imageCount = computed(() => page.value?.images.length ?? 0);
 const pageTextObjects = computed(() => page.value?.text ?? []);
+
+// Edit bindings
 const selectedTextObject = computed<StructuredTextObject | null>(
   () => page.value?.text.find((item) => item.id === selectedTextId.value) ?? null
 );
@@ -68,6 +66,7 @@ const activeGroupObjectIds = computed(() => {
 const selectedFontUsage = computed(() =>
   describePdfFontUsage(editSession.value?.font_id ?? selectedTextObject.value?.font_name ?? null, fontFamilies.value)
 );
+
 const renderTextObjects = computed(() => {
   const pageText = page.value?.text ?? [];
   if (!layoutPreview.value || !selectedTextObject.value || !editSession.value) {
@@ -85,12 +84,14 @@ const renderTextObjects = computed(() => {
   };
   return pageText.filter((text) => !hiddenIds.has(text.id)).concat(previewObject);
 });
+
 const selectedViewportRect = computed(() => {
   const viewport = currentViewport.value;
   const targetBounds = layoutPreview.value?.bbox ?? selectedTextObject.value?.bounds;
   if (!viewport || !targetBounds) return null;
   return pdfRectToViewportRect(viewport, targetBounds);
 });
+
 const previewGlyphRects = computed(() => {
   const viewport = currentViewport.value;
   const glyphs = layoutPreview.value?.glyphs ?? [];
@@ -100,6 +101,7 @@ const previewGlyphRects = computed(() => {
     rect: pdfRectToViewportRect(viewport, glyph.bbox)
   }));
 });
+
 const canSaveEdit = computed(() => {
   if (!selectedTextObject.value || !editSession.value || isSavingEdit.value || isPreparingEdit.value) {
     return false;
@@ -109,6 +111,7 @@ const canSaveEdit = computed(() => {
   }
   return draftText.value !== editSession.value.original_text;
 });
+
 const previewStatus = computed(() => {
   if (!selectedTextObject.value) return "点击页面高亮框或左侧列表，开始编辑文本对象。";
   if (isPreparingEdit.value) return "正在准备文本编辑会话...";
@@ -119,9 +122,8 @@ const previewStatus = computed(() => {
 });
 
 onBeforeUnmount(() => {
-  closePdfDocument(pdfHandle.value);
+  cleanupPdf();
   skiaRenderer.dispose();
-  revokeUrls();
   clearPreviewTimer();
 });
 
@@ -131,26 +133,13 @@ async function onFileChange(event: Event) {
   if (!file) return;
 
   clearEditingState();
-  closePdfDocument(pdfHandle.value);
-  pdfHandle.value = null;
-  page.value = null;
-  pdfFileName.value = file.name;
-  pdfBytes.value = new Uint8Array(await file.arrayBuffer());
-  status.value = "正在打开 PDF...";
-  pdfHandle.value = await openPdfDocument(pdfBytes.value);
+  await openFile(file);
   await loadPage();
 }
 
 async function loadPage(options?: { preserveSelectionId?: number | null }) {
-  if (!pdfBytes.value) return;
-
-  status.value = "正在解析 PDF 页面...";
-  revokeUrls();
-  const loaded = await loadPdfPage(pdfBytes.value, pageNumber.value, pdfHandle.value);
-  page.value = loaded.structure;
-  backgroundUrl.value = loaded.backgroundUrl;
-  currentFontAssets = loaded.fontAssets;
-  fontFamilies.value = loaded.fontFamilies;
+  const loaded = await loadCurrentPage();
+  if (!loaded) return;
 
   const preserveSelectionId = options?.preserveSelectionId ?? null;
   if (preserveSelectionId == null || !loaded.structure.text.some((item) => item.id === preserveSelectionId)) {
@@ -163,7 +152,6 @@ async function loadPage(options?: { preserveSelectionId?: number | null }) {
 
   await nextTick();
   await renderPdfCanvas();
-  status.value = `已加载第 ${pageNumber.value} 页：${loaded.structure.text.length} 个文本对象，${loaded.structure.images.length} 个图片对象`;
 }
 
 function onLoadPageClick() {
@@ -178,7 +166,7 @@ async function renderPdfCanvas() {
       viewport: currentViewport.value,
       backgroundUrl: backgroundUrl.value,
       texts: renderTextObjects.value,
-      fonts: currentFontAssets
+      fonts: fontAssets.value
     });
   } catch (error) {
     console.warn("Failed to render page with CanvasKit", error);
@@ -194,25 +182,25 @@ async function beginTextEdit(objectId: number) {
   layoutPreview.value = null;
   void nextTick(renderPdfCanvas);
   status.value = `正在准备文本对象 ${objectId} 的编辑会话...`;
-  const currentSelection = ++selectionSequence;
+  const currentSelection = incrementSelection();
 
   try {
     const session = await startTextEdit(pdfBytes.value, objectId, pdfHandle.value);
-    if (currentSelection !== selectionSequence) return;
+    if (currentSelection !== getSelectionToken()) return;
     editSession.value = session;
     draftText.value = session.original_text;
     await refreshPreview(objectId, session.original_text, currentSelection);
-    if (currentSelection !== selectionSequence) return;
+    if (currentSelection !== getSelectionToken()) return;
     status.value = `已选中文本对象 ${objectId}，可直接修改并保存`;
   } catch (error) {
     console.error(error);
-    if (currentSelection !== selectionSequence) return;
+    if (currentSelection !== getSelectionToken()) return;
     status.value = error instanceof Error ? error.message : "启动文本编辑失败";
     selectedTextId.value = null;
     editSession.value = null;
     layoutPreview.value = null;
   } finally {
-    if (currentSelection === selectionSequence) {
+    if (currentSelection === getSelectionToken()) {
       isPreparingEdit.value = false;
     }
   }
@@ -220,25 +208,24 @@ async function beginTextEdit(objectId: number) {
 
 function onDraftInput() {
   if (!selectedTextId.value) return;
-  clearPreviewTimer();
-  previewTimer = window.setTimeout(() => {
-    void refreshPreview(selectedTextId.value!, draftText.value, selectionSequence);
+  setPreviewTimer(() => {
+    void refreshPreview(selectedTextId.value!, draftText.value, getSelectionToken());
   }, 120);
 }
 
-async function refreshPreview(objectId: number, text: string, selectionToken = selectionSequence) {
+async function refreshPreview(objectId: number, text: string, selectionToken = getSelectionToken()) {
   if (!pdfBytes.value) return;
-  const requestId = ++previewRequestSequence;
+  const requestId = incrementPreviewToken();
   try {
     const preview = await previewTextLayout(pdfBytes.value, objectId, text, pdfHandle.value);
-    if (requestId !== previewRequestSequence || selectionToken !== selectionSequence || selectedTextId.value !== objectId) {
+    if (requestId !== getPreviewToken() || selectionToken !== getSelectionToken() || selectedTextId.value !== objectId) {
       return;
     }
     layoutPreview.value = preview;
     void nextTick(renderPdfCanvas);
   } catch (error) {
     console.error(error);
-    if (requestId !== previewRequestSequence || selectionToken !== selectionSequence) {
+    if (requestId !== getPreviewToken() || selectionToken !== getSelectionToken()) {
       return;
     }
     status.value = error instanceof Error ? error.message : "生成文本布局预览失败";
@@ -266,26 +253,12 @@ async function saveTextEdit() {
   }
 }
 
-function clearEditingState() {
-  clearPreviewTimer();
-  selectionSequence += 1;
-  previewRequestSequence += 1;
-  selectedTextId.value = null;
-  editSession.value = null;
-  draftText.value = "";
-  layoutPreview.value = null;
-  isPreparingEdit.value = false;
-  isSavingEdit.value = false;
+function clearSelection() {
+  clearEditingState();
   void nextTick(renderPdfCanvas);
 }
 
-function clearPreviewTimer() {
-  if (previewTimer != null) {
-    window.clearTimeout(previewTimer);
-    previewTimer = null;
-  }
-}
-
+// Zoom controls
 function zoomIn() {
   zoom.value = clampZoom(zoom.value + 0.1);
   void nextTick(renderPdfCanvas);
@@ -305,6 +278,29 @@ function clampZoom(value: number) {
   return Math.min(3, Math.max(0.25, Math.round(value * 10) / 10));
 }
 
+// Canvas Interaction (HitTest)
+async function onCanvasPointerDown(event: PointerEvent) {
+  if (!pdfBytes.value || !currentViewport.value || !page.value) return;
+  
+  const target = event.currentTarget as HTMLElement;
+  const rect = target.getBoundingClientRect();
+  const offsetX = event.clientX - rect.left;
+  const offsetY = event.clientY - rect.top;
+  
+  const pdfPoint = viewportToPdf(currentViewport.value, offsetX, offsetY);
+  
+  try {
+    const hitResult = await hitTestPdf(pdfBytes.value, page.value.page.index, pdfPoint.x, pdfPoint.y, pdfHandle.value);
+    if (hitResult && hitResult.object_type === "text") {
+      await beginTextEdit(hitResult.object_id);
+    } else {
+      clearSelection();
+    }
+  } catch (error) {
+    console.error("Hit test failed", error);
+  }
+}
+
 function pageViewportStyle() {
   const viewport = currentViewport.value;
   if (!viewport) return {};
@@ -319,19 +315,8 @@ function pageCanvasStyle() {
   if (!viewport) return {};
   return {
     width: `${viewport.width}px`,
-    height: `${viewport.height}px`
-  };
-}
-
-function textObjectStyle(text: StructuredTextObject) {
-  const viewport = currentViewport.value;
-  if (!viewport) return {};
-  const rect = pdfRectToViewportRect(viewport, text.bounds);
-  return {
-    left: `${rect.left}px`,
-    top: `${rect.top}px`,
-    width: `${Math.max(rect.width, 12)}px`,
-    height: `${Math.max(rect.height, 12)}px`
+    height: `${viewport.height}px`,
+    cursor: "text"
   };
 }
 
@@ -354,16 +339,6 @@ function textObjectLabel(text: StructuredTextObject) {
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-}
-
-function revokeUrls() {
-  if (backgroundUrl.value) {
-    URL.revokeObjectURL(backgroundUrl.value);
-    backgroundUrl.value = null;
-  }
-  page.value?.images.forEach((image) => {
-    if (image.objectUrl) URL.revokeObjectURL(image.objectUrl);
-  });
 }
 </script>
 
@@ -393,7 +368,7 @@ function revokeUrls() {
 
       <div class="action-row">
         <button :disabled="!pdfBytes" @click="exportCurrentPdf">导出当前 PDF</button>
-        <button :disabled="!selectedTextId" @click="clearEditingState">取消选择</button>
+        <button :disabled="!selectedTextId" @click="clearSelection">取消选择</button>
       </div>
 
       <p class="status">{{ status }}</p>
@@ -450,24 +425,15 @@ function revokeUrls() {
 
     <section class="canvas-pane">
       <div v-if="page && backgroundUrl" class="page-viewport" :style="pageViewportStyle()">
-        <div class="page-canvas" :style="pageCanvasStyle()">
+        <div class="page-canvas" :style="pageCanvasStyle()" @pointerdown="onCanvasPointerDown">
           <canvas ref="skiaCanvas" class="background" aria-label="PDF canvas render"></canvas>
-
-          <button
-            v-for="text in pageTextObjects"
-            :key="`overlay-${text.id}`"
-            class="text-object"
-            :class="{ selected: activeGroupObjectIds.includes(text.id) }"
-            :style="textObjectStyle(text)"
-            :title="text.content || `文本对象 ${text.id}`"
-            @click="beginTextEdit(text.id)"
-          />
 
           <svg
             v-if="currentViewport && selectedViewportRect"
             class="layout-preview"
             :class="{ overflow: Boolean(layoutPreview?.overflow) }"
             :viewBox="`0 0 ${currentViewport.width} ${currentViewport.height}`"
+            style="pointer-events: none;"
           >
             <rect
               class="layout-preview-box"
@@ -488,7 +454,7 @@ function revokeUrls() {
           </svg>
         </div>
       </div>
-      <div v-else class="empty-state">加载 PDF 后显示 CanvasKit 渲染结果，并可直接选择文本编辑</div>
+      <div v-else class="empty-state">加载 PDF 后显示 CanvasKit 渲染结果，并可直接点击画布文本进行编辑</div>
     </section>
   </main>
 </template>
