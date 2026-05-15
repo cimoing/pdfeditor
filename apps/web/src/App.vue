@@ -1,15 +1,15 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref } from "vue";
-import type { StructuredTextObject } from "./pdfEditor";
+import { computed, onBeforeUnmount } from "vue";
+import type { StructuredTextObject, TextRunInfo } from "./pdfEditor";
 import {
   commitTextEdit,
   describePdfFontUsage,
+  hitTestPdf,
   previewTextLayout,
-  startTextEdit,
-  hitTestPdf
+  resolvePdfFontFamily,
+  startTextEdit
 } from "./pdfEditor";
-import { SkiaPageRenderer } from "./skiaRenderer";
-import { pdfRectToViewportRect, viewportToPdf } from "./viewport";
+import { pdfRectToViewportRect, viewportToPdf, type Matrix2D } from "./viewport";
 import { usePdfDocument } from "./composables/usePdfDocument";
 import { usePdfEditor } from "./composables/usePdfEditor";
 
@@ -46,16 +46,12 @@ const {
   setPreviewTimer
 } = usePdfEditor();
 
-const skiaCanvas = ref<HTMLCanvasElement | null>(null);
-const skiaRenderer = new SkiaPageRenderer();
-
-// Viewport bindings
+const fontAssetMap = computed(() => new Map(fontAssets.value.map((font) => [font.resource_name, font])));
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 const textCount = computed(() => page.value?.text.length ?? 0);
 const imageCount = computed(() => page.value?.images.length ?? 0);
 const pageTextObjects = computed(() => page.value?.text ?? []);
 
-// Edit bindings
 const selectedTextObject = computed<StructuredTextObject | null>(
   () => page.value?.text.find((item) => item.id === selectedTextId.value) ?? null
 );
@@ -123,7 +119,6 @@ const previewStatus = computed(() => {
 
 onBeforeUnmount(() => {
   cleanupPdf();
-  skiaRenderer.dispose();
   clearPreviewTimer();
 });
 
@@ -149,29 +144,10 @@ async function loadPage(options?: { preserveSelectionId?: number | null }) {
     editSession.value = null;
     layoutPreview.value = null;
   }
-
-  await nextTick();
-  await renderPdfCanvas();
 }
 
 function onLoadPageClick() {
   void loadPage();
-}
-
-async function renderPdfCanvas() {
-  if (!backgroundUrl.value || !skiaCanvas.value || !currentViewport.value || !page.value) return;
-  try {
-    await skiaRenderer.render({
-      canvas: skiaCanvas.value,
-      viewport: currentViewport.value,
-      backgroundUrl: backgroundUrl.value,
-      texts: renderTextObjects.value,
-      fonts: fontAssets.value
-    });
-  } catch (error) {
-    console.warn("Failed to render page with CanvasKit", error);
-    status.value = "CanvasKit 渲染失败，请查看控制台错误";
-  }
 }
 
 async function beginTextEdit(objectId: number) {
@@ -180,7 +156,6 @@ async function beginTextEdit(objectId: number) {
   selectedTextId.value = objectId;
   isPreparingEdit.value = true;
   layoutPreview.value = null;
-  void nextTick(renderPdfCanvas);
   status.value = `正在准备文本对象 ${objectId} 的编辑会话...`;
   const currentSelection = incrementSelection();
 
@@ -222,7 +197,6 @@ async function refreshPreview(objectId: number, text: string, selectionToken = g
       return;
     }
     layoutPreview.value = preview;
-    void nextTick(renderPdfCanvas);
   } catch (error) {
     console.error(error);
     if (requestId !== getPreviewToken() || selectionToken !== getSelectionToken()) {
@@ -255,40 +229,33 @@ async function saveTextEdit() {
 
 function clearSelection() {
   clearEditingState();
-  void nextTick(renderPdfCanvas);
 }
 
-// Zoom controls
 function zoomIn() {
   zoom.value = clampZoom(zoom.value + 0.1);
-  void nextTick(renderPdfCanvas);
 }
 
 function zoomOut() {
   zoom.value = clampZoom(zoom.value - 0.1);
-  void nextTick(renderPdfCanvas);
 }
 
 function resetZoom() {
   zoom.value = 1;
-  void nextTick(renderPdfCanvas);
 }
 
 function clampZoom(value: number) {
   return Math.min(3, Math.max(0.25, Math.round(value * 10) / 10));
 }
 
-// Canvas Interaction (HitTest)
 async function onCanvasPointerDown(event: PointerEvent) {
   if (!pdfBytes.value || !currentViewport.value || !page.value) return;
-  
+
   const target = event.currentTarget as HTMLElement;
   const rect = target.getBoundingClientRect();
   const offsetX = event.clientX - rect.left;
   const offsetY = event.clientY - rect.top;
-  
   const pdfPoint = viewportToPdf(currentViewport.value, offsetX, offsetY);
-  
+
   try {
     const hitResult = await hitTestPdf(pdfBytes.value, page.value.page.index, pdfPoint.x, pdfPoint.y, pdfHandle.value);
     if (hitResult && hitResult.object_type === "text") {
@@ -320,6 +287,34 @@ function pageCanvasStyle() {
   };
 }
 
+function backgroundStyle() {
+  const viewport = currentViewport.value;
+  const pageInfo = page.value?.page;
+  if (!viewport || !pageInfo) return {};
+  const baseWidth = pageInfo.size.width * viewport.zoom;
+  const baseHeight = pageInfo.size.height * viewport.zoom;
+  let transform = "none";
+  switch (viewport.rotation) {
+    case 90:
+      transform = `translate(${viewport.width}px, 0px) rotate(90deg)`;
+      break;
+    case 180:
+      transform = `translate(${viewport.width}px, ${viewport.height}px) rotate(180deg)`;
+      break;
+    case 270:
+      transform = `translate(0px, ${viewport.height}px) rotate(-90deg)`;
+      break;
+    default:
+      break;
+  }
+  return {
+    width: `${baseWidth}px`,
+    height: `${baseHeight}px`,
+    transform,
+    transformOrigin: "left top"
+  };
+}
+
 function exportCurrentPdf() {
   if (!pdfBytes.value) return;
   const blob = new Blob([toArrayBuffer(pdfBytes.value)], { type: "application/pdf" });
@@ -335,6 +330,96 @@ function exportCurrentPdf() {
 function textObjectLabel(text: StructuredTextObject) {
   const normalized = text.content.replace(/\s+/g, " ").trim();
   return normalized || `文本对象 ${text.id}`;
+}
+
+function svgTextTransform(text: StructuredTextObject) {
+  const viewport = currentViewport.value;
+  if (!viewport) return "";
+  const matrix = multiplyMatrices(multiplyMatrices(viewport.transform, text.transform), [1, 0, 0, -1, 0, 0]);
+  return `matrix(${matrix.map((value) => roundSvg(value)).join(" ")})`;
+}
+
+function svgTextLength(text: StructuredTextObject) {
+  if (text.content.includes("\n")) return undefined;
+  if (!text.glyphs?.length) return undefined;
+  return roundSvg(text.glyphs.reduce((sum, glyph) => sum + Math.max(glyph.advance, 0), 0));
+}
+
+function svgTextLines(text: StructuredTextObject) {
+  return text.content.split("\n");
+}
+
+function svgTextRuns(text: StructuredTextObject) {
+  const runs = (text.runs ?? []).filter((run) => run.content);
+  if (!runs.length || text.content.includes("\n")) {
+    return null;
+  }
+  return runs;
+}
+
+function svgFontFamily(fontName: string | null) {
+  return resolvePdfFontFamily(fontName, fontFamilies.value);
+}
+
+function svgFill(text: StructuredTextObject) {
+  return shouldFillText(text.rendering_mode) ? colorToCss(text.color) : "none";
+}
+
+function svgStroke(text: StructuredTextObject) {
+  return shouldStrokeText(text.rendering_mode) ? colorToCss(text.stroke_color) : "none";
+}
+
+function svgStrokeWidth(text: StructuredTextObject) {
+  if (!shouldStrokeText(text.rendering_mode)) return undefined;
+  return roundSvg(text.stroke_width / Math.max(effectiveFontSize(text), 1));
+}
+
+function svgPaintOrder(text: StructuredTextObject) {
+  if (shouldFillText(text.rendering_mode) && shouldStrokeText(text.rendering_mode)) {
+    return "stroke fill";
+  }
+  return undefined;
+}
+
+function fontWeightFor(fontName: string | null) {
+  if (!fontName) return undefined;
+  const font = fontAssetMap.value.get(fontName);
+  return font?.font_weight ? String(font.font_weight) : undefined;
+}
+
+function colorToCss(color: { r: number; g: number; b: number; a: number }) {
+  return `rgba(${color.r}, ${color.g}, ${color.b}, ${Math.max(0, Math.min(color.a / 255, 1))})`;
+}
+
+function effectiveFontSize(text: StructuredTextObject) {
+  const yAxisScale = Math.hypot(text.transform[2], text.transform[3]);
+  if (yAxisScale > 0.01) return yAxisScale;
+  const xAxisScale = Math.hypot(text.transform[0], text.transform[1]);
+  if (xAxisScale > 0.01) return xAxisScale;
+  return text.font_size > 0 ? text.font_size : 1;
+}
+
+function shouldFillText(renderingMode: number) {
+  return renderingMode === 0 || renderingMode === 2 || renderingMode === 4 || renderingMode === 6;
+}
+
+function shouldStrokeText(renderingMode: number) {
+  return renderingMode === 1 || renderingMode === 2 || renderingMode === 5 || renderingMode === 6;
+}
+
+function multiplyMatrices(left: Matrix2D, right: Matrix2D): Matrix2D {
+  return [
+    left[0] * right[0] + left[2] * right[1],
+    left[1] * right[0] + left[3] * right[1],
+    left[0] * right[2] + left[2] * right[3],
+    left[1] * right[2] + left[3] * right[3],
+    left[0] * right[4] + left[2] * right[5] + left[4],
+    left[1] * right[4] + left[3] * right[5] + left[5]
+  ];
+}
+
+function roundSvg(value: number) {
+  return Number(value.toFixed(4));
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -375,8 +460,8 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 
       <section v-if="page" class="render-summary">
         <h2>渲染摘要</h2>
-        <div>文本对象：{{ textCount }}</div>
-        <div>图片对象：{{ imageCount }}</div>
+        <div>SVG 文本对象：{{ textCount }}</div>
+        <div>背景图片对象：{{ imageCount }}</div>
         <div>旋转角度：{{ page.page.rotation ?? 0 }}°</div>
       </section>
 
@@ -424,16 +509,61 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
     </aside>
 
     <section class="canvas-pane">
-      <div v-if="page && backgroundUrl" class="page-viewport" :style="pageViewportStyle()">
+      <div v-if="page && backgroundUrl && currentViewport" class="page-viewport" :style="pageViewportStyle()">
         <div class="page-canvas" :style="pageCanvasStyle()" @pointerdown="onCanvasPointerDown">
-          <canvas ref="skiaCanvas" class="background" aria-label="PDF canvas render"></canvas>
+          <img class="background" :style="backgroundStyle()" :src="backgroundUrl" alt="PDF background render" />
 
           <svg
-            v-if="currentViewport && selectedViewportRect"
+            class="page-svg"
+            :viewBox="`0 0 ${currentViewport.width} ${currentViewport.height}`"
+            aria-label="PDF svg text render"
+          >
+            <text
+              v-for="text in renderTextObjects"
+              :key="`text-${text.id}`"
+              :transform="svgTextTransform(text)"
+              :font-family="svgFontFamily(text.font_name)"
+              :font-weight="fontWeightFor(text.font_name)"
+              :fill="svgFill(text)"
+              :stroke="svgStroke(text)"
+              :stroke-width="svgStrokeWidth(text)"
+              :paint-order="svgPaintOrder(text)"
+              font-size="1"
+              xml:space="preserve"
+              dominant-baseline="alphabetic"
+              :textLength="svgTextLength(text)"
+              :lengthAdjust="svgTextLength(text) != null ? 'spacingAndGlyphs' : undefined"
+            >
+              <template v-if="svgTextRuns(text)">
+                <tspan
+                  v-for="(run, runIndex) in svgTextRuns(text) ?? []"
+                  :key="`run-${text.id}-${runIndex}`"
+                  :font-family="svgFontFamily(run.font_name)"
+                  :font-weight="fontWeightFor(run.font_name)"
+                  :fill="colorToCss(run.color)"
+                >
+                  {{ run.content }}
+                </tspan>
+              </template>
+              <template v-else-if="svgTextLines(text).length > 1">
+                <tspan
+                  v-for="(line, lineIndex) in svgTextLines(text)"
+                  :key="`line-${text.id}-${lineIndex}`"
+                  x="0"
+                  :y="lineIndex === 0 ? 0 : lineIndex * 1.2"
+                >
+                  {{ line }}
+                </tspan>
+              </template>
+              <template v-else>{{ text.content }}</template>
+            </text>
+          </svg>
+
+          <svg
+            v-if="selectedViewportRect"
             class="layout-preview"
             :class="{ overflow: Boolean(layoutPreview?.overflow) }"
             :viewBox="`0 0 ${currentViewport.width} ${currentViewport.height}`"
-            style="pointer-events: none;"
           >
             <rect
               class="layout-preview-box"
@@ -454,7 +584,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
           </svg>
         </div>
       </div>
-      <div v-else class="empty-state">加载 PDF 后显示 CanvasKit 渲染结果，并可直接点击画布文本进行编辑</div>
+      <div v-else class="empty-state">加载 PDF 后显示 PNG 背景与 SVG 文本层，并可直接点击文本进行编辑</div>
     </section>
   </main>
 </template>

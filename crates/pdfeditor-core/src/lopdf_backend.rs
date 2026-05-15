@@ -1146,6 +1146,7 @@ impl LopdfDocument {
     fn structured_text(&self, page: PageIndex) -> CoreResult<Vec<StructuredTextObject>> {
         let page_id = self.page_id(page)?;
         let content = self.decoded_page_content(page_id)?;
+        let page_fonts = self.document.get_page_fonts(page_id).ok();
         let font_maps = self.page_font_maps(page_id);
         let font_metrics = self.page_font_metrics(page_id);
         let mut state = PageParseState::default();
@@ -1163,8 +1164,19 @@ impl LopdfDocument {
                 .font_name
                 .as_ref()
                 .and_then(|name| font_metrics.get(name));
+            let is_background_only_text = state
+                .text
+                .font_name
+                .as_ref()
+                .is_some_and(|font_name| {
+                    is_type3_font_name(page_fonts.as_ref(), font_name) || !state.text.is_svg_safe()
+                });
             if let Some(text) = operation_text(operation, font_map) {
                 if text.is_empty() {
+                    advance_page_text_state(&mut state, operation, metrics);
+                    continue;
+                }
+                if is_background_only_text {
                     advance_page_text_state(&mut state, operation, metrics);
                     continue;
                 }
@@ -1286,25 +1298,16 @@ impl LopdfDocument {
                 .font_name
                 .as_ref()
                 .and_then(|name| font_metrics.get(name));
-            let is_visual_only_type3 = state
+            let is_background_only_text = state
                 .text
                 .font_name
                 .as_ref()
-                .and_then(|name| {
-                    page_fonts
-                        .as_ref()
-                        .and_then(|fonts| fonts.get(name.as_bytes()))
-                })
-                .is_some_and(|font| {
-                    font.get(b"Subtype")
-                        .ok()
-                        .and_then(object_name_bytes)
-                        .as_deref()
-                        == Some("Type3")
+                .is_some_and(|font_name| {
+                    is_type3_font_name(page_fonts.as_ref(), font_name) || !state.text.is_svg_safe()
                 });
 
-            if let Some(text) = operation_text(operation, font_map) {
-                if text.is_empty() && is_visual_only_type3 {
+            if let Some(_text) = operation_text(operation, font_map) {
+                if is_background_only_text {
                     let transform = text_render_transform(&state);
                     if let Some(width) = operation_text_advance(operation, metrics, &state.text) {
                         objects.push(StructuredVisualTextObject {
@@ -1665,9 +1668,21 @@ impl LopdfDocument {
                     }
                     path.clear();
                 }
-                "Do" => {}
+                "Do" => {
+                    if draw_image_xobject(
+                        &mut pixmap,
+                        &self.document,
+                        page_id,
+                        operation,
+                        state.ctm,
+                        page_info.size.height,
+                        scale,
+                    ) {
+                        drawn_operations += 1;
+                    }
+                }
                 "Tj" | "TJ" | "'" | "\"" => {
-                    if self.draw_visual_only_type3_text(
+                    if self.draw_background_only_text(
                         &mut pixmap,
                         page_fonts.as_ref(),
                         &font_maps,
@@ -1699,7 +1714,7 @@ impl LopdfDocument {
         ))
     }
 
-    fn draw_visual_only_type3_text(
+    fn draw_background_only_text(
         &self,
         pixmap: &mut Pixmap,
         page_fonts: Option<&BTreeMap<Vec<u8>, &Dictionary>>,
@@ -1712,19 +1727,6 @@ impl LopdfDocument {
         let Some(font_name) = state.text.font_name.as_ref() else {
             return Ok(false);
         };
-        let decoded = font_maps
-            .get(font_name)
-            .and_then(|font_map| operation_text(operation, Some(font_map)))
-            .unwrap_or_default();
-        if !decoded.is_empty() {
-            return Ok(false);
-        }
-        let Some(raw_bytes) = operation_text_bytes(operation) else {
-            return Ok(false);
-        };
-        if raw_bytes.is_empty() {
-            return Ok(false);
-        }
         let Some(font) = page_fonts.and_then(|fonts| fonts.get(font_name.as_bytes()).copied())
         else {
             return Ok(false);
@@ -1736,6 +1738,21 @@ impl LopdfDocument {
             .as_deref()
             != Some("Type3")
         {
+            return Ok(false);
+        }
+        let decoded = font_maps
+            .get(font_name)
+            .and_then(|font_map| operation_text(operation, Some(font_map)))
+            .unwrap_or_default();
+        let raw_bytes = if decoded.is_empty() {
+            operation_text_bytes(operation).unwrap_or_default()
+        } else {
+            font_maps
+                .get(font_name)
+                .and_then(|font_map| font_map.encode(&decoded))
+                .unwrap_or_else(|| operation_text_bytes(operation).unwrap_or_default())
+        };
+        if raw_bytes.is_empty() {
             return Ok(false);
         }
 
@@ -2469,6 +2486,127 @@ fn fill_pdf_path(
     true
 }
 
+fn draw_image_xobject(
+    pixmap: &mut Pixmap,
+    document: &Document,
+    page_id: ObjectId,
+    operation: &Operation,
+    ctm: [f32; 6],
+    page_height: f32,
+    scale: f32,
+) -> bool {
+    let Some(name) = operation.operands.first().and_then(object_name) else {
+        return false;
+    };
+    let xobjects = page_xobjects(document, page_id);
+    let Some((_, stream)) = xobjects.get(&name) else {
+        return false;
+    };
+    if stream
+        .dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(object_name_bytes)
+        .as_deref()
+        != Some("Image")
+    {
+        return false;
+    }
+    let Some(image) = decode_basic_image_xobject(document, stream) else {
+        return false;
+    };
+    composite_image_onto_pixmap(
+        pixmap,
+        &image.premultiplied_rgba,
+        image.width,
+        image.height,
+        ctm,
+        page_height,
+        scale,
+    )
+}
+
+fn composite_image_onto_pixmap(
+    pixmap: &mut Pixmap,
+    rgba: &[u8],
+    image_width: u32,
+    image_height: u32,
+    transform: [f32; 6],
+    page_height: f32,
+    scale: f32,
+) -> bool {
+    let corners = [
+        transform_point(transform, 0.0, 0.0),
+        transform_point(transform, 1.0, 0.0),
+        transform_point(transform, 0.0, 1.0),
+        transform_point(transform, 1.0, 1.0),
+    ];
+    let min_x = corners.iter().map(|point| point.0).fold(f32::INFINITY, f32::min);
+    let max_x = corners
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = corners.iter().map(|point| point.1).fold(f32::INFINITY, f32::min);
+    let max_y = corners
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !min_x.is_finite() || !max_x.is_finite() || !min_y.is_finite() || !max_y.is_finite() {
+        return false;
+    }
+
+    let Some(inverse) = invert_matrix(transform) else {
+        return false;
+    };
+
+    let left = (min_x * scale).floor().max(0.0) as u32;
+    let right = (max_x * scale).ceil().min(pixmap.width() as f32) as u32;
+    let top = ((page_height - max_y) * scale).floor().max(0.0) as u32;
+    let bottom = ((page_height - min_y) * scale)
+        .ceil()
+        .min(pixmap.height() as f32) as u32;
+    if left >= right || top >= bottom {
+        return false;
+    }
+
+    let stride = pixmap.width() as usize * 4;
+    let dest = pixmap.data_mut();
+    let mut drew = false;
+    for py in top..bottom {
+        for px in left..right {
+            let page_x = (px as f32 + 0.5) / scale;
+            let page_y = page_height - (py as f32 + 0.5) / scale;
+            let (u, v) = transform_point(inverse, page_x, page_y);
+            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                continue;
+            }
+            let sx = ((u * image_width as f32).floor() as i32).clamp(0, image_width as i32 - 1);
+            let sy =
+                (((1.0 - v) * image_height as f32).floor() as i32).clamp(0, image_height as i32 - 1);
+            let src_index = (sy as usize * image_width as usize + sx as usize) * 4;
+            let dest_index = py as usize * stride + px as usize * 4;
+            blend_premultiplied_pixel(dest, dest_index, &rgba[src_index..src_index + 4]);
+            drew = true;
+        }
+    }
+    drew
+}
+
+fn blend_premultiplied_pixel(dest: &mut [u8], dest_index: usize, src: &[u8]) {
+    let src_a = u16::from(src[3]);
+    if src_a == 0 {
+        return;
+    }
+    let inv_a = 255u16.saturating_sub(src_a);
+    for channel in 0..3 {
+        let src_value = u16::from(src[channel]);
+        let dest_value = u16::from(dest[dest_index + channel]);
+        dest[dest_index + channel] = (src_value + ((dest_value * inv_a + 127) / 255)) as u8;
+    }
+    let dest_a = u16::from(dest[dest_index + 3]);
+    dest[dest_index + 3] = (src_a + ((dest_a * inv_a + 127) / 255)).min(255) as u8;
+}
+
 #[derive(Debug, Clone)]
 struct BasicImage {
     width: u32,
@@ -2759,6 +2897,8 @@ struct TextParseState {
     stroke_color: Color,
     stroke_width: f32,
     rendering_mode: i32,
+    fill_color_svg_safe: bool,
+    stroke_color_svg_safe: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2805,7 +2945,17 @@ impl Default for TextParseState {
             stroke_color: Color::BLACK,
             stroke_width: 1.0,
             rendering_mode: 0,
+            fill_color_svg_safe: true,
+            stroke_color_svg_safe: true,
         }
+    }
+}
+
+impl TextParseState {
+    fn is_svg_safe(&self) -> bool {
+        matches!(self.rendering_mode, 0 | 1 | 2)
+            && self.fill_color_svg_safe
+            && self.stroke_color_svg_safe
     }
 }
 
@@ -2889,11 +3039,13 @@ fn update_page_state(state: &mut PageParseState, operation: &Operation) {
                     normalized_color_channel(b),
                     255,
                 );
+                state.text.fill_color_svg_safe = true;
             }
         }
         "g" => {
             if let Some(color) = gray_color(operation) {
                 state.text.color = color;
+                state.text.fill_color_svg_safe = true;
             }
         }
         "RG" => {
@@ -2908,12 +3060,20 @@ fn update_page_state(state: &mut PageParseState, operation: &Operation) {
                     normalized_color_channel(b),
                     255,
                 );
+                state.text.stroke_color_svg_safe = true;
             }
         }
         "G" => {
             if let Some(color) = gray_color(operation) {
                 state.text.stroke_color = color;
+                state.text.stroke_color_svg_safe = true;
             }
+        }
+        "k" | "sc" | "scn" | "cs" => {
+            state.text.fill_color_svg_safe = false;
+        }
+        "K" | "SC" | "SCN" | "CS" => {
+            state.text.stroke_color_svg_safe = false;
         }
         "w" => {
             if let Some(width) = operation.operands.first().and_then(object_to_f32) {
@@ -3373,6 +3533,21 @@ fn transform_point(transform: [f32; 6], x: f32, y: f32) -> (f32, f32) {
     )
 }
 
+fn invert_matrix(transform: [f32; 6]) -> Option<[f32; 6]> {
+    let determinant = transform[0] * transform[3] - transform[1] * transform[2];
+    if determinant.abs() <= f32::EPSILON {
+        return None;
+    }
+    Some([
+        transform[3] / determinant,
+        -transform[1] / determinant,
+        -transform[2] / determinant,
+        transform[0] / determinant,
+        (transform[2] * transform[5] - transform[3] * transform[4]) / determinant,
+        (transform[1] * transform[4] - transform[0] * transform[5]) / determinant,
+    ])
+}
+
 fn inverse_transform_point(transform: [f32; 6], point: Point) -> Point {
     let [a, b, c, d, e, f] = transform;
     let determinant = a * d - b * c;
@@ -3677,6 +3852,21 @@ fn object_color_space(object: &Object) -> Option<String> {
     }
 }
 
+fn is_type3_font_name(
+    page_fonts: Option<&BTreeMap<Vec<u8>, &Dictionary>>,
+    font_name: &str,
+) -> bool {
+    page_fonts
+        .and_then(|fonts| fonts.get(font_name.as_bytes()).copied())
+        .is_some_and(|font| {
+            font.get(b"Subtype")
+                .ok()
+                .and_then(object_name_bytes)
+                .as_deref()
+                == Some("Type3")
+        })
+}
+
 fn object_text(object: &Object, font_map: Option<&ToUnicodeMap>) -> Option<String> {
     match object {
         Object::String(value, format) => Some(match font_map {
@@ -3942,6 +4132,22 @@ fn collect_xobjects(
     }
 }
 
+fn page_xobjects(document: &Document, page_id: ObjectId) -> HashMap<String, (ObjectId, lopdf::Stream)> {
+    let mut result = HashMap::new();
+    let Ok((resource_dict, resource_ids)) = document.get_page_resources(page_id) else {
+        return result;
+    };
+    if let Some(resources) = resource_dict {
+        collect_xobjects(document, resources, &mut result);
+    }
+    for resource_id in resource_ids {
+        if let Ok(resources) = document.get_dictionary(resource_id) {
+            collect_xobjects(document, resources, &mut result);
+        }
+    }
+    result
+}
+
 #[derive(Debug, Clone)]
 struct FontMetrics {
     widths: HashMap<u32, f32>,
@@ -4148,13 +4354,13 @@ fn font_file_bytes(
         if let Some(to_unicode) = to_unicode {
             if let Some(remapped) = cff_otf_wrap::wrap_sfnt_with_tounicode_cmap(&bytes, to_unicode)
             {
-                return Some((remapped, "font/ttf", "truetype", "ttf"));
+                return Some((remapped, "font/otf", "opentype", "otf"));
             }
         }
         if !sfnt_has_usable_cmap(&bytes) {
             return Some((bytes, "application/octet-stream", "unknown", "font"));
         }
-        return Some((bytes, "font/ttf", "truetype", "ttf"));
+        return Some((bytes, "font/otf", "opentype", "otf"));
     }
 
     if let Some(stream) = descriptor
