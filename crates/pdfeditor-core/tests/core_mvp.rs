@@ -556,9 +556,11 @@ fn lopdf_backend_exports_image_xobject_separately_from_background_png() {
     let center = pixmap.pixel(80, 80).unwrap();
     assert_eq!(report.width_px, 200);
     assert_eq!(report.height_px, 200);
-    assert_eq!(report.drawn_operations, 1);
+    assert_eq!(report.drawn_operations, 0);
     assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
-    assert!(center.red() > 0 || center.green() > 0 || center.blue() > 0);
+    assert_eq!(center.red(), 255);
+    assert_eq!(center.green(), 255);
+    assert_eq!(center.blue(), 255);
     assert_eq!(images.len(), 1);
     assert!(images[0].file_name.ends_with(".image.png"));
     assert!(image_dir.join(&images[0].file_name).exists());
@@ -587,7 +589,7 @@ fn lopdf_backend_applies_image_soft_mask_to_exported_image_png() {
     let pixmap = tiny_skia::Pixmap::load_png(&image_path).unwrap();
     let transparent_corner = pixmap.pixel(0, 0).unwrap();
     let opaque_corner = pixmap.pixel(1, 0).unwrap();
-    assert_eq!(report.drawn_operations, 1);
+    assert_eq!(report.drawn_operations, 0);
     assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     assert_eq!(transparent_corner.alpha(), 0);
     assert_eq!(opaque_corner.alpha(), 255);

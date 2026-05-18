@@ -51,11 +51,7 @@ const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 const textCount = computed(() => page.value?.text.length ?? 0);
 const imageCount = computed(() => page.value?.images.length ?? 0);
 const pageTextObjects = computed(() => page.value?.text ?? []);
-const renderImagesAsSvg = computed(() => {
-  const currentPage = page.value;
-  if (!currentPage) return false;
-  return currentPage.text.length === 0 && (currentPage.visual_text?.length ?? 0) === 0 && currentPage.images.length > 0;
-});
+const renderImageObjects = computed(() => page.value?.images.filter((image) => image.objectUrl) ?? []);
 
 const selectedTextObject = computed<StructuredTextObject | null>(
   () => page.value?.text.find((item) => item.id === selectedTextId.value) ?? null
@@ -527,7 +523,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
       <div v-if="page && backgroundUrl && currentViewport" class="page-viewport" :style="pageViewportStyle()">
         <div class="page-canvas" :style="pageCanvasStyle()" @pointerdown="onCanvasPointerDown">
           <img
-            v-if="!renderImagesAsSvg"
             class="background"
             :style="backgroundStyle()"
             :src="backgroundUrl"
@@ -540,7 +535,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
             aria-label="PDF svg text render"
           >
             <image
-              v-for="image in renderImagesAsSvg ? page.images : []"
+              v-for="image in renderImageObjects"
               :key="`image-${image.id}`"
               :href="image.objectUrl"
               width="1"
