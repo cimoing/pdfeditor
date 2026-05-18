@@ -222,11 +222,23 @@ button:disabled {
   width: 100%;
   height: 100%;
   overflow: visible;
+  pointer-events: auto;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.page-svg image {
   pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .page-svg text {
+  cursor: text;
+  pointer-events: visiblePainted;
   text-rendering: geometricPrecision;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .layout-preview {
@@ -258,6 +270,25 @@ button:disabled {
 
 .layout-preview.overflow .layout-preview-glyph {
   stroke: rgba(217, 45, 32, 0.42);
+}
+
+.inline-text-editor {
+  position: absolute;
+  z-index: 3;
+  overflow: hidden;
+  padding: 0;
+  border: 1px solid rgba(31, 111, 235, 0.72);
+  outline: 2px solid rgba(31, 111, 235, 0.16);
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 2px 8px rgba(31, 41, 55, 0.12);
+  resize: none;
+  white-space: pre-wrap;
+  transform-origin: left top;
+}
+
+.inline-text-editor.overflow {
+  border-color: rgba(217, 45, 32, 0.82);
+  outline-color: rgba(217, 45, 32, 0.16);
 }
 
 .empty-state {

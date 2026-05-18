@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount } from "vue";
-import type { StructuredImageObject, StructuredTextObject, TextRunInfo } from "./pdfEditor";
+import { computed, nextTick, onBeforeUnmount, ref } from "vue";
+import type { StructuredImageObject, StructuredTextObject } from "./pdfEditor";
 import {
   commitTextEdit,
   describePdfFontUsage,
@@ -47,6 +47,7 @@ const {
 } = usePdfEditor();
 
 const fontAssetMap = computed(() => new Map(fontAssets.value.map((font) => [font.resource_name, font])));
+const inlineEditor = ref<HTMLTextAreaElement | null>(null);
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 const textCount = computed(() => page.value?.text.length ?? 0);
 const imageCount = computed(() => page.value?.images.length ?? 0);
@@ -97,6 +98,25 @@ const previewGlyphRects = computed(() => {
     id: `${index}-${glyph.ch}-${glyph.x}-${glyph.y}`,
     rect: pdfRectToViewportRect(viewport, glyph.bbox)
   }));
+});
+
+const inlineEditorStyle = computed(() => {
+  const text = selectedTextObject.value;
+  const viewport = currentViewport.value;
+  if (!text || !viewport || !editSession.value) return {};
+  const rect = pdfRectToViewportRect(viewport, editSession.value.bbox);
+  const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
+  return {
+    left: `${rect.left}px`,
+    top: `${rect.top}px`,
+    width: `${Math.max(rect.width, fontSize * 4)}px`,
+    minHeight: `${Math.max(rect.height, fontSize * 1.4)}px`,
+    fontFamily: svgFontFamily(editSession.value.font_id ?? text.font_name),
+    fontSize: `${fontSize}px`,
+    fontWeight: fontWeightFor(editSession.value.font_id ?? text.font_name),
+    color: colorToCss(text.color),
+    lineHeight: "1.2"
+  };
 });
 
 const canSaveEdit = computed(() => {
@@ -168,6 +188,9 @@ async function beginTextEdit(objectId: number) {
     await refreshPreview(objectId, session.original_text, currentSelection);
     if (currentSelection !== getSelectionToken()) return;
     status.value = `已选中文本对象 ${objectId}，可直接修改并保存`;
+    await nextTick();
+    inlineEditor.value?.focus();
+    inlineEditor.value?.select();
   } catch (error) {
     console.error(error);
     if (currentSelection !== getSelectionToken()) return;
@@ -189,6 +212,18 @@ function onDraftInput() {
   }, 120);
 }
 
+function onInlineEditorKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    clearSelection();
+    return;
+  }
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    void saveTextEdit({ closeAfterSave: true });
+  }
+}
+
 async function refreshPreview(objectId: number, text: string, selectionToken = getSelectionToken()) {
   if (!pdfBytes.value) return;
   const requestId = incrementPreviewToken();
@@ -207,7 +242,7 @@ async function refreshPreview(objectId: number, text: string, selectionToken = g
   }
 }
 
-async function saveTextEdit() {
+async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
   if (!pdfBytes.value || !selectedTextId.value || !canSaveEdit.value) return;
   clearPreviewTimer();
   isSavingEdit.value = true;
@@ -217,8 +252,12 @@ async function saveTextEdit() {
   try {
     const updatedBytes = await commitTextEdit(pdfBytes.value, objectId, draftText.value, pdfHandle.value);
     pdfBytes.value = new Uint8Array(updatedBytes);
-    await loadPage({ preserveSelectionId: objectId });
-    await beginTextEdit(objectId);
+    await loadPage(options.closeAfterSave ? undefined : { preserveSelectionId: objectId });
+    if (options.closeAfterSave) {
+      clearEditingState();
+    } else {
+      await beginTextEdit(objectId);
+    }
     status.value = `文本对象 ${objectId} 已保存`;
   } catch (error) {
     console.error(error);
@@ -226,6 +265,22 @@ async function saveTextEdit() {
   } finally {
     isSavingEdit.value = false;
   }
+}
+
+async function saveTextEditOnBlur() {
+  if (isPreparingEdit.value || isSavingEdit.value) return;
+  if (!selectedTextObject.value || !editSession.value) return;
+  if (layoutPreview.value?.overflow) {
+    status.value = "当前文本超出原始文本边界，失去焦点时未保存。";
+    await nextTick();
+    inlineEditor.value?.focus();
+    return;
+  }
+  if (draftText.value === editSession.value.original_text) {
+    clearSelection();
+    return;
+  }
+  await saveTextEdit({ closeAfterSave: true });
 }
 
 function clearSelection() {
@@ -258,9 +313,11 @@ async function onCanvasPointerDown(event: PointerEvent) {
   const pdfPoint = viewportToPdf(currentViewport.value, offsetX, offsetY);
 
   try {
-    const hitResult = await hitTestPdf(pdfBytes.value, page.value.page.index, pdfPoint.x, pdfPoint.y, pdfHandle.value);
+    const hitResult = await hitTestPdf(pdfBytes.value, pageNumber.value, pdfPoint.x, pdfPoint.y, pdfHandle.value);
     if (hitResult && hitResult.object_type === "text") {
       await beginTextEdit(hitResult.object_id);
+    } else if (editSession.value) {
+      await saveTextEditOnBlur();
     } else {
       clearSelection();
     }
@@ -353,7 +410,20 @@ function svgTextTransform(text: StructuredTextObject) {
 function svgTextLength(text: StructuredTextObject) {
   if (text.content.includes("\n")) return undefined;
   if (!text.glyphs?.length) return undefined;
+  if (!shouldTrustSvgTextLength(text)) return undefined;
   return roundSvg(text.glyphs.reduce((sum, glyph) => sum + Math.max(glyph.advance, 0), 0));
+}
+
+function shouldTrustSvgTextLength(text: StructuredTextObject) {
+  const glyphs = text.glyphs ?? [];
+  const chars = Array.from(text.content);
+  if (glyphs.length !== chars.length) return false;
+  if (glyphs.length <= 1) return true;
+  for (let index = 0; index < chars.length; index += 1) {
+    if (glyphs[index].ch !== chars[index]) return false;
+  }
+  const unitAdvanceCount = glyphs.filter((glyph) => Math.abs(glyph.advance - 1) < 0.001).length;
+  return unitAdvanceCount / glyphs.length < 0.8;
 }
 
 function svgTextLines(text: StructuredTextObject) {
@@ -500,7 +570,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
         <p class="helper-text" :class="{ danger: Boolean(layoutPreview?.overflow) }">
           {{ previewStatus }}
         </p>
-        <button class="save-button" :disabled="!canSaveEdit" @click="saveTextEdit">
+        <button class="save-button" :disabled="!canSaveEdit" @click="saveTextEdit()">
           {{ isSavingEdit ? "正在保存..." : "保存到 PDF" }}
         </button>
       </section>
@@ -558,6 +628,8 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
               dominant-baseline="alphabetic"
               :textLength="svgTextLength(text)"
               :lengthAdjust="svgTextLength(text) != null ? 'spacingAndGlyphs' : undefined"
+              @pointerdown.stop
+              @click.stop="beginTextEdit(text.id)"
             >
               <template v-if="svgTextRuns(text)">
                 <tspan
@@ -607,6 +679,22 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
               :height="glyph.rect.height"
             />
           </svg>
+
+          <textarea
+            v-if="editSession && selectedTextObject"
+            ref="inlineEditor"
+            v-model="draftText"
+            class="inline-text-editor"
+            :class="{ overflow: Boolean(layoutPreview?.overflow) }"
+            :style="inlineEditorStyle"
+            :disabled="isPreparingEdit || isSavingEdit"
+            spellcheck="false"
+            @input="onDraftInput"
+            @keydown="onInlineEditorKeydown"
+            @blur="saveTextEditOnBlur"
+            @pointerdown.stop
+            @click.stop
+          />
         </div>
       </div>
       <div v-else class="empty-state">加载 PDF 后显示 PNG 背景与 SVG 文本层，并可直接点击文本进行编辑</div>

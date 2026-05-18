@@ -4087,7 +4087,15 @@ fn parse_cid_font_metrics(
     Some(FontMetrics {
         widths,
         default_width,
-        code_len: to_unicode.map(|map| map.max_code_len.max(1)).unwrap_or(2),
+        code_len: to_unicode
+            .map(|map| {
+                if map.identity_utf16 && map.max_code_len == 0 {
+                    2
+                } else {
+                    map.max_code_len.max(1)
+                }
+            })
+            .unwrap_or(2),
         width_scale: 0.001,
     })
 }

@@ -736,6 +736,10 @@ fn lopdf_backend_preserves_hex_unicode_text_when_updating_chinese() {
     let bytes = fs::read(&target).unwrap();
     let mut document = open_lopdf_document_from_bytes(&bytes).unwrap();
     let object = document.text_objects(PageIndex(0)).unwrap()[0].clone();
+    let original_structured = document.page_structure(PageIndex(0)).unwrap().text[0].clone();
+    let original_font_size = object.font_size;
+    let original_x_scale = original_structured.transform[0].hypot(original_structured.transform[1]);
+    let original_y_scale = original_structured.transform[2].hypot(original_structured.transform[3]);
 
     document
         .update_text_object(object.id, "你好，世界".to_string(), None)
@@ -744,7 +748,26 @@ fn lopdf_backend_preserves_hex_unicode_text_when_updating_chinese() {
 
     let reopened = open_lopdf_document_from_bytes(&updated_bytes).unwrap();
     let texts = reopened.text_objects(PageIndex(0)).unwrap();
-    assert!(texts.iter().any(|item| item.content == "你好，世界"));
+    let structured = reopened.page_structure(PageIndex(0)).unwrap().text;
+    let updated = texts
+        .iter()
+        .find(|item| item.content == "你好，世界")
+        .unwrap();
+    let updated_structured = structured
+        .iter()
+        .find(|item| item.content == "你好，世界")
+        .unwrap();
+    assert!((updated.font_size - original_font_size).abs() < 0.01);
+    assert!(
+        (updated_structured.transform[0].hypot(updated_structured.transform[1]) - original_x_scale)
+            .abs()
+            < 0.01
+    );
+    assert!(
+        (updated_structured.transform[2].hypot(updated_structured.transform[3]) - original_y_scale)
+            .abs()
+            < 0.01
+    );
 }
 
 fn rendered(page: PageIndex, byte_len: usize) -> RenderedPage {
