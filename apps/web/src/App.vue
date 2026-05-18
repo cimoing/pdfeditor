@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount } from "vue";
-import type { StructuredTextObject, TextRunInfo } from "./pdfEditor";
+import type { StructuredImageObject, StructuredTextObject, TextRunInfo } from "./pdfEditor";
 import {
   commitTextEdit,
   describePdfFontUsage,
@@ -51,6 +51,11 @@ const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 const textCount = computed(() => page.value?.text.length ?? 0);
 const imageCount = computed(() => page.value?.images.length ?? 0);
 const pageTextObjects = computed(() => page.value?.text ?? []);
+const renderImagesAsSvg = computed(() => {
+  const currentPage = page.value;
+  if (!currentPage) return false;
+  return currentPage.text.length === 0 && (currentPage.visual_text?.length ?? 0) === 0 && currentPage.images.length > 0;
+});
 
 const selectedTextObject = computed<StructuredTextObject | null>(
   () => page.value?.text.find((item) => item.id === selectedTextId.value) ?? null
@@ -315,6 +320,16 @@ function backgroundStyle() {
   };
 }
 
+function svgImageTransform(image: StructuredImageObject) {
+  const viewport = currentViewport.value;
+  if (!viewport) return "";
+  const matrix = multiplyMatrices(
+    multiplyMatrices(viewport.transform, image.transform),
+    [1, 0, 0, -1, 0, 1]
+  );
+  return `matrix(${matrix.map((value) => roundSvg(value)).join(" ")})`;
+}
+
 function exportCurrentPdf() {
   if (!pdfBytes.value) return;
   const blob = new Blob([toArrayBuffer(pdfBytes.value)], { type: "application/pdf" });
@@ -511,13 +526,28 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
     <section class="canvas-pane">
       <div v-if="page && backgroundUrl && currentViewport" class="page-viewport" :style="pageViewportStyle()">
         <div class="page-canvas" :style="pageCanvasStyle()" @pointerdown="onCanvasPointerDown">
-          <img class="background" :style="backgroundStyle()" :src="backgroundUrl" alt="PDF background render" />
+          <img
+            v-if="!renderImagesAsSvg"
+            class="background"
+            :style="backgroundStyle()"
+            :src="backgroundUrl"
+            alt="PDF background render"
+          />
 
           <svg
             class="page-svg"
             :viewBox="`0 0 ${currentViewport.width} ${currentViewport.height}`"
             aria-label="PDF svg text render"
           >
+            <image
+              v-for="image in renderImagesAsSvg ? page.images : []"
+              :key="`image-${image.id}`"
+              :href="image.objectUrl"
+              width="1"
+              height="1"
+              preserveAspectRatio="none"
+              :transform="svgImageTransform(image)"
+            />
             <text
               v-for="text in renderTextObjects"
               :key="`text-${text.id}`"
