@@ -289,7 +289,9 @@ fn lopdf_backend_updates_existing_pdf_text_and_saves() {
     let reopened = DocumentSession::open(&engine, &target, OpenOptions::default()).unwrap();
     let texts = reopened.text_objects(PageIndex(0)).unwrap();
 
-    assert!(texts.iter().any(|object| object.content == "World"));
+    // scatter stores one char per text object; concatenate to verify full content
+    let all_content: String = texts.iter().map(|o| o.content.as_str()).collect();
+    assert_eq!(all_content, "World");
     assert!(!texts.iter().any(|object| object.content == "Hello"));
 }
 
@@ -317,7 +319,9 @@ fn lopdf_backend_decodes_to_unicode_cmap_and_replaces_text() {
     let reopened = DocumentSession::open(&engine, &target, OpenOptions::default()).unwrap();
     let texts = reopened.text_objects(PageIndex(0)).unwrap();
 
-    assert!(texts.iter().any(|object| object.content == "25"));
+    // scatter stores one char per text object; concatenate to verify full content
+    let all_content: String = texts.iter().map(|o| o.content.as_str()).collect();
+    assert_eq!(all_content, "25");
     assert!(!texts.iter().any(|object| object.content == "24.8"));
 }
 
@@ -415,11 +419,10 @@ fn lopdf_backend_commits_text_after_preview() {
         .unwrap();
 
     assert_eq!(committed.content, "World");
-    assert!(document
-        .text_objects(PageIndex(0))
-        .unwrap()
-        .iter()
-        .any(|object| object.content == "World"));
+    // scatter stores one char per text object; concatenate to verify full content
+    let texts = document.text_objects(PageIndex(0)).unwrap();
+    let all_content: String = texts.iter().map(|o| o.content.as_str()).collect();
+    assert_eq!(all_content, "World");
 }
 
 #[test]
@@ -507,7 +510,9 @@ fn lopdf_backend_updates_text_and_saves_bytes_for_wasm() {
 
     let reopened = open_lopdf_document_from_bytes(&updated_bytes).unwrap();
     let texts = reopened.text_objects(PageIndex(0)).unwrap();
-    assert!(texts.iter().any(|object| object.content == "World"));
+    // scatter stores one char per text object; concatenate to verify full content
+    let all_content: String = texts.iter().map(|o| o.content.as_str()).collect();
+    assert_eq!(all_content, "World");
 }
 
 #[test]
@@ -749,15 +754,14 @@ fn lopdf_backend_preserves_hex_unicode_text_when_updating_chinese() {
     let reopened = open_lopdf_document_from_bytes(&updated_bytes).unwrap();
     let texts = reopened.text_objects(PageIndex(0)).unwrap();
     let structured = reopened.page_structure(PageIndex(0)).unwrap().text;
-    let updated = texts
-        .iter()
-        .find(|item| item.content == "你好，世界")
-        .unwrap();
+    // scatter stores one char per text object; font_size is on each individual char
+    let first_char = texts.iter().next().expect("expected scattered text objects");
+    // page_structure uses merged_structured_text which groups adjacent scattered chars
     let updated_structured = structured
         .iter()
         .find(|item| item.content == "你好，世界")
         .unwrap();
-    assert!((updated.font_size - original_font_size).abs() < 0.01);
+    assert!((first_char.font_size - original_font_size).abs() < 0.01);
     assert!(
         (updated_structured.transform[0].hypot(updated_structured.transform[1]) - original_x_scale)
             .abs()

@@ -439,17 +439,32 @@ impl EngineDocument for LopdfDocument {
             .iter()
             .map(|plan| plan.original_content.as_str())
             .collect::<String>();
-        let segments = repartition_group_text(&original_group_text, &replacement, &member_plans)?;
-        let fallback_font_name = if member_plans
+        let segments = repartition_group_text(&original_group_text, &replacement, &member_plans)
+            .unwrap_or_else(|_| proportional_split(&replacement, &member_plans));
+        // Group-level fallback: all chars in the group switch to STSong-Light because the
+        // original font is Identity-H but its glyph coverage may be inadequate.
+        let use_group_fallback = member_plans
             .iter()
             .zip(segments.iter())
-            .any(|(member, segment)| needs_cjk_fallback_font(member, segment))
-        {
+            .any(|(member, segment)| needs_cjk_fallback_font(member, segment));
+        // Per-char fallback: only chars that can't be encoded by the original font switch to
+        // STSong-Light; chars the original font can encode keep their original encoding.
+        let needs_char_fallback = !use_group_fallback
+            && member_plans.iter().zip(segments.iter()).any(|(member, segment)| {
+                segment.chars().any(|ch| {
+                    replacement_text_object(
+                        &member.template,
+                        ch.to_string(),
+                        member.font_map.as_ref(),
+                    )
+                    .is_err()
+                })
+            });
+        let fallback_font_name = if use_group_fallback || needs_char_fallback {
             Some(self.ensure_page_cjk_fallback_font(page_id)?)
         } else {
             None
         };
-        let use_group_fallback = fallback_font_name.is_some();
         let segment_map = member_plans
             .iter()
             .zip(segments)
@@ -486,11 +501,26 @@ impl EngineDocument for LopdfDocument {
 
         let first_member_id = edit_group.member_ids.first().copied();
         let last_member_id = edit_group.member_ids.last().copied();
+
+        // Anchor for the entire group's scatter: always use the first member's text matrix so
+        // that, regardless of which member repartition assigns chars to (e.g. when earlier
+        // members can't encode the replacement), all characters are placed starting at the
+        // original beginning of the group rather than wherever the capable member happens to sit.
+        let anchor_text_matrix = first_member_id
+            .and_then(|id| self.text_refs.get(&id))
+            .and_then(|text_ref| operation_states.get(&text_ref.operation_index))
+            .map(|(tm, _)| *tm)
+            .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+
         // Each member emits up to 2*N+2 operations (Tm+Tj per char, plus optional Tf).
         let estimated_capacity = content.operations.len()
             + member_plans.iter().map(|p| p.original_char_count * 2 + 4).sum::<usize>();
         let mut rebuilt_operations: Vec<Operation> = Vec::with_capacity(estimated_capacity);
         let mut updated_member_ids = HashMap::new();
+
+        // Running x offset (in PDF user-space points) shared across all group members so that
+        // chars placed by later members continue seamlessly after earlier members' chars.
+        let mut global_scatter_pts = 0.0f32;
 
         for (operation_index, operation) in content.operations.into_iter().enumerate() {
             if let Some(member_id) = targeted_operation_indexes.get(&operation_index) {
@@ -500,7 +530,7 @@ impl EngineDocument for LopdfDocument {
                 let replacement_segment = segment_map.get(member_id).cloned().ok_or_else(|| {
                     CoreError::Engine("missing replacement segment for grouped text".to_string())
                 })?;
-                let (text_matrix, text_state) = operation_states
+                let (_text_matrix, text_state) = operation_states
                     .get(&operation_index)
                     .cloned()
                     .unwrap_or_else(|| ([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], TextParseState::default()));
@@ -517,15 +547,55 @@ impl EngineDocument for LopdfDocument {
                 }
 
                 // Scatter: emit one Tm+Tj per character.
+                // All characters use `anchor_text_matrix` (first member's matrix) as the base
+                // so chars are always placed starting from the group's original x position,
+                // with `global_scatter_pts` advancing continuously across members.
                 let chars: Vec<char> = replacement_segment.chars().collect();
-                let mut cursor = 0.0f32;
                 let mut first_tj_index: Option<usize> = None;
+                // Tracks whether we have switched to the fallback font for the current char.
+                // Only used in per-char fallback mode (when !use_group_fallback).
+                let mut char_font_is_fallback = false;
                 for (char_idx, ch) in chars.iter().copied().enumerate() {
-                    // Text matrix for this character: advance the original matrix by
-                    // font_size * cursor in the text coordinate direction.
+                    let char_str = ch.to_string();
+
+                    // Determine encoding before emitting Tm so we can insert Tf first.
+                    let (char_obj, char_needs_fallback) = if use_group_fallback {
+                        (Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal), true)
+                    } else {
+                        match replacement_text_object(
+                            &member_plan.template,
+                            char_str.clone(),
+                            member_plan.font_map.as_ref(),
+                        ) {
+                            Ok(obj) => (obj, false),
+                            Err(_) => (
+                                Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal),
+                                true,
+                            ),
+                        }
+                    };
+
+                    // Per-char font switch: emit Tf when the required font changes.
+                    if !use_group_fallback {
+                        if char_needs_fallback && !char_font_is_fallback {
+                            let fallback = fallback_font_name.as_deref().ok_or_else(|| {
+                                CoreError::Engine("missing fallback font resource".to_string())
+                            })?;
+                            rebuilt_operations.push(font_set_operation(fallback, member_plan.font_size));
+                            char_font_is_fallback = true;
+                        } else if !char_needs_fallback && char_font_is_fallback {
+                            if let Some(font_name) = member_plan.font_name.as_deref() {
+                                rebuilt_operations.push(font_set_operation(font_name, member_plan.font_size));
+                            }
+                            char_font_is_fallback = false;
+                        }
+                    }
+
+                    // Text matrix for this character: offset from the group anchor by the
+                    // accumulated advance across all previously placed chars.
                     let char_tm = multiply_matrix(
-                        text_matrix,
-                        [1.0, 0.0, 0.0, 1.0, member_plan.font_size * cursor, 0.0],
+                        anchor_text_matrix,
+                        [1.0, 0.0, 0.0, 1.0, global_scatter_pts, 0.0],
                     );
                     rebuilt_operations.push(Operation::new(
                         "Tm",
@@ -544,19 +614,9 @@ impl EngineDocument for LopdfDocument {
                         first_tj_index = Some(tj_index);
                     }
 
-                    let char_str = ch.to_string();
-                    let char_obj = if use_group_fallback {
-                        Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal)
-                    } else {
-                        replacement_text_object(
-                            &member_plan.template,
-                            char_str.clone(),
-                            member_plan.font_map.as_ref(),
-                        )?
-                    };
                     rebuilt_operations.push(Operation::new("Tj", vec![char_obj]));
 
-                    // Advance cursor by this glyph's advance width (in glyph-space units).
+                    // Advance the global cursor by this glyph's width in user-space points.
                     let encoded = member_plan.font_map.as_ref().and_then(|m| m.encode(&char_str));
                     let glyph_advance = encoded
                         .as_deref()
@@ -567,11 +627,18 @@ impl EngineDocument for LopdfDocument {
                             estimate_text_width(&char_str, member_plan.font_size)
                                 / member_plan.font_size.max(1.0)
                         });
-                    cursor += glyph_advance;
-                    // Add inter-character spacing (between chars, not after the last).
+                    global_scatter_pts += glyph_advance * member_plan.font_size;
+                    // Add inter-character spacing in points (between chars, not after the last).
                     if char_idx + 1 < chars.len() {
-                        cursor += (text_state.char_spacing / member_plan.font_size.max(1.0))
-                            * (text_state.horizontal_scaling / 100.0);
+                        global_scatter_pts +=
+                            text_state.char_spacing * (text_state.horizontal_scaling / 100.0);
+                    }
+                }
+
+                // If per-char fallback ended in fallback mode, restore the original font.
+                if !use_group_fallback && char_font_is_fallback {
+                    if let Some(font_name) = member_plan.font_name.as_deref() {
+                        rebuilt_operations.push(font_set_operation(font_name, member_plan.font_size));
                     }
                 }
 
@@ -585,7 +652,7 @@ impl EngineDocument for LopdfDocument {
                     ))),
                 );
 
-                // Restore original font after the last member's characters.
+                // Restore original font after the last member's characters (group fallback only).
                 if use_group_fallback && is_last_member {
                     if let Some(original_font_name) = member_plan.font_name.as_deref() {
                         rebuilt_operations.push(font_set_operation(
@@ -848,7 +915,8 @@ impl LopdfDocument {
                 template: Object::String(Vec::new(), StringFormat::Hexadecimal),
             })
             .collect::<Vec<_>>();
-        let segments = repartition_group_text(&original_text, text, &members)?;
+        let segments = repartition_group_text(&original_text, text, &members)
+            .unwrap_or_else(|_| proportional_split(text, &members));
         let mut glyphs = Vec::new();
         for (context, segment) in member_contexts.iter().zip(segments.iter()) {
             let (mut segment_glyphs, _) = layout_glyphs(segment, context);
@@ -2841,6 +2909,7 @@ struct TextParseState {
     char_spacing: f32,
     word_spacing: f32,
     horizontal_scaling: f32,
+    text_leading: f32,
     color: Color,
     stroke_color: Color,
     stroke_width: f32,
@@ -2889,6 +2958,7 @@ impl Default for TextParseState {
             char_spacing: 0.0,
             word_spacing: 0.0,
             horizontal_scaling: 100.0,
+            text_leading: 0.0,
             color: Color::BLACK,
             stroke_color: Color::BLACK,
             stroke_width: 1.0,
@@ -2955,7 +3025,12 @@ fn update_page_state(state: &mut PageParseState, operation: &Operation) {
                 state.text.horizontal_scaling = scaling;
             }
         }
-        "Td" | "TD" => {
+        "TL" => {
+            if let Some(leading) = operation.operands.first().and_then(object_to_f32) {
+                state.text.text_leading = leading;
+            }
+        }
+        "Td" => {
             if let (Some(x), Some(y)) = (
                 operation.operands.first().and_then(object_to_f32),
                 operation.operands.get(1).and_then(object_to_f32),
@@ -2966,6 +3041,53 @@ fn update_page_state(state: &mut PageParseState, operation: &Operation) {
                 state.text.x = state.text_matrix[4];
                 state.text.y = state.text_matrix[5];
             }
+        }
+        "TD" => {
+            // TD tx ty: equivalent to  -ty TL  tx ty Td  (also sets text leading to -ty)
+            if let (Some(x), Some(y)) = (
+                operation.operands.first().and_then(object_to_f32),
+                operation.operands.get(1).and_then(object_to_f32),
+            ) {
+                state.text.text_leading = -y;
+                let translate = [1.0, 0.0, 0.0, 1.0, x, y];
+                state.text_line_matrix = multiply_matrix(state.text_line_matrix, translate);
+                state.text_matrix = state.text_line_matrix;
+                state.text.x = state.text_matrix[4];
+                state.text.y = state.text_matrix[5];
+            }
+        }
+        // T*: move to start of next line, equivalent to  0 -TL Td
+        "T*" => {
+            let leading = state.text.text_leading;
+            let translate = [1.0, 0.0, 0.0, 1.0, 0.0, -leading];
+            state.text_line_matrix = multiply_matrix(state.text_line_matrix, translate);
+            state.text_matrix = state.text_line_matrix;
+            state.text.x = state.text_matrix[4];
+            state.text.y = state.text_matrix[5];
+        }
+        // ' operator: T* then show string (advance handled by advance_page_text_state)
+        "'" => {
+            let leading = state.text.text_leading;
+            let translate = [1.0, 0.0, 0.0, 1.0, 0.0, -leading];
+            state.text_line_matrix = multiply_matrix(state.text_line_matrix, translate);
+            state.text_matrix = state.text_line_matrix;
+            state.text.x = state.text_matrix[4];
+            state.text.y = state.text_matrix[5];
+        }
+        // " operator: set word/char spacing, then T*, then show string
+        "\"" => {
+            if let Some(word_spacing) = operation.operands.first().and_then(object_to_f32) {
+                state.text.word_spacing = word_spacing;
+            }
+            if let Some(char_spacing) = operation.operands.get(1).and_then(object_to_f32) {
+                state.text.char_spacing = char_spacing;
+            }
+            let leading = state.text.text_leading;
+            let translate = [1.0, 0.0, 0.0, 1.0, 0.0, -leading];
+            state.text_line_matrix = multiply_matrix(state.text_line_matrix, translate);
+            state.text_matrix = state.text_line_matrix;
+            state.text.x = state.text_matrix[4];
+            state.text.y = state.text_matrix[5];
         }
         "Tm" => {
             if let Some(matrix) = operation_matrix(operation) {
@@ -3062,7 +3184,12 @@ fn update_text_state(state: &mut TextParseState, operation: &Operation) {
                 state.horizontal_scaling = scaling;
             }
         }
-        "Td" | "TD" => {
+        "TL" => {
+            if let Some(leading) = operation.operands.first().and_then(object_to_f32) {
+                state.text_leading = leading;
+            }
+        }
+        "Td" => {
             if let (Some(x), Some(y)) = (
                 operation.operands.first().and_then(object_to_f32),
                 operation.operands.get(1).and_then(object_to_f32),
@@ -3070,6 +3197,35 @@ fn update_text_state(state: &mut TextParseState, operation: &Operation) {
                 state.x += x;
                 state.y += y;
             }
+        }
+        "TD" => {
+            // TD tx ty: equivalent to -ty TL; tx ty Td
+            if let (Some(x), Some(y)) = (
+                operation.operands.first().and_then(object_to_f32),
+                operation.operands.get(1).and_then(object_to_f32),
+            ) {
+                state.text_leading = -y;
+                state.x += x;
+                state.y += y;
+            }
+        }
+        // T*: move to start of next line, equivalent to 0 -TL Td
+        "T*" => {
+            state.y -= state.text_leading;
+        }
+        // ' operator: T* then show string
+        "'" => {
+            state.y -= state.text_leading;
+        }
+        // " operator: set word/char spacing, then T*, then show string
+        "\"" => {
+            if let Some(word_spacing) = operation.operands.first().and_then(object_to_f32) {
+                state.word_spacing = word_spacing;
+            }
+            if let Some(char_spacing) = operation.operands.get(1).and_then(object_to_f32) {
+                state.char_spacing = char_spacing;
+            }
+            state.y -= state.text_leading;
         }
         "Tm" => {
             if let (Some(x), Some(y)) = (
@@ -3781,6 +3937,30 @@ fn repartition_group_text(
     }
 
     repartition_group_text_by_dp(replacement_text, members)
+}
+
+// Distributes replacement chars across members proportionally to original char counts.
+// Used as a last-resort fallback when the font can't encode the replacement characters;
+// in that case the caller must also enable the CJK fallback font.
+fn proportional_split(replacement_text: &str, members: &[GroupMemberPlan]) -> Vec<String> {
+    let chars: Vec<char> = replacement_text.chars().collect();
+    let total_replacement = chars.len();
+    let total_original: usize = members.iter().map(|m| m.original_char_count.max(1)).sum();
+    let mut result = Vec::with_capacity(members.len());
+    let mut placed = 0usize;
+    for (i, member) in members.iter().enumerate() {
+        let is_last = i + 1 == members.len();
+        let count = if is_last {
+            total_replacement - placed
+        } else {
+            let weight = member.original_char_count.max(1);
+            (weight * total_replacement + total_original / 2) / total_original
+        };
+        let end = (placed + count).min(total_replacement);
+        result.push(chars[placed..end].iter().collect());
+        placed = end;
+    }
+    result
 }
 
 fn can_write_replacement_with_template(
@@ -5537,9 +5717,10 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
 }
 
 fn uses_direct_utf16_encoding(name: &str) -> bool {
-    name == "Identity-H"
-        || name == "Identity-V"
-        || (name.starts_with("Uni") && name.contains("UCS2"))
+    // Identity-H/V fonts use glyph IDs as CIDs, not Unicode code points,
+    // so direct UTF-16 encoding would produce wrong glyph indices.
+    // Only CMaps that truly map CID = Unicode are valid here (e.g. UniGB-UCS2-H).
+    (name.starts_with("Uni") && name.contains("UCS2"))
         || name.contains("UTF16")
 }
 
