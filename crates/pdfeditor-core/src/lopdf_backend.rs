@@ -196,6 +196,7 @@ struct GroupMemberPlan {
     font_name: Option<String>,
     font_size: f32,
     font_map: Option<ToUnicodeMap>,
+    metrics: Option<FontMetrics>,
     template: Object,
 }
 
@@ -375,6 +376,7 @@ impl EngineDocument for LopdfDocument {
         let edit_group = self.text_edit_group(id)?;
         let page_id = self.page_id(edit_group.page)?;
         let font_maps = self.page_font_maps(page_id);
+        let font_metrics = self.page_font_metrics(page_id);
         let content_bytes = self.document.get_page_content(page_id).map_err(|err| {
             CoreError::Engine(format!("failed to read page content stream: {err}"))
         })?;
@@ -412,6 +414,11 @@ impl EngineDocument for LopdfDocument {
                     .as_ref()
                     .and_then(|name| font_maps.get(name))
                     .cloned();
+                let metrics = text_ref
+                    .font_name
+                    .as_ref()
+                    .and_then(|name| font_metrics.get(name))
+                    .cloned();
                 Ok(GroupMemberPlan {
                     id: *member_id,
                     original_content: object.content.clone(),
@@ -419,6 +426,7 @@ impl EngineDocument for LopdfDocument {
                     font_name: text_ref.font_name.clone(),
                     font_size: object.font_size,
                     font_map,
+                    metrics,
                     template: operation
                         .operands
                         .first()
@@ -441,6 +449,7 @@ impl EngineDocument for LopdfDocument {
         } else {
             None
         };
+        let use_group_fallback = fallback_font_name.is_some();
         let segment_map = member_plans
             .iter()
             .zip(segments)
@@ -459,7 +468,28 @@ impl EngineDocument for LopdfDocument {
                     .map(|text_ref| (text_ref.operation_index, *member_id))
             })
             .collect::<BTreeMap<_, _>>();
-        let mut rebuilt_operations = Vec::with_capacity(content.operations.len() + targeted_operation_indexes.len() * 2);
+
+        // Pre-pass: collect text_matrix and text state at each targeted operation.
+        // State is recorded BEFORE the operation executes so we capture the matrix
+        // that was active when the original Tj/TJ was rendered.
+        let mut pre_pass_state = PageParseState::default();
+        let mut operation_states: HashMap<usize, ([f32; 6], TextParseState)> = HashMap::new();
+        for (op_index, operation) in content.operations.iter().enumerate() {
+            if targeted_operation_indexes.contains_key(&op_index) {
+                operation_states.insert(op_index, (pre_pass_state.text_matrix, pre_pass_state.text.clone()));
+            }
+            update_page_state(&mut pre_pass_state, operation);
+            let metrics_for_advance = pre_pass_state.text.font_name.as_ref()
+                .and_then(|name| font_metrics.get(name));
+            advance_page_text_state(&mut pre_pass_state, operation, metrics_for_advance);
+        }
+
+        let first_member_id = edit_group.member_ids.first().copied();
+        let last_member_id = edit_group.member_ids.last().copied();
+        // Each member emits up to 2*N+2 operations (Tm+Tj per char, plus optional Tf).
+        let estimated_capacity = content.operations.len()
+            + member_plans.iter().map(|p| p.original_char_count * 2 + 4).sum::<usize>();
+        let mut rebuilt_operations: Vec<Operation> = Vec::with_capacity(estimated_capacity);
         let mut updated_member_ids = HashMap::new();
 
         for (operation_index, operation) in content.operations.into_iter().enumerate() {
@@ -470,43 +500,93 @@ impl EngineDocument for LopdfDocument {
                 let replacement_segment = segment_map.get(member_id).cloned().ok_or_else(|| {
                     CoreError::Engine("missing replacement segment for grouped text".to_string())
                 })?;
-                let use_fallback = fallback_font_name
-                    .as_deref()
-                    .is_some_and(|_| needs_cjk_fallback_font(member_plan, &replacement_segment));
+                let (text_matrix, text_state) = operation_states
+                    .get(&operation_index)
+                    .cloned()
+                    .unwrap_or_else(|| ([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], TextParseState::default()));
 
-                if use_fallback {
-                    let fallback_font_name = fallback_font_name.as_deref().ok_or_else(|| {
+                let is_first_member = Some(*member_id) == first_member_id;
+                let is_last_member = Some(*member_id) == last_member_id;
+
+                // Emit Tf for fallback font before the first member's characters.
+                if use_group_fallback && is_first_member {
+                    let fallback = fallback_font_name.as_deref().ok_or_else(|| {
                         CoreError::Engine("missing fallback font resource".to_string())
                     })?;
-                    rebuilt_operations.push(font_set_operation(
-                        fallback_font_name,
-                        member_plan.font_size,
-                    ));
+                    rebuilt_operations.push(font_set_operation(fallback, member_plan.font_size));
                 }
 
+                // Scatter: emit one Tm+Tj per character.
+                let chars: Vec<char> = replacement_segment.chars().collect();
+                let mut cursor = 0.0f32;
+                let mut first_tj_index: Option<usize> = None;
+                for (char_idx, ch) in chars.iter().copied().enumerate() {
+                    // Text matrix for this character: advance the original matrix by
+                    // font_size * cursor in the text coordinate direction.
+                    let char_tm = multiply_matrix(
+                        text_matrix,
+                        [1.0, 0.0, 0.0, 1.0, member_plan.font_size * cursor, 0.0],
+                    );
+                    rebuilt_operations.push(Operation::new(
+                        "Tm",
+                        vec![
+                            Object::Real(char_tm[0]),
+                            Object::Real(char_tm[1]),
+                            Object::Real(char_tm[2]),
+                            Object::Real(char_tm[3]),
+                            Object::Real(char_tm[4]),
+                            Object::Real(char_tm[5]),
+                        ],
+                    ));
+
+                    let tj_index = rebuilt_operations.len();
+                    if first_tj_index.is_none() {
+                        first_tj_index = Some(tj_index);
+                    }
+
+                    let char_str = ch.to_string();
+                    let char_obj = if use_group_fallback {
+                        Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal)
+                    } else {
+                        replacement_text_object(
+                            &member_plan.template,
+                            char_str.clone(),
+                            member_plan.font_map.as_ref(),
+                        )?
+                    };
+                    rebuilt_operations.push(Operation::new("Tj", vec![char_obj]));
+
+                    // Advance cursor by this glyph's advance width (in glyph-space units).
+                    let encoded = member_plan.font_map.as_ref().and_then(|m| m.encode(&char_str));
+                    let glyph_advance = encoded
+                        .as_deref()
+                        .and_then(|bytes| {
+                            member_plan.metrics.as_ref().map(|m| m.text_advance(bytes, &text_state))
+                        })
+                        .unwrap_or_else(|| {
+                            estimate_text_width(&char_str, member_plan.font_size)
+                                / member_plan.font_size.max(1.0)
+                        });
+                    cursor += glyph_advance;
+                    // Add inter-character spacing (between chars, not after the last).
+                    if char_idx + 1 < chars.len() {
+                        cursor += (text_state.char_spacing / member_plan.font_size.max(1.0))
+                            * (text_state.horizontal_scaling / 100.0);
+                    }
+                }
+
+                // Record the new ID pointing to the first Tj for this member.
+                let id_index = first_tj_index.unwrap_or(rebuilt_operations.len());
                 updated_member_ids.insert(
                     *member_id,
                     TextObjectId(PdfObjectId(encode_text_object_id(
                         edit_group.page.0,
-                        rebuilt_operations.len() as u32,
+                        id_index as u32,
                     ))),
                 );
-                let mut updated_operation = operation;
-                if use_fallback {
-                    replace_operation_text_with_direct_utf16(
-                        &mut updated_operation,
-                        replacement_segment,
-                    )?;
-                } else {
-                    replace_operation_text(
-                        &mut updated_operation,
-                        replacement_segment,
-                        member_plan.font_map.as_ref(),
-                    )?;
-                }
-                rebuilt_operations.push(updated_operation);
 
-                if use_fallback {
+                // Restore original font after the last member's characters.
+                if use_group_fallback && is_last_member {
                     if let Some(original_font_name) = member_plan.font_name.as_deref() {
                         rebuilt_operations.push(font_set_operation(
                             original_font_name,
@@ -764,6 +844,7 @@ impl LopdfDocument {
                 font_name: context.object.font_name.clone(),
                 font_size: context.object.font_size,
                 font_map: context.font_map.clone(),
+                metrics: context.metrics.clone(),
                 template: Object::String(Vec::new(), StringFormat::Hexadecimal),
             })
             .collect::<Vec<_>>();
@@ -3498,65 +3579,6 @@ fn object_text_advance(
     metrics.map(|metrics| metrics.text_advance(bytes, state))
 }
 
-fn replace_operation_text(
-    operation: &mut Operation,
-    replacement: String,
-    font_map: Option<&ToUnicodeMap>,
-) -> CoreResult<()> {
-    match operation.operator.as_str() {
-        "Tj" | "'" | "\"" => {
-            let operand = operation.operands.last_mut().ok_or_else(|| {
-                CoreError::InvalidPdf("text operation has no operand".to_string())
-            })?;
-            *operand = replacement_text_object(operand, replacement, font_map)?;
-            Ok(())
-        }
-        "TJ" => {
-            let operand = operation
-                .operands
-                .first_mut()
-                .ok_or_else(|| CoreError::InvalidPdf("TJ operation has no operand".to_string()))?;
-            *operand = Object::Array(vec![replacement_text_object(
-                operand,
-                replacement,
-                font_map,
-            )?]);
-            Ok(())
-        }
-        operator => Err(CoreError::Unsupported(format!(
-            "unsupported text operation {operator}"
-        ))),
-    }
-}
-
-fn replace_operation_text_with_direct_utf16(
-    operation: &mut Operation,
-    replacement: String,
-) -> CoreResult<()> {
-    match operation.operator.as_str() {
-        "Tj" | "'" | "\"" => {
-            let operand = operation.operands.last_mut().ok_or_else(|| {
-                CoreError::InvalidPdf("text operation has no operand".to_string())
-            })?;
-            *operand = Object::String(utf16be_bytes(&replacement), StringFormat::Hexadecimal);
-            Ok(())
-        }
-        "TJ" => {
-            let operand = operation
-                .operands
-                .first_mut()
-                .ok_or_else(|| CoreError::InvalidPdf("TJ operation has no operand".to_string()))?;
-            *operand = Object::Array(vec![Object::String(
-                utf16be_bytes(&replacement),
-                StringFormat::Hexadecimal,
-            )]);
-            Ok(())
-        }
-        operator => Err(CoreError::Unsupported(format!(
-            "unsupported text operation {operator}"
-        ))),
-    }
-}
 
 fn font_set_operation(font_name: &str, font_size: f32) -> Operation {
     Operation::new(

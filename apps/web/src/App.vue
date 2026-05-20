@@ -123,9 +123,6 @@ const canSaveEdit = computed(() => {
   if (!selectedTextObject.value || !editSession.value || isSavingEdit.value || isPreparingEdit.value) {
     return false;
   }
-  if (layoutPreview.value?.overflow) {
-    return false;
-  }
   return draftText.value !== editSession.value.original_text;
 });
 
@@ -133,7 +130,7 @@ const previewStatus = computed(() => {
   if (!selectedTextObject.value) return "点击页面高亮框或左侧列表，开始编辑文本对象。";
   if (isPreparingEdit.value) return "正在准备文本编辑会话...";
   if (!layoutPreview.value) return "修改文本后会实时生成布局预览。";
-  if (layoutPreview.value.overflow) return "当前文本超出原始文本边界，暂不能保存。";
+  if (layoutPreview.value.overflow) return "当前文本超出原始文本边界，可以保存。";
   if (draftText.value === editSession.value?.original_text) return "当前内容与原始文本一致。";
   return "预览通过，可以保存到当前 PDF。";
 });
