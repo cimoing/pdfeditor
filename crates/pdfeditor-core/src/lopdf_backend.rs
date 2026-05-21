@@ -441,16 +441,15 @@ impl EngineDocument for LopdfDocument {
             .collect::<String>();
         let segments = repartition_group_text(&original_group_text, &replacement, &member_plans)
             .unwrap_or_else(|_| proportional_split(&replacement, &member_plans));
-        // Group-level fallback: all chars in the group switch to STSong-Light because the
-        // original font is Identity-H but its glyph coverage may be inadequate.
+        // Once a text edit group needs CJK fallback, keep the whole edited line on the
+        // fallback font. Mixing fallback and the original font in one line makes PDF viewers
+        // use different glyph metrics than the SVG preview.
         let use_group_fallback = member_plans
             .iter()
             .zip(segments.iter())
             .any(|(member, segment)| needs_cjk_fallback_font(member, segment));
-        // Per-char fallback: only chars that can't be encoded by the original font switch to
-        // STSong-Light; chars the original font can encode keep their original encoding.
-        let needs_char_fallback = !use_group_fallback
-            && member_plans.iter().zip(segments.iter()).any(|(member, segment)| {
+        let needs_char_fallback =
+            !use_group_fallback && member_plans.iter().zip(segments.iter()).any(|(member, segment)| {
                 segment.chars().any(|ch| {
                     replacement_text_object(
                         &member.template,
@@ -500,7 +499,6 @@ impl EngineDocument for LopdfDocument {
         }
 
         let first_member_id = edit_group.member_ids.first().copied();
-        let last_member_id = edit_group.member_ids.last().copied();
 
         // Anchor for the entire group's scatter: always use the first member's text matrix so
         // that, regardless of which member repartition assigns chars to (e.g. when earlier
@@ -535,15 +533,57 @@ impl EngineDocument for LopdfDocument {
                     .cloned()
                     .unwrap_or_else(|| ([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], TextParseState::default()));
 
-                let is_first_member = Some(*member_id) == first_member_id;
-                let is_last_member = Some(*member_id) == last_member_id;
-
-                // Emit Tf for fallback font before the first member's characters.
-                if use_group_fallback && is_first_member {
-                    let fallback = fallback_font_name.as_deref().ok_or_else(|| {
-                        CoreError::Engine("missing fallback font resource".to_string())
-                    })?;
-                    rebuilt_operations.push(font_set_operation(fallback, member_plan.font_size));
+                if use_group_fallback {
+                    if Some(*member_id) == first_member_id {
+                        let fallback = fallback_font_name.as_deref().ok_or_else(|| {
+                            CoreError::Engine("missing fallback font resource".to_string())
+                        })?;
+                        rebuilt_operations.push(font_set_operation(fallback, member_plan.font_size));
+                        rebuilt_operations.push(Operation::new("Tc", vec![Object::Integer(0)]));
+                        rebuilt_operations.push(Operation::new("Tw", vec![Object::Integer(0)]));
+                        rebuilt_operations.push(Operation::new(
+                            "Tm",
+                            vec![
+                                Object::Real(anchor_text_matrix[0]),
+                                Object::Real(anchor_text_matrix[1]),
+                                Object::Real(anchor_text_matrix[2]),
+                                Object::Real(anchor_text_matrix[3]),
+                                Object::Real(anchor_text_matrix[4]),
+                                Object::Real(anchor_text_matrix[5]),
+                            ],
+                        ));
+                        let tj_index = rebuilt_operations.len();
+                        rebuilt_operations.push(Operation::new(
+                            "Tj",
+                            vec![Object::String(
+                                utf16be_bytes(&replacement),
+                                StringFormat::Hexadecimal,
+                            )],
+                        ));
+                        if text_state.char_spacing != 0.0 {
+                            rebuilt_operations.push(Operation::new(
+                                "Tc",
+                                vec![Object::Real(text_state.char_spacing)],
+                            ));
+                        }
+                        if text_state.word_spacing != 0.0 {
+                            rebuilt_operations.push(Operation::new(
+                                "Tw",
+                                vec![Object::Real(text_state.word_spacing)],
+                            ));
+                        }
+                        if let Some(font_name) = member_plan.font_name.as_deref() {
+                            rebuilt_operations.push(font_set_operation(font_name, member_plan.font_size));
+                        }
+                        let updated_id = TextObjectId(PdfObjectId(encode_text_object_id(
+                            edit_group.page.0,
+                            tj_index as u32,
+                        )));
+                        for group_member_id in &edit_group.member_ids {
+                            updated_member_ids.insert(*group_member_id, updated_id);
+                        }
+                    }
+                    continue;
                 }
 
                 // Scatter: emit one Tm+Tj per character.
@@ -553,14 +593,16 @@ impl EngineDocument for LopdfDocument {
                 let chars: Vec<char> = replacement_segment.chars().collect();
                 let mut first_tj_index: Option<usize> = None;
                 // Tracks whether we have switched to the fallback font for the current char.
-                // Only used in per-char fallback mode (when !use_group_fallback).
                 let mut char_font_is_fallback = false;
                 for (char_idx, ch) in chars.iter().copied().enumerate() {
                     let char_str = ch.to_string();
 
                     // Determine encoding before emitting Tm so we can insert Tf first.
                     let (char_obj, char_needs_fallback) = if use_group_fallback {
-                        (Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal), true)
+                        (
+                            Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal),
+                            true,
+                        )
                     } else {
                         match replacement_text_object(
                             &member_plan.template,
@@ -576,19 +618,17 @@ impl EngineDocument for LopdfDocument {
                     };
 
                     // Per-char font switch: emit Tf when the required font changes.
-                    if !use_group_fallback {
-                        if char_needs_fallback && !char_font_is_fallback {
-                            let fallback = fallback_font_name.as_deref().ok_or_else(|| {
-                                CoreError::Engine("missing fallback font resource".to_string())
-                            })?;
-                            rebuilt_operations.push(font_set_operation(fallback, member_plan.font_size));
-                            char_font_is_fallback = true;
-                        } else if !char_needs_fallback && char_font_is_fallback {
-                            if let Some(font_name) = member_plan.font_name.as_deref() {
-                                rebuilt_operations.push(font_set_operation(font_name, member_plan.font_size));
-                            }
-                            char_font_is_fallback = false;
+                    if char_needs_fallback && !char_font_is_fallback {
+                        let fallback = fallback_font_name.as_deref().ok_or_else(|| {
+                            CoreError::Engine("missing fallback font resource".to_string())
+                        })?;
+                        rebuilt_operations.push(font_set_operation(fallback, member_plan.font_size));
+                        char_font_is_fallback = true;
+                    } else if !char_needs_fallback && char_font_is_fallback {
+                        if let Some(font_name) = member_plan.font_name.as_deref() {
+                            rebuilt_operations.push(font_set_operation(font_name, member_plan.font_size));
                         }
+                        char_font_is_fallback = false;
                     }
 
                     // Text matrix for this character: offset from the group anchor by the
@@ -617,16 +657,20 @@ impl EngineDocument for LopdfDocument {
                     rebuilt_operations.push(Operation::new("Tj", vec![char_obj]));
 
                     // Advance the global cursor by this glyph's width in user-space points.
-                    let encoded = member_plan.font_map.as_ref().and_then(|m| m.encode(&char_str));
-                    let glyph_advance = encoded
-                        .as_deref()
-                        .and_then(|bytes| {
-                            member_plan.metrics.as_ref().map(|m| m.text_advance(bytes, &text_state))
-                        })
-                        .unwrap_or_else(|| {
-                            estimate_text_width(&char_str, member_plan.font_size)
-                                / member_plan.font_size.max(1.0)
-                        });
+                    let glyph_advance = if char_needs_fallback {
+                        fallback_char_advance(ch) * (text_state.horizontal_scaling / 100.0)
+                    } else {
+                        let encoded = member_plan.font_map.as_ref().and_then(|m| m.encode(&char_str));
+                        encoded
+                            .as_deref()
+                            .and_then(|bytes| {
+                                member_plan.metrics.as_ref().map(|m| m.text_advance(bytes, &text_state))
+                            })
+                            .unwrap_or_else(|| {
+                                estimate_text_width(&char_str, member_plan.font_size)
+                                    / member_plan.font_size.max(1.0)
+                            })
+                    };
                     global_scatter_pts += glyph_advance * member_plan.font_size;
                     // Add inter-character spacing in points (between chars, not after the last).
                     if char_idx + 1 < chars.len() {
@@ -636,7 +680,7 @@ impl EngineDocument for LopdfDocument {
                 }
 
                 // If per-char fallback ended in fallback mode, restore the original font.
-                if !use_group_fallback && char_font_is_fallback {
+                if char_font_is_fallback {
                     if let Some(font_name) = member_plan.font_name.as_deref() {
                         rebuilt_operations.push(font_set_operation(font_name, member_plan.font_size));
                     }
@@ -651,16 +695,6 @@ impl EngineDocument for LopdfDocument {
                         id_index as u32,
                     ))),
                 );
-
-                // Restore original font after the last member's characters (group fallback only).
-                if use_group_fallback && is_last_member {
-                    if let Some(original_font_name) = member_plan.font_name.as_deref() {
-                        rebuilt_operations.push(font_set_operation(
-                            original_font_name,
-                            member_plan.font_size,
-                        ));
-                    }
-                }
             } else {
                 rebuilt_operations.push(operation);
             }
@@ -716,14 +750,12 @@ impl LopdfDocument {
 
     fn ensure_page_cjk_fallback_font(&mut self, page_id: ObjectId) -> CoreResult<String> {
         const FALLBACK_FONT_NAME: &str = "PdfEditorFallbackCjk";
-        if self.page_has_font_resource(page_id, FALLBACK_FONT_NAME)? {
-            return Ok(FALLBACK_FONT_NAME.to_string());
-        }
-
         let cid_font_id = self.document.add_object(dictionary! {
             "Type" => "Font",
             "Subtype" => "CIDFontType0",
             "BaseFont" => "STSong-Light",
+            "DW" => 1000,
+            "W" => fallback_cjk_widths(),
             "CIDSystemInfo" => dictionary! {
                 "Registry" => Object::string_literal("Adobe"),
                 "Ordering" => Object::string_literal("GB1"),
@@ -764,28 +796,6 @@ impl LopdfDocument {
         page_dict.set("Resources", Object::Dictionary(resources));
 
         Ok(FALLBACK_FONT_NAME.to_string())
-    }
-
-    fn page_has_font_resource(&self, page_id: ObjectId, font_name: &str) -> CoreResult<bool> {
-        let page = self
-            .document
-            .get_dictionary(page_id)
-            .map_err(|err| CoreError::Engine(format!("failed to access page dictionary: {err}")))?;
-        let Some(resources) = page
-            .get(b"Resources")
-            .ok()
-            .and_then(|object| cloned_dictionary_from_object(&self.document, object))
-        else {
-            return Ok(false);
-        };
-        let Some(fonts) = resources
-            .get(b"Font")
-            .ok()
-            .and_then(|object| cloned_dictionary_from_object(&self.document, object))
-        else {
-            return Ok(false);
-        };
-        Ok(fonts.has(font_name.as_bytes()))
     }
 
     pub fn page_load_bundle(
@@ -3514,7 +3524,8 @@ fn can_join_text_edit_group(
         return false;
     }
     let gap = text_group_gap(previous, next);
-    if gap < -1.0 {
+    let max_overlap = previous.font_size.max(next.font_size) * 0.35 + 1.0;
+    if gap < -max_overlap {
         return false;
     }
     let max_gap = previous.font_size.max(next.font_size) * 2.0;
@@ -3923,6 +3934,70 @@ fn estimate_text_width(content: &str, font_size: f32) -> f32 {
     content.chars().count() as f32 * font_size.max(1.0) * 0.6
 }
 
+fn estimated_unicode_width_units(code: u32) -> f32 {
+    char::from_u32(code)
+        .map(fallback_char_width_units)
+        .unwrap_or(1000.0)
+}
+
+fn fallback_char_advance(ch: char) -> f32 {
+    fallback_char_width_units(ch) / 1000.0
+}
+
+fn fallback_char_width_units(ch: char) -> f32 {
+    if ch.is_ascii() {
+        fallback_ascii_width_units(ch)
+    } else if is_cjk_or_fullwidth(ch) {
+        1000.0
+    } else {
+        600.0
+    }
+}
+
+fn fallback_ascii_width_units(ch: char) -> f32 {
+    match ch {
+        ' ' => 250.0,
+        '!' | '"' | '\'' | ',' | '.' | ':' | ';' | '|' => 280.0,
+        '(' | ')' | '[' | ']' | '{' | '}' | '/' | '\\' | '-' => 330.0,
+        'i' | 'j' | 'l' | 'I' => 280.0,
+        'f' | 'r' | 't' => 330.0,
+        'm' | 'w' | 'M' | 'W' => 780.0,
+        '0'..='9' => 560.0,
+        'A'..='Z' => 670.0,
+        'a'..='z' => 560.0,
+        _ => 600.0,
+    }
+}
+
+fn fallback_cjk_widths() -> Object {
+    Object::Array(vec![
+        Object::Integer(0),
+        Object::Array(
+            (0u32..=127)
+                .map(|code| {
+                    char::from_u32(code)
+                        .map(|ch| Object::Integer(fallback_ascii_width_units(ch).round() as i64))
+                        .unwrap_or(Object::Integer(600))
+                })
+                .collect(),
+        ),
+    ])
+}
+
+fn is_cjk_or_fullwidth(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1100..=0x11FF
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE1F
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFFEF
+            | 0x20000..=0x3FFFD
+    )
+}
+
 fn repartition_group_text(
     original_text: &str,
     replacement_text: &str,
@@ -4192,6 +4267,7 @@ struct FontMetrics {
     default_width: f32,
     code_len: usize,
     width_scale: f32,
+    estimate_missing_widths_from_unicode: bool,
 }
 
 impl FontMetrics {
@@ -4199,7 +4275,7 @@ impl FontMetrics {
         let codes = self.codes(bytes);
         let glyph_units = codes
             .iter()
-            .map(|code| self.widths.get(code).copied().unwrap_or(self.default_width))
+            .map(|code| self.width_for_code(*code))
             .sum::<f32>()
             * self.width_scale;
         let char_gaps = codes.len().saturating_sub(1) as f32;
@@ -4208,6 +4284,17 @@ impl FontMetrics {
         let spacing_units =
             (char_gaps * state.char_spacing + word_gaps * state.word_spacing) / font_size;
         (glyph_units + spacing_units) * (state.horizontal_scaling / 100.0)
+    }
+
+    fn width_for_code(&self, code: u32) -> f32 {
+        self.widths
+            .get(&code)
+            .copied()
+            .or_else(|| {
+                self.estimate_missing_widths_from_unicode
+                    .then(|| estimated_unicode_width_units(code))
+            })
+            .unwrap_or(self.default_width)
     }
 
     fn codes(&self, bytes: &[u8]) -> Vec<u32> {
@@ -4235,22 +4322,32 @@ fn parse_font_metrics(
     if font.get(b"DescendantFonts").is_ok() {
         parse_cid_font_metrics(document, font, to_unicode)
     } else {
-        parse_simple_font_metrics(font)
+        parse_simple_font_metrics(document, font)
     }
 }
 
-fn parse_simple_font_metrics(font: &Dictionary) -> Option<FontMetrics> {
+fn parse_simple_font_metrics(document: &Document, font: &Dictionary) -> Option<FontMetrics> {
     let first_char = font
         .get(b"FirstChar")
         .ok()
         .and_then(object_to_i64)
         .unwrap_or(0)
         .max(0) as u32;
-    let widths_array = font.get(b"Widths").ok()?.as_array().ok()?;
     let mut widths = HashMap::new();
-    for (offset, width) in widths_array.iter().enumerate() {
-        if let Some(width) = object_to_f32(width) {
-            widths.insert(first_char + offset as u32, width);
+    if let Some(widths_array) = font
+        .get(b"Widths")
+        .ok()
+        .and_then(|object| array_from_object(document, object))
+    {
+        for (offset, width) in widths_array.iter().enumerate() {
+            if let Some(width) = object_to_f32(width) {
+                widths.insert(first_char + offset as u32, width);
+            }
+        }
+    }
+    if let Some(base_font) = font.get(b"BaseFont").ok().and_then(object_plain_text) {
+        if should_use_standard_latin_widths(&base_font, &widths) {
+            widths.extend(standard_latin_widths(&base_font));
         }
     }
     (!widths.is_empty()).then_some(FontMetrics {
@@ -4258,7 +4355,106 @@ fn parse_simple_font_metrics(font: &Dictionary) -> Option<FontMetrics> {
         default_width: 0.0,
         code_len: 1,
         width_scale: simple_font_width_scale(font),
+        estimate_missing_widths_from_unicode: false,
     })
+}
+
+fn should_use_standard_latin_widths(base_font: &str, widths: &HashMap<u32, f32>) -> bool {
+    if !is_standard_proportional_latin_font(base_font) {
+        return false;
+    }
+    if widths.is_empty() {
+        return true;
+    }
+    let mut printable_widths = (32u32..=126).filter_map(|code| widths.get(&code).copied());
+    let Some(first) = printable_widths.next() else {
+        return true;
+    };
+    printable_widths.all(|width| (width - first).abs() < 0.01)
+}
+
+fn is_standard_proportional_latin_font(base_font: &str) -> bool {
+    let normalized = normalize_base_font_name(base_font);
+    matches!(
+        normalized.as_str(),
+        "Helvetica"
+            | "Helvetica-Bold"
+            | "Helvetica-Oblique"
+            | "Helvetica-BoldOblique"
+            | "Arial"
+            | "Arial,Bold"
+            | "Arial,Italic"
+            | "Arial,BoldItalic"
+            | "Times-Roman"
+            | "Times-Bold"
+            | "Times-Italic"
+            | "Times-BoldItalic"
+    )
+}
+
+fn normalize_base_font_name(base_font: &str) -> String {
+    base_font
+        .rsplit_once('+')
+        .map(|(_, name)| name)
+        .unwrap_or(base_font)
+        .trim_start_matches('/')
+        .to_string()
+}
+
+fn standard_latin_widths(base_font: &str) -> HashMap<u32, f32> {
+    let normalized = normalize_base_font_name(base_font);
+    (0u32..=127)
+        .map(|code| {
+            let ch = char::from_u32(code).unwrap_or(' ');
+            (code, standard_latin_width_units(&normalized, ch))
+        })
+        .collect()
+}
+
+fn standard_latin_width_units(base_font: &str, ch: char) -> f32 {
+    if base_font.starts_with("Times") {
+        times_latin_width_units(ch)
+    } else {
+        helvetica_latin_width_units(ch)
+    }
+}
+
+fn helvetica_latin_width_units(ch: char) -> f32 {
+    match ch {
+        ' ' => 278.0,
+        '!' | '\'' | ',' | '.' | ':' | ';' | 'I' | 'i' | 'j' | 'l' | '|' => 278.0,
+        '"' | '(' | ')' | '-' | '/' | '[' | ']' | 'f' | 'r' | 't' | '{' | '}' => 333.0,
+        'J' | 'c' | 's' | 'z' => 500.0,
+        '0'..='9' | 'a' | 'b' | 'd' | 'e' | 'g' | 'h' | 'n' | 'o' | 'p' | 'q' | 'u' | 'v' | 'x' | 'y' => 556.0,
+        'k' => 500.0,
+        'A' | 'B' | 'E' | 'K' | 'P' | 'S' | 'V' | 'X' | 'Y' | 'Z' => 667.0,
+        'C' | 'D' | 'H' | 'N' | 'O' | 'R' | 'U' => 722.0,
+        'F' | 'L' | 'T' => 611.0,
+        'G' | 'M' | 'Q' => 778.0,
+        'm' => 833.0,
+        'W' => 944.0,
+        'w' => 722.0,
+        _ => fallback_ascii_width_units(ch),
+    }
+}
+
+fn times_latin_width_units(ch: char) -> f32 {
+    match ch {
+        ' ' => 250.0,
+        '!' | '\'' | ',' | '.' | ':' | ';' | 'I' | 'i' | 'j' | 'l' => 278.0,
+        '"' | '(' | ')' | '/' | '[' | ']' | 'f' | 'r' | 't' | '{' | '}' => 333.0,
+        '-' => 333.0,
+        '0'..='9' => 500.0,
+        'a' | 'c' | 'e' | 's' | 'v' | 'x' | 'z' => 444.0,
+        'b' | 'd' | 'g' | 'h' | 'k' | 'n' | 'o' | 'p' | 'q' | 'u' | 'y' => 500.0,
+        'm' => 778.0,
+        'w' => 722.0,
+        'A' | 'B' | 'E' | 'K' | 'P' | 'S' | 'V' | 'X' | 'Y' | 'Z' => 667.0,
+        'C' | 'D' | 'H' | 'N' | 'O' | 'R' | 'U' => 722.0,
+        'F' | 'L' | 'T' => 611.0,
+        'G' | 'M' | 'Q' | 'W' => 889.0,
+        _ => fallback_ascii_width_units(ch),
+    }
 }
 
 fn parse_cid_font_metrics(
@@ -4299,6 +4495,7 @@ fn parse_cid_font_metrics(
             })
             .unwrap_or(2),
         width_scale: 0.001,
+        estimate_missing_widths_from_unicode: to_unicode.is_some_and(ToUnicodeMap::supports_direct_utf16),
     })
 }
 

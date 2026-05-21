@@ -138,7 +138,7 @@ impl<D: EngineDocument> DocumentSession<D> {
             color: before.color,
         });
 
-        ensure_text_fits_bounds(&content, &effective_style, before.bounds)?;
+        ensure_text_preserves_layout(&before.content, &content, &effective_style, before.bounds)?;
 
         let before_snapshot = ObjectSnapshot::Text {
             id: before.id,
@@ -366,16 +366,6 @@ fn temp_save_path(target: &Path) -> PathBuf {
         .unwrap_or_default();
     extension.push(".tmp");
     target.with_extension(extension)
-}
-
-fn ensure_text_fits_bounds(content: &str, style: &TextStyle, bounds: Rect) -> CoreResult<()> {
-    let run = TextRun::new(
-        content.to_string(),
-        style.font_name.clone(),
-        style.font_size,
-        style.color,
-    );
-    ensure_text_runs_fit_bounds(&[run], bounds)
 }
 
 fn ensure_text_preserves_layout(

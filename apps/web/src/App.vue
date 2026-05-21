@@ -162,6 +162,7 @@ async function loadPage(options?: { preserveSelectionId?: number | null }) {
     editSession.value = null;
     layoutPreview.value = null;
   }
+  return loaded;
 }
 
 function onLoadPageClick() {
@@ -245,15 +246,23 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
   isSavingEdit.value = true;
   status.value = `正在保存文本对象 ${selectedTextId.value}...`;
   const objectId = selectedTextId.value;
+  const savedText = draftText.value;
+  const savedBounds = layoutPreview.value?.bbox ?? editSession.value?.bbox ?? selectedTextObject.value?.bounds ?? null;
 
   try {
-    const updatedBytes = await commitTextEdit(pdfBytes.value, objectId, draftText.value, pdfHandle.value);
+    const updatedBytes = await commitTextEdit(pdfBytes.value, objectId, savedText, pdfHandle.value);
     pdfBytes.value = new Uint8Array(updatedBytes);
-    await loadPage(options.closeAfterSave ? undefined : { preserveSelectionId: objectId });
     if (options.closeAfterSave) {
+      await loadPage();
       clearEditingState();
     } else {
-      await beginTextEdit(objectId);
+      const loaded = await loadPage();
+      const nextObjectId = loaded ? findSavedTextObjectId(loaded.structure.text, objectId, savedText, savedBounds) : null;
+      if (nextObjectId == null) {
+        clearEditingState();
+      } else {
+        await beginTextEdit(nextObjectId);
+      }
     }
     status.value = `文本对象 ${objectId} 已保存`;
   } catch (error) {
@@ -262,6 +271,39 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
   } finally {
     isSavingEdit.value = false;
   }
+}
+
+function findSavedTextObjectId(
+  textObjects: StructuredTextObject[],
+  previousId: number,
+  savedText: string,
+  savedBounds: StructuredTextObject["bounds"] | null
+) {
+  if (textObjects.some((item) => item.id === previousId)) {
+    return previousId;
+  }
+
+  const normalizedSavedText = normalizeTextForMatch(savedText);
+  const textMatches = textObjects.filter((item) => normalizeTextForMatch(item.content) === normalizedSavedText);
+  const candidates = textMatches.length ? textMatches : textObjects;
+  if (!candidates.length) return null;
+  if (!savedBounds) return candidates[0].id;
+
+  return candidates
+    .map((item) => ({ id: item.id, distance: rectCenterDistanceSquared(item.bounds, savedBounds) }))
+    .sort((left, right) => left.distance - right.distance)[0].id;
+}
+
+function normalizeTextForMatch(value: string) {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function rectCenterDistanceSquared(left: StructuredTextObject["bounds"], right: StructuredTextObject["bounds"]) {
+  const leftX = left.origin.x + left.size.width / 2;
+  const leftY = left.origin.y + left.size.height / 2;
+  const rightX = right.origin.x + right.size.width / 2;
+  const rightY = right.origin.y + right.size.height / 2;
+  return (leftX - rightX) ** 2 + (leftY - rightY) ** 2;
 }
 
 async function saveTextEditOnBlur() {

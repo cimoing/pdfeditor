@@ -296,6 +296,36 @@ fn lopdf_backend_updates_existing_pdf_text_and_saves() {
 }
 
 #[test]
+fn lopdf_backend_uses_standard_latin_widths_for_uniform_helvetica_widths() {
+    let source = write_lopdf_text_pdf("lopdf-standard-latin-widths", "Alibaba");
+    let document = open_lopdf_document_from_bytes(&fs::read(source).unwrap()).unwrap();
+    let text = document
+        .page_structure(PageIndex(0))
+        .unwrap()
+        .text
+        .into_iter()
+        .find(|object| object.content == "Alibaba")
+        .unwrap();
+
+    let advances = text
+        .glyphs
+        .iter()
+        .map(|glyph| (glyph.ch.as_str(), glyph.advance))
+        .collect::<Vec<_>>();
+    let advance = |needle: &str| {
+        advances
+            .iter()
+            .find(|(ch, _)| *ch == needle)
+            .map(|(_, advance)| *advance)
+            .unwrap()
+    };
+
+    assert!(advance("l") < advance("A"));
+    assert!(advance("i") < advance("b"));
+    assert!(advance("A") > 0.6);
+}
+
+#[test]
 fn lopdf_backend_decodes_to_unicode_cmap_and_replaces_text() {
     let source = write_lopdf_cmap_text_pdf("lopdf-cmap-source");
     let target = temp_path("lopdf-cmap-updated", "pdf");
@@ -772,6 +802,145 @@ fn lopdf_backend_preserves_hex_unicode_text_when_updating_chinese() {
             .abs()
             < 0.01
     );
+}
+
+#[test]
+fn lopdf_backend_uses_narrow_advances_for_ascii_inside_cjk_text() {
+    let target = temp_path("lopdf-cjk-ascii-advances", "pdf");
+    let replacement = "中文Alibaba Ltd. d/b/a";
+    let structure = PageStructure {
+        page: PageInfo {
+            index: PageIndex(0),
+            size: Size::new(300.0, 300.0),
+            rotation: 0,
+        },
+        text: vec![StructuredTextObject {
+            id: pdfeditor_core::TextObjectId(pdfeditor_core::PdfObjectId(1)),
+            bounds: Rect::new(72.0, 120.0, 180.0, 24.0),
+            content: "中文ABC123".to_string(),
+            font_name: Some("STSong-Light".to_string()),
+            font_size: 14.0,
+            color: Color::BLACK,
+            stroke_color: Color::BLACK,
+            stroke_width: 0.0,
+            rendering_mode: 0,
+            transform: [14.0, 0.0, 0.0, 14.0, 72.0, 120.0],
+            angle_degrees: 0.0,
+            z_index: 0,
+            glyphs: Vec::new(),
+            runs: Vec::new(),
+        }],
+        visual_text: Vec::new(),
+        images: Vec::new(),
+        watermarks: Vec::new(),
+        annotations: Vec::new(),
+        bookmarks: Vec::new(),
+    };
+    write_page_structure_pdf(&structure, &target).unwrap();
+
+    let bytes = fs::read(&target).unwrap();
+    let mut document = open_lopdf_document_from_bytes(&bytes).unwrap();
+    let object = document.text_objects(PageIndex(0)).unwrap()[0].clone();
+    let preview = document
+        .preview_text_layout(object.id, replacement.to_string())
+        .unwrap();
+    let chinese_advance = preview.glyphs[0].advance;
+    let latin_advance = preview.glyphs[2].advance;
+    let slash_advance = preview
+        .glyphs
+        .iter()
+        .find(|glyph| glyph.ch == "/")
+        .unwrap()
+        .advance;
+    assert!(latin_advance < chinese_advance * 0.75);
+    assert!(slash_advance < latin_advance);
+
+    document
+        .update_text_object(object.id, replacement.to_string(), None)
+        .unwrap();
+    let updated_bytes = save_pdf_document_to_bytes(&document).unwrap();
+    let updated_pdf = Document::load_mem(&updated_bytes).unwrap();
+    let page_id = *updated_pdf.get_pages().values().next().unwrap();
+    let page_dict = updated_pdf.get_dictionary(page_id).unwrap();
+    let resources = test_dictionary_from_object(&updated_pdf, page_dict.get(b"Resources").unwrap());
+    let fonts = test_dictionary_from_object(&updated_pdf, resources.get(b"Font").unwrap());
+    let fallback_font = test_dictionary_from_object(
+        &updated_pdf,
+        fonts.get(b"PdfEditorFallbackCjk").unwrap(),
+    );
+    let descendant = fallback_font
+        .get(b"DescendantFonts")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .first()
+        .map(|object| test_dictionary_from_object(&updated_pdf, object))
+        .unwrap();
+    let fallback_widths = descendant.get(b"W").unwrap().as_array().unwrap();
+    let ascii_widths = fallback_widths[1].as_array().unwrap();
+    assert_eq!(test_integer(&fallback_widths[0]), 0);
+    assert!(test_integer(&ascii_widths[b'l' as usize]) < test_integer(&ascii_widths[b'A' as usize]));
+    assert!(test_integer(&ascii_widths[b'/' as usize]) < test_integer(&ascii_widths[b'A' as usize]));
+    assert!(test_integer(&ascii_widths[b'W' as usize]) > test_integer(&ascii_widths[b'A' as usize]));
+
+    let content = Content::decode(&updated_pdf.get_page_content(page_id).unwrap()).unwrap();
+    let mut active_font = String::new();
+    let mut fallback_replacement_tj_count = 0;
+    for operation in &content.operations {
+        if operation.operator == "Tf" {
+            active_font = operation
+                .operands
+                .first()
+                .and_then(|object| object.as_name().ok())
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .unwrap_or_default();
+        } else if operation.operator == "Tj" {
+            let Some(Object::String(bytes, _)) = operation.operands.first() else {
+                continue;
+            };
+            let text = String::from_utf16(
+                &bytes
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            if text == replacement {
+                fallback_replacement_tj_count += 1;
+                assert_eq!(active_font, "PdfEditorFallbackCjk");
+            } else if replacement.contains(text.as_str()) {
+                assert_eq!(active_font, "PdfEditorFallbackCjk");
+            }
+        }
+    }
+    assert_eq!(fallback_replacement_tj_count, 1);
+    let reopened = open_lopdf_document_from_bytes(&updated_bytes).unwrap();
+    let updated = reopened
+        .page_structure(PageIndex(0))
+        .unwrap()
+        .text
+        .into_iter()
+        .find(|item| item.content == replacement)
+        .unwrap();
+    let glyph_chars = updated
+        .glyphs
+        .iter()
+        .map(|glyph| glyph.ch.as_str())
+        .collect::<Vec<_>>();
+    let gap_after = |needle: &str| {
+        let index = glyph_chars
+            .iter()
+            .position(|ch| *ch == needle)
+            .expect("expected glyph");
+        updated.glyphs[index + 1].x - updated.glyphs[index].x
+    };
+    let chinese_gap = updated.glyphs[1].x - updated.glyphs[0].x;
+    let latin_gap = gap_after("A");
+    let narrow_l_gap = gap_after("l");
+    let slash_gap = gap_after("/");
+    assert!(latin_gap < chinese_gap * 0.75);
+    assert!(narrow_l_gap < latin_gap * 0.7);
+    assert!(slash_gap < latin_gap * 0.7);
 }
 
 fn rendered(page: PageIndex, byte_len: usize) -> RenderedPage {
@@ -1364,4 +1533,22 @@ fn temp_dir(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("pdfeditor-core-{name}-{nanos}"))
+}
+
+fn test_dictionary_from_object<'a>(
+    document: &'a Document,
+    object: &'a Object,
+) -> &'a lopdf::Dictionary {
+    match object {
+        Object::Reference(id) => document.get_dictionary(*id).unwrap(),
+        Object::Dictionary(dictionary) => dictionary,
+        _ => panic!("expected dictionary object"),
+    }
+}
+
+fn test_integer(object: &Object) -> i64 {
+    match object {
+        Object::Integer(value) => *value,
+        _ => panic!("expected integer object"),
+    }
 }
