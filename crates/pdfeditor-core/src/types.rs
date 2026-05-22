@@ -164,6 +164,12 @@ pub struct StructuredTextObject {
     pub stroke_width: f32,
     #[serde(default)]
     pub rendering_mode: i32,
+    #[serde(default)]
+    pub char_spacing: f32,
+    #[serde(default)]
+    pub word_spacing: f32,
+    #[serde(default = "default_horizontal_scaling")]
+    pub horizontal_scaling: f32,
     pub transform: [f32; 6],
     pub angle_degrees: f32,
     pub z_index: usize,
@@ -174,6 +180,10 @@ pub struct StructuredTextObject {
 
 const fn default_stroke_color() -> Color {
     Color::BLACK
+}
+
+const fn default_horizontal_scaling() -> f32 {
+    100.0
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -224,6 +234,7 @@ pub struct LayoutGlyph {
     pub x: f32,
     pub y: f32,
     pub advance: f32,
+    pub width: f32,
     pub bbox: Rect,
 }
 

@@ -46,6 +46,9 @@ export interface StructuredTextObject {
   stroke_color: { r: number; g: number; b: number; a: number };
   stroke_width: number;
   rendering_mode: number;
+  char_spacing: number;
+  word_spacing: number;
+  horizontal_scaling: number;
   transform: [number, number, number, number, number, number];
   angle_degrees: number;
   z_index: number;
@@ -114,6 +117,7 @@ export interface LayoutGlyph {
   x: number;
   y: number;
   advance: number;
+  width: number;
   bbox: Rect;
 }
 

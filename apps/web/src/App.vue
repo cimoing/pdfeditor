@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref } from "vue";
-import type { StructuredImageObject, StructuredTextObject } from "./pdfEditor";
+import type { LayoutGlyph, StructuredImageObject, StructuredTextObject } from "./pdfEditor";
 import {
   commitTextEdit,
   describePdfFontUsage,
@@ -542,6 +542,50 @@ function roundSvg(value: number) {
   return Number(value.toFixed(4));
 }
 
+/**
+ * Returns the glyph array when it can be used for per-glyph absolute SVG rendering:
+ * - glyphs must be present and non-empty
+ * - glyph count must match the character count of the content
+ * - each glyph.ch must match the corresponding character
+ * Returns null when the fallback textLength rendering should be used instead.
+ */
+function glyphsForSvg(text: StructuredTextObject): LayoutGlyph[] | null {
+  const glyphs = text.glyphs;
+  if (!glyphs?.length) return null;
+  const chars = Array.from(text.content);
+  if (glyphs.length !== chars.length) return null;
+  for (let i = 0; i < glyphs.length; i++) {
+    if (glyphs[i].ch !== chars[i]) return null;
+  }
+  return glyphs;
+}
+
+/**
+ * Builds an SVG transform string that positions a single glyph at its absolute
+ * PDF-space coordinates (glyph.x, glyph.y).  The orientation (scale + rotation)
+ * is taken from the parent text object's transform[0..3], but the translation is
+ * replaced with the glyph's own position.  This guarantees each glyph lands at the
+ * exact position described by the original PDF Tm operator, regardless of how the
+ * containing StructuredTextObject was assembled (merged scatter group or otherwise).
+ */
+function svgGlyphTransform(glyph: LayoutGlyph, text: StructuredTextObject): string {
+  const viewport = currentViewport.value;
+  if (!viewport) return "";
+  const glyphMatrix: Matrix2D = [
+    text.transform[0],
+    text.transform[1],
+    text.transform[2],
+    text.transform[3],
+    glyph.x,
+    glyph.y
+  ];
+  const matrix = multiplyMatrices(
+    multiplyMatrices(viewport.transform, glyphMatrix),
+    [1, 0, 0, -1, 0, 0]
+  );
+  return `matrix(${matrix.map((v) => roundSvg(v)).join(" ")})`;
+}
+
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
@@ -652,47 +696,82 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
               preserveAspectRatio="none"
               :transform="svgImageTransform(image)"
             />
-            <text
-              v-for="text in renderTextObjects"
-              :key="`text-${text.id}`"
-              :transform="svgTextTransform(text)"
-              :font-family="svgFontFamily(text.font_name)"
-              :font-weight="fontWeightFor(text.font_name)"
-              :fill="svgFill(text)"
-              :stroke="svgStroke(text)"
-              :stroke-width="svgStrokeWidth(text)"
-              :paint-order="svgPaintOrder(text)"
-              font-size="1"
-              xml:space="preserve"
-              dominant-baseline="alphabetic"
-              :textLength="svgTextLength(text)"
-              :lengthAdjust="svgTextLength(text) != null ? 'spacingAndGlyphs' : undefined"
-              @pointerdown.stop
-              @click.stop="beginTextEdit(text.id)"
-            >
-              <template v-if="svgTextRuns(text)">
-                <tspan
-                  v-for="(run, runIndex) in svgTextRuns(text) ?? []"
-                  :key="`run-${text.id}-${runIndex}`"
-                  :font-family="svgFontFamily(run.font_name)"
-                  :font-weight="fontWeightFor(run.font_name)"
-                  :fill="colorToCss(run.color)"
-                >
-                  {{ run.content }}
-                </tspan>
-              </template>
-              <template v-else-if="svgTextLines(text).length > 1">
-                <tspan
-                  v-for="(line, lineIndex) in svgTextLines(text)"
-                  :key="`line-${text.id}-${lineIndex}`"
-                  x="0"
-                  :y="lineIndex === 0 ? 0 : lineIndex * 1.2"
-                >
-                  {{ line }}
-                </tspan>
-              </template>
-              <template v-else>{{ text.content }}</template>
-            </text>
+            <template v-for="text in renderTextObjects" :key="`text-${text.id}`">
+              <!--
+                Per-glyph absolute rendering (scatter-format merged groups and any object
+                where glyph positions are available).  Each character is placed at its exact
+                PDF-space (x, y) coordinate so it aligns with the background bitmap regardless
+                of inter-character spacing variations in the original PDF.
+                Clicking any glyph triggers editing for the whole logical group via text.id,
+                which maps to the primary member of the group — the backend distributes the
+                new text across all group members via repartition_group_text.
+              -->
+              <g
+                v-if="glyphsForSvg(text)"
+                :data-object-id="text.id"
+              >
+                <text
+                  v-for="(glyph, glyphIndex) in (glyphsForSvg(text) ?? [])"
+                  :key="`glyph-${text.id}-${glyphIndex}`"
+                  :transform="svgGlyphTransform(glyph, text)"
+                  :font-family="svgFontFamily(glyph.font_name ?? text.font_name)"
+                  :font-weight="fontWeightFor(glyph.font_name ?? text.font_name)"
+                  :fill="svgFill(text)"
+                  :stroke="svgStroke(text)"
+                  :stroke-width="svgStrokeWidth(text)"
+                  :paint-order="svgPaintOrder(text)"
+                  font-size="1"
+                  dominant-baseline="alphabetic"
+                  @pointerdown.stop
+                  @click.stop="beginTextEdit(text.id)"
+                >{{ glyph.ch }}</text>
+              </g>
+              <!--
+                Legacy textLength rendering for text objects without glyph position data.
+                Uses the group transform + lengthAdjust to distribute characters across the
+                object's width.
+              -->
+              <text
+                v-else
+                :transform="svgTextTransform(text)"
+                :font-family="svgFontFamily(text.font_name)"
+                :font-weight="fontWeightFor(text.font_name)"
+                :fill="svgFill(text)"
+                :stroke="svgStroke(text)"
+                :stroke-width="svgStrokeWidth(text)"
+                :paint-order="svgPaintOrder(text)"
+                font-size="1"
+                xml:space="preserve"
+                dominant-baseline="alphabetic"
+                :textLength="svgTextLength(text)"
+                :lengthAdjust="svgTextLength(text) != null ? 'spacingAndGlyphs' : undefined"
+                @pointerdown.stop
+                @click.stop="beginTextEdit(text.id)"
+              >
+                <template v-if="svgTextRuns(text)">
+                  <tspan
+                    v-for="(run, runIndex) in svgTextRuns(text) ?? []"
+                    :key="`run-${text.id}-${runIndex}`"
+                    :font-family="svgFontFamily(run.font_name)"
+                    :font-weight="fontWeightFor(run.font_name)"
+                    :fill="colorToCss(run.color)"
+                  >
+                    {{ run.content }}
+                  </tspan>
+                </template>
+                <template v-else-if="svgTextLines(text).length > 1">
+                  <tspan
+                    v-for="(line, lineIndex) in svgTextLines(text)"
+                    :key="`line-${text.id}-${lineIndex}`"
+                    x="0"
+                    :y="lineIndex === 0 ? 0 : lineIndex * 1.2"
+                  >
+                    {{ line }}
+                  </tspan>
+                </template>
+                <template v-else>{{ text.content }}</template>
+              </text>
+            </template>
           </svg>
 
           <svg

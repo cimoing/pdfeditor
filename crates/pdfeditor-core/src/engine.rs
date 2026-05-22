@@ -37,6 +37,9 @@ pub trait EngineDocument {
                 stroke_color: object.color,
                 stroke_width: 0.0,
                 rendering_mode: 0,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
                 transform: [
                     object.font_size,
                     0.0,

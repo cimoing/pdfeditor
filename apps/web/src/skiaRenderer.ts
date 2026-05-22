@@ -373,8 +373,18 @@ export class SkiaPageRenderer {
     glyph?: LayoutGlyph
   ) {
     const fontName = glyph?.font_name ?? text.font_name;
-    const resolved = this.fontForText(canvasKit, text, size, content, fontName);
-    const measuredWidth = measureGlyphWidth(resolved.font, content, paint);
+    let resolved = this.fontForText(canvasKit, text, size, content, fontName);
+    let measuredWidth = measureGlyphWidth(resolved.font, content, paint);
+
+    // Some embedded CJK fonts map fullwidth Unicode codepoints (U+FF00–FFEF) to
+    // narrow ASCII-style glyphs. Detect this by checking measured width and fall
+    // through to a fallback font so the character renders at full width.
+    if (resolved.source === "embedded" && isFullwidthContent(content) && measuredWidth < size * 0.5) {
+      resolved.font.delete();
+      resolved = this.fontForText(canvasKit, text, size, content, null);
+      measuredWidth = measureGlyphWidth(resolved.font, content, paint);
+    }
+
     const advance =
       resolved.source === "embedded"
         ? glyphAdvance(measuredWidth, size, glyph?.advance, content)
@@ -526,6 +536,11 @@ function shouldStrokeText(renderingMode: number) {
 
 function isIgnorableForGlyphCheck(content: string) {
   return /^[\s\u00A0\u2000-\u200F\u2028-\u202F\u205F\u3000]+$/u.test(content);
+}
+
+function isFullwidthContent(content: string): boolean {
+  const cp = content.codePointAt(0) ?? 0;
+  return content.length <= 2 && cp >= 0xFF00 && cp <= 0xFFEF;
 }
 
 function glyphAdvance(

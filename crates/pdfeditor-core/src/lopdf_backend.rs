@@ -1356,6 +1356,9 @@ impl LopdfDocument {
                         stroke_color: state.text.stroke_color,
                         stroke_width: state.text.stroke_width,
                         rendering_mode: state.text.rendering_mode,
+                        char_spacing: state.text.char_spacing,
+                        word_spacing: state.text.word_spacing,
+                        horizontal_scaling: state.text.horizontal_scaling,
                         transform,
                         angle_degrees: matrix_angle_degrees(transform),
                         z_index: operation_index,
@@ -1381,6 +1384,9 @@ impl LopdfDocument {
                     stroke_color: state.text.stroke_color,
                     stroke_width: state.text.stroke_width,
                     rendering_mode: state.text.rendering_mode,
+                    char_spacing: state.text.char_spacing,
+                    word_spacing: state.text.word_spacing,
+                    horizontal_scaling: state.text.horizontal_scaling,
                     transform,
                     angle_degrees: matrix_angle_degrees(transform),
                     z_index: operation_index,
@@ -3386,6 +3392,9 @@ fn merge_text_group_objects(
         stroke_color: Color::BLACK,
         stroke_width: 0.0,
         rendering_mode: 0,
+        char_spacing: 0.0,
+        word_spacing: 0.0,
+        horizontal_scaling: 100.0,
         transform: group.matrix,
         angle_degrees: matrix_angle_degrees(group.matrix),
         z_index: 0,
@@ -3396,10 +3405,11 @@ fn merge_text_group_objects(
         .iter()
         .map(|member| member.content.as_str())
         .collect::<String>();
-    let glyphs = members
+    let mut glyphs = members
         .iter()
         .flat_map(|member| member.glyphs.iter().cloned())
         .collect::<Vec<_>>();
+    fix_scatter_glyph_advances(&mut glyphs, group.font_size);
     let bounds = glyph_bounds(&glyphs).unwrap_or(group.bounds);
     StructuredTextObject {
         id: primary.id,
@@ -3411,6 +3421,9 @@ fn merge_text_group_objects(
         stroke_color: primary.stroke_color,
         stroke_width: primary.stroke_width,
         rendering_mode: primary.rendering_mode,
+        char_spacing: primary.char_spacing,
+        word_spacing: primary.word_spacing,
+        horizontal_scaling: primary.horizontal_scaling,
         transform: group.matrix,
         angle_degrees: matrix_angle_degrees(group.matrix),
         z_index: primary.z_index,
@@ -3580,6 +3593,7 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
         let (x, y) = transform_point(context.object.transform, cursor, 0.0);
         let glyph_transform =
             multiply_matrix(context.object.transform, [1.0, 0.0, 0.0, 1.0, cursor, 0.0]);
+        let bbox = transformed_rect_bounds(glyph_transform, advance.max(0.0), 1.2);
         glyphs.push(LayoutGlyph {
             ch: ch.to_string(),
             glyph_id,
@@ -3587,7 +3601,8 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
             x,
             y,
             advance,
-            bbox: transformed_rect_bounds(glyph_transform, advance.max(0.0), 1.2),
+            width: bbox.size.width,
+            bbox,
         });
         cursor += advance;
     }
@@ -3597,6 +3612,23 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
 
 fn unit_bounds_after_transform(transform: [f32; 6]) -> Rect {
     transformed_rect_bounds(transform, 1.0, 1.0)
+}
+
+/// After merging glyphs from scatter-format (individual Tm+Tj) members the per-glyph
+/// `advance` only reflects the raw font-metric step for that glyph, not the actual
+/// cursor distance to the next character.  Reconstruct advances from the real
+/// page-space x-position differences so that `advance[i] * font_size ≈ x[i+1] - x[i]`.
+/// The last glyph keeps its original advance (no following position to reference).
+/// `width` is left unchanged — it represents the rendered glyph ink width, which is
+/// a different concept from the cursor step.
+fn fix_scatter_glyph_advances(glyphs: &mut [LayoutGlyph], font_size: f32) {
+    let scale = font_size.abs().max(1.0);
+    for i in 0..glyphs.len().saturating_sub(1) {
+        let delta_x = glyphs[i + 1].x - glyphs[i].x;
+        if delta_x > 0.0 {
+            glyphs[i].advance = delta_x / scale;
+        }
+    }
 }
 
 fn glyph_bounds(glyphs: &[LayoutGlyph]) -> Option<Rect> {
@@ -5772,7 +5804,7 @@ impl ToUnicodeMap {
             return;
         }
         self.max_code_len = self.max_code_len.max(source.len());
-        if !target.is_empty() {
+        if !target.is_empty() && !is_ascii_range_to_fullwidth(&source, &target) {
             self.reverse
                 .entry(target.clone())
                 .or_insert_with(|| source.clone());
@@ -5919,6 +5951,24 @@ fn uses_direct_utf16_encoding(name: &str) -> bool {
     // Only CMaps that truly map CID = Unicode are valid here (e.g. UniGB-UCS2-H).
     (name.starts_with("Uni") && name.contains("UCS2"))
         || name.contains("UTF16")
+}
+
+fn is_ascii_range_to_fullwidth(source: &[u8], target: &str) -> bool {
+    // Some CJK fonts incorrectly map ASCII-range glyph bytes (CID ≤ 0x7F) to
+    // fullwidth Unicode codepoints (U+FF00–FFEF) in their ToUnicode CMap.
+    // The actual glyph is a narrow ASCII design, so using these bytes to encode a
+    // fullwidth character would produce a narrow glyph.  Suppress such entries from
+    // the reverse map so encoding falls back to the STSong-Light fullwidth font.
+    // The forward map (decoding) is intentionally left unchanged.
+    let source_cid = match source.len() {
+        1 => source[0] as u32,
+        2 => u32::from_be_bytes([0, 0, source[0], source[1]]),
+        _ => return false,
+    };
+    source_cid <= 0x7F
+        && target
+            .chars()
+            .all(|ch| matches!(ch as u32, 0xFF00..=0xFFEF))
 }
 
 fn win_ansi_to_unicode(code: u8) -> Option<u16> {
