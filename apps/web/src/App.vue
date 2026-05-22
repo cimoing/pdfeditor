@@ -726,8 +726,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                   :paint-order="svgPaintOrder(text)"
                   font-size="1"
                   dominant-baseline="alphabetic"
-                  :textLength="glyph.advance > 0 ? roundSvg(glyph.advance) : undefined"
-                  :lengthAdjust="glyph.advance > 0 ? 'spacingAndGlyphs' : undefined"
                   @pointerdown.stop
                   @click.stop="beginTextEdit(text.id)"
                 >{{ glyph.ch }}</text>
