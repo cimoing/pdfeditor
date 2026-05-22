@@ -411,7 +411,13 @@ function normalizeLayoutGlyphs(glyphs: LayoutGlyph[] | undefined): LayoutGlyph[]
 }
 
 function normalizeCompatibilityText(value: string): string {
-  return value ? value.normalize("NFKC") : value;
+  // NFC: canonical decomposition + recomposition only.
+  // This handles combining-character sequences (e.g. e + combining-accent → é)
+  // without collapsing compatibility forms such as fullwidth punctuation:
+  //   NFKC would turn "，" (U+FF0C) → "," (U+002C), "：" → ":", "（" → "(", etc.
+  //   Those characters must reach the backend unchanged so they are encoded with
+  //   the correct fullwidth glyph rather than the narrow ASCII substitute.
+  return value ? value.normalize("NFC") : value;
 }
 
 function assetBlobPart(payload: Uint8Array, asset: BinaryAssetInfo): ArrayBuffer {

@@ -5955,20 +5955,19 @@ fn uses_direct_utf16_encoding(name: &str) -> bool {
 
 fn is_ascii_range_to_fullwidth(source: &[u8], target: &str) -> bool {
     // Some CJK fonts incorrectly map ASCII-range glyph bytes (CID ≤ 0x7F) to
-    // fullwidth Unicode codepoints (U+FF00–FFEF) in their ToUnicode CMap.
+    // CJK or fullwidth Unicode codepoints in their ToUnicode CMap — for example
+    // 0x2C (',') → U+FF0C ('，'), 0x2E ('.') → U+3002 ('。').
     // The actual glyph is a narrow ASCII design, so using these bytes to encode a
-    // fullwidth character would produce a narrow glyph.  Suppress such entries from
-    // the reverse map so encoding falls back to the STSong-Light fullwidth font.
+    // fullwidth/CJK character would produce a narrow glyph.  Suppress such entries
+    // from the reverse map so encoding falls back to the STSong-Light font which
+    // carries the correct fullwidth glyphs.
     // The forward map (decoding) is intentionally left unchanged.
     let source_cid = match source.len() {
         1 => source[0] as u32,
         2 => u32::from_be_bytes([0, 0, source[0], source[1]]),
         _ => return false,
     };
-    source_cid <= 0x7F
-        && target
-            .chars()
-            .all(|ch| matches!(ch as u32, 0xFF00..=0xFFEF))
+    source_cid <= 0x7F && target.chars().all(is_cjk_or_fullwidth)
 }
 
 fn win_ansi_to_unicode(code: u8) -> Option<u16> {
