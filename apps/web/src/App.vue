@@ -547,6 +547,9 @@ function roundSvg(value: number) {
  * - glyphs must be present and non-empty
  * - glyph count must match the character count of the content
  * - each glyph.ch must match the corresponding character
+ * - no glyph has an advance/width mismatch that would cause the fallback font to
+ *   visibly overflow into adjacent characters (e.g. fullwidth punctuation placed at
+ *   a tight inter-character spacing from the original scatter-format PDF).
  * Returns null when the fallback textLength rendering should be used instead.
  */
 function glyphsForSvg(text: StructuredTextObject): LayoutGlyph[] | null {
@@ -554,8 +557,16 @@ function glyphsForSvg(text: StructuredTextObject): LayoutGlyph[] | null {
   if (!glyphs?.length) return null;
   const chars = Array.from(text.content);
   if (glyphs.length !== chars.length) return null;
+  const fontSize = effectiveFontSize(text);
   for (let i = 0; i < glyphs.length; i++) {
     if (glyphs[i].ch !== chars[i]) return null;
+    // When the Tm-derived advance (in page units) is substantially less than the
+    // glyph's font-metric ink width, the fallback font (e.g. Noto Sans SC) would
+    // render the full-width ink and visually overflow into the next character.
+    // Fall back to textLength rendering which compresses each glyph proportionally.
+    if (glyphs[i].width > 0 && glyphs[i].advance * fontSize < glyphs[i].width * 0.6) {
+      return null;
+    }
   }
   return glyphs;
 }
