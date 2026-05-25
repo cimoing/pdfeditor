@@ -59,6 +59,10 @@ export interface StructuredTextObject {
     font_size: number;
     color: { r: number; g: number; b: number; a: number };
   }>;
+  /** True when the font defines reduced advance widths for fullwidth CJK punctuation (标点宽度替换). */
+  punct_width_squeeze?: boolean;
+  /** OpenType layout features detected in the font (subset of: palt, halt, kern, liga, fwid, hwid). */
+  font_features?: string[];
 }
 
 export interface TextRunInfo {

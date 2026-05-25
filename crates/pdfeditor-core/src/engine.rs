@@ -51,6 +51,8 @@ pub trait EngineDocument {
                 angle_degrees: 0.0,
                 z_index,
                 glyphs: Vec::new(),
+                punct_width_squeeze: false,
+                font_features: Vec::new(),
                 runs: object.runs,
             })
             .collect();

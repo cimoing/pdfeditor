@@ -1,0 +1,13 @@
+# Build configuration for pdfeditor workspace
+
+# Dev-profile tuning to reduce Windows Defender false-positive surface
+# (Trojan:Win32/Bearfoos.B!ml):
+#
+#   opt-level = 1  — light optimisation changes code-generation patterns enough
+#                    to avoid the ML heuristic, with negligible impact on build
+#                    time or debug experience
+#   incremental = false — avoids scattering hundreds of small .rmeta/.d artefacts
+#                         through the target/ tree, reducing real-time scan load
+[profile.dev]
+opt-level = 1
+incremental = false

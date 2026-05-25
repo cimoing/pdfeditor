@@ -176,6 +176,17 @@ pub struct StructuredTextObject {
     #[serde(default)]
     pub glyphs: Vec<LayoutGlyph>,
     pub runs: Vec<TextRun>,
+    /// True when the font defines reduced advance widths for fullwidth CJK punctuation
+    /// (e.g. "，" stored as 500/1000 units instead of the default 1000/1000).
+    /// Consumers should rely on per-glyph `advance` values rather than assuming
+    /// uniform full-width spacing for such objects.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub punct_width_squeeze: bool,
+    /// OpenType layout feature tags detected in the font binary (e.g. "palt", "kern", "liga").
+    /// Only the subset of [palt, halt, kern, liga, fwid, hwid] that are present is listed.
+    /// Empty when the font has none of these features or is not an SFNT font.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub font_features: Vec<String>,
 }
 
 const fn default_stroke_color() -> Color {

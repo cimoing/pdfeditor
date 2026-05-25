@@ -1266,6 +1266,27 @@ impl LopdfDocument {
         metrics
     }
 
+    fn page_font_features(&self, page_id: ObjectId) -> HashMap<String, Vec<String>> {
+        let Ok(fonts) = self.document.get_page_fonts(page_id) else {
+            return HashMap::new();
+        };
+        let mut feature_map = HashMap::new();
+        for (name, font) in fonts {
+            let resource_name = String::from_utf8_lossy(&name).into_owned();
+            let Some(descriptor) = font_descriptor(&self.document, font) else {
+                continue;
+            };
+            let Some(bytes) = font_raw_sfnt_bytes(&self.document, descriptor) else {
+                continue;
+            };
+            let features = sfnt_layout_features(&bytes);
+            if !features.is_empty() {
+                feature_map.insert(resource_name, features);
+            }
+        }
+        feature_map
+    }
+
     pub fn page_font_assets(&self, page: PageIndex) -> CoreResult<Vec<PageFontAsset>> {
         let page_id = self.page_id(page)?;
         let Ok(fonts) = self.document.get_page_fonts(page_id) else {
@@ -1308,6 +1329,7 @@ impl LopdfDocument {
         let page_fonts = self.document.get_page_fonts(page_id).ok();
         let font_maps = self.page_font_maps(page_id);
         let font_metrics = self.page_font_metrics(page_id);
+        let font_feature_map = self.page_font_features(page_id);
         let mut state = PageParseState::default();
         let mut objects = Vec::new();
 
@@ -1363,17 +1385,30 @@ impl LopdfDocument {
                         angle_degrees: matrix_angle_degrees(transform),
                         z_index: operation_index,
                         glyphs: Vec::new(),
+                        punct_width_squeeze: false,
+                        font_features: Vec::new(),
                         runs: Vec::new(),
                     },
                     state: state.text.clone(),
                     font_map: font_map.cloned(),
                     metrics: metrics.cloned(),
                 };
-                let (glyphs, width) = layout_glyphs(&text, &layout_context);
+                let (glyphs, width) = layout_glyphs_tj(operation, &layout_context);
                 let bounds = operation_text_advance(operation, metrics, &state.text)
                     .or_else(|| (!glyphs.is_empty()).then_some(width))
                     .map(|width| bounds_for_text_width(width, transform))
                     .unwrap_or_else(|| bounds_for_text(&text, state.text.font_size, transform));
+                let punct_width_squeeze = match (font_map, metrics) {
+                    (Some(fm), Some(m)) => font_has_punct_width_squeeze(m, fm),
+                    _ => false,
+                };
+                let font_features = state
+                    .text
+                    .font_name
+                    .as_ref()
+                    .and_then(|name| font_feature_map.get(name))
+                    .cloned()
+                    .unwrap_or_default();
                 objects.push(StructuredTextObject {
                     id: object_id,
                     bounds,
@@ -1391,6 +1426,8 @@ impl LopdfDocument {
                     angle_degrees: matrix_angle_degrees(transform),
                     z_index: operation_index,
                     glyphs,
+                    punct_width_squeeze,
+                    font_features,
                     runs: vec![TextRun::new(
                         text,
                         state.text.font_name.clone(),
@@ -3365,6 +3402,8 @@ fn merge_text_group_objects(
         angle_degrees: matrix_angle_degrees(group.matrix),
         z_index: 0,
         glyphs: Vec::new(),
+        punct_width_squeeze: false,
+        font_features: Vec::new(),
         runs: Vec::new(),
     });
     let content = members
@@ -3394,6 +3433,16 @@ fn merge_text_group_objects(
         angle_degrees: matrix_angle_degrees(group.matrix),
         z_index: primary.z_index,
         glyphs,
+        punct_width_squeeze: members.iter().any(|m| m.punct_width_squeeze),
+        font_features: {
+            let mut set = std::collections::BTreeSet::new();
+            for member in members {
+                for f in &member.font_features {
+                    set.insert(f.clone());
+                }
+            }
+            set.into_iter().collect()
+        },
         runs: members
             .iter()
             .flat_map(|member| member.runs.iter().cloned())
@@ -3571,6 +3620,110 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
             bbox,
         });
         cursor += advance;
+    }
+
+    (glyphs, cursor)
+}
+
+/// TJ-aware variant of [`layout_glyphs`].
+///
+/// For `Tj`/`'`/`"` operations the result is identical to `layout_glyphs`.
+/// For `TJ` operations the function walks the operand array and applies the
+/// numeric displacement elements to the internal cursor between string chunks,
+/// so each glyph's `x` reflects the actual PDF rendering position.
+fn layout_glyphs_tj(operation: &Operation, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, f32) {
+    if operation.operator.as_str() != "TJ" {
+        let text = match operation.operator.as_str() {
+            "Tj" | "'" | "\"" => operation
+                .operands
+                .last()
+                .and_then(|o| object_text(o, context.font_map.as_ref()))
+                .unwrap_or_default(),
+            _ => return (Vec::new(), 0.0),
+        };
+        return layout_glyphs(&text, context);
+    }
+
+    let Some(array) = operation
+        .operands
+        .first()
+        .and_then(|o| o.as_array().ok())
+    else {
+        return (Vec::new(), 0.0);
+    };
+
+    // Pre-count total characters so we know which glyph is last (char_spacing is
+    // skipped on the last glyph, matching the behaviour of layout_glyphs).
+    let total_chars: usize = array
+        .iter()
+        .filter_map(|item| object_text(item, context.font_map.as_ref()))
+        .map(|s| s.chars().count())
+        .sum();
+
+    if total_chars == 0 {
+        return (Vec::new(), 0.0);
+    }
+
+    let mut glyphs = Vec::with_capacity(total_chars);
+    let mut cursor = 0.0f32;
+    let mut chars_placed = 0usize;
+
+    for item in array {
+        if let Some(text) = object_text(item, context.font_map.as_ref()) {
+            for ch in text.chars() {
+                chars_placed += 1;
+                let is_last = chars_placed == total_chars;
+
+                let encoded = context
+                    .font_map
+                    .as_ref()
+                    .and_then(|fm| fm.encode(&ch.to_string()));
+                let glyph_id = encoded.as_deref().and_then(|bytes| {
+                    context
+                        .metrics
+                        .as_ref()
+                        .and_then(|m| m.codes(bytes).first().copied())
+                });
+                // text_advance for a single glyph does NOT include char_spacing
+                // (char_gaps = codes.len()-1 = 0).  We add it manually below.
+                let mut advance = encoded
+                    .as_deref()
+                    .and_then(|bytes| {
+                        context
+                            .metrics
+                            .as_ref()
+                            .map(|m| m.text_advance(bytes, &context.state))
+                    })
+                    .unwrap_or_else(|| fallback_char_advance(ch));
+
+                if !is_last {
+                    advance += (context.state.char_spacing / context.object.font_size.max(1.0))
+                        * (context.state.horizontal_scaling / 100.0);
+                }
+
+                let (x, y) = transform_point(context.object.transform, cursor, 0.0);
+                let glyph_transform =
+                    multiply_matrix(context.object.transform, [1.0, 0.0, 0.0, 1.0, cursor, 0.0]);
+                let bbox = transformed_rect_bounds(glyph_transform, advance.max(0.0), 1.2);
+                glyphs.push(LayoutGlyph {
+                    ch: ch.to_string(),
+                    glyph_id,
+                    font_name: context.object.font_name.clone(),
+                    x,
+                    y,
+                    advance,
+                    width: bbox.size.width,
+                    bbox,
+                });
+                cursor += advance;
+            }
+        } else if let Some(wi) = object_to_f32(item) {
+            // Positive wi = tighten spacing (move cursor left).
+            // The displacement is in thousandths of a text-space unit.
+            // Multiply by horizontal_scaling to stay consistent with how
+            // character advances are normalised in layout_glyphs / text_advance.
+            cursor -= (wi / 1000.0) * (context.state.horizontal_scaling / 100.0);
+        }
     }
 
     (glyphs, cursor)
@@ -4312,6 +4465,21 @@ impl FontMetrics {
     }
 }
 
+/// Returns `true` when the font defines reduced advance widths (< 850/1000 units)
+/// for common fullwidth CJK punctuation characters, indicating the font implements
+/// the "punctuation width substitution" (标点宽度替换) typographic feature.
+fn font_has_punct_width_squeeze(metrics: &FontMetrics, font_map: &ToUnicodeMap) -> bool {
+    const CJK_PUNCT: &[&str] = &[
+        "，", "。", "、", "：", "；", "！", "？", "（", "）", "「", "」", "…", "—",
+    ];
+    let default_state = TextParseState::default();
+    CJK_PUNCT.iter().any(|s| {
+        font_map
+            .encode(s)
+            .is_some_and(|bytes| metrics.text_advance(&bytes, &default_state) < 0.85)
+    })
+}
+
 fn parse_font_metrics(
     document: &Document,
     font: &Dictionary,
@@ -4639,6 +4807,97 @@ fn font_file_bytes(
         .and_then(|object| stream_from_object(document, object))
         .and_then(stream_content_bytes)
         .map(|bytes| (bytes, "application/x-font-type1", "type1", "pfb"))
+}
+
+/// Finds a table by 4-byte tag in an SFNT font binary and returns a slice of its data.
+fn sfnt_find_table_data<'a>(sfnt: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
+    if sfnt.len() < 12 {
+        return None;
+    }
+    let num_tables = u16::from_be_bytes([sfnt[4], sfnt[5]]) as usize;
+    for index in 0..num_tables {
+        let rec = 12 + index * 16;
+        if sfnt.get(rec..rec + 4)? != tag {
+            continue;
+        }
+        let offset = u32::from_be_bytes(sfnt.get(rec + 8..rec + 12)?.try_into().ok()?) as usize;
+        let length = u32::from_be_bytes(sfnt.get(rec + 12..rec + 16)?.try_into().ok()?) as usize;
+        return sfnt.get(offset..offset + length);
+    }
+    None
+}
+
+/// Scans the GSUB and GPOS tables of an SFNT binary and returns those of
+/// [palt, halt, kern, liga, fwid, hwid] that are present, sorted alphabetically.
+fn sfnt_layout_features(bytes: &[u8]) -> Vec<String> {
+    const INTERESTING: &[[u8; 4]] = &[
+        *b"fwid", *b"halt", *b"hwid", *b"kern", *b"liga", *b"palt",
+    ];
+    let mut found = std::collections::BTreeSet::new();
+    for table_tag in [b"GSUB", b"GPOS"] {
+        let Some(table) = sfnt_find_table_data(bytes, table_tag) else {
+            continue;
+        };
+        // Common layout table header (version 1.0):
+        //   uint16 majorVersion, uint16 minorVersion,
+        //   Offset16 scriptListOffset, Offset16 featureListOffset, ...
+        if table.len() < 10 {
+            continue;
+        }
+        let feature_list_offset = u16::from_be_bytes([table[6], table[7]]) as usize;
+        let Some(feature_list) = table.get(feature_list_offset..) else {
+            continue;
+        };
+        if feature_list.len() < 2 {
+            continue;
+        }
+        let feature_count = u16::from_be_bytes([feature_list[0], feature_list[1]]) as usize;
+        // FeatureRecord: Tag(4) + Offset16(2) = 6 bytes each, starting at offset 2
+        for i in 0..feature_count {
+            let rec = 2 + i * 6;
+            let Some(tag) = feature_list.get(rec..rec + 4) else {
+                break;
+            };
+            if let Ok(tag_arr) = <&[u8; 4]>::try_from(tag) {
+                if INTERESTING.contains(tag_arr) {
+                    if let Ok(s) = std::str::from_utf8(tag) {
+                        found.insert(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Returns the raw SFNT binary of a font (TrueType/OpenType) from its descriptor,
+/// without any cmap remapping.  Returns `None` for pure-CFF / Type1 fonts.
+fn font_raw_sfnt_bytes(document: &Document, descriptor: &Dictionary) -> Option<Vec<u8>> {
+    // FontFile2 = TrueType or OpenType/TT sfnt
+    if let Some(bytes) = descriptor
+        .get(b"FontFile2")
+        .ok()
+        .and_then(|obj| stream_from_object(document, obj))
+        .and_then(stream_content_bytes)
+    {
+        return Some(bytes);
+    }
+    // FontFile3 with Subtype=OpenType = CFF-in-OTF or TT-in-OTF, still an sfnt
+    if let Some(stream) = descriptor
+        .get(b"FontFile3")
+        .ok()
+        .and_then(|obj| stream_from_object(document, obj))
+    {
+        let subtype = stream
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(object_name_bytes);
+        if matches!(subtype.as_deref(), Some("OpenType")) {
+            return stream_content_bytes(stream);
+        }
+    }
+    None
 }
 
 fn sfnt_has_usable_cmap(bytes: &[u8]) -> bool {

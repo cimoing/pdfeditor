@@ -446,7 +446,17 @@ function svgTextTransform(text: StructuredTextObject) {
 
 function svgTextLength(text: StructuredTextObject) {
   if (text.content.includes("\n")) return undefined;
-  if (!text.glyphs?.length) return undefined;
+  if (!text.glyphs?.length) {
+    // For fonts with punctuation width substitution (标点宽度替换) and no per-glyph
+    // positions, derive textLength from the object's actual bounds width so that
+    // lengthAdjust="spacingAndGlyphs" distributes the text (including narrow
+    // punctuation) across the correct PDF-space width.
+    if (text.punct_width_squeeze) {
+      const fs = effectiveFontSize(text);
+      if (fs > 0.01) return roundSvg(text.bounds.size.width / fs);
+    }
+    return undefined;
+  }
   if (!shouldTrustSvgTextLength(text)) return undefined;
   return roundSvg(text.glyphs.reduce((sum, glyph) => sum + Math.max(glyph.advance, 0), 0));
 }
@@ -497,6 +507,16 @@ function svgPaintOrder(text: StructuredTextObject) {
     return "stroke fill";
   }
   return undefined;
+}
+
+/**
+ * Builds a CSS `font-feature-settings` value string for the given text object,
+ * e.g. `"kern" 1, "palt" 1`.  Returns undefined when no features are detected.
+ */
+function svgFontFeatureSettings(text: StructuredTextObject): string | undefined {
+  const features = text.font_features;
+  if (!features?.length) return undefined;
+  return features.map((f) => `"${f}" 1`).join(", ");
 }
 
 function fontWeightFor(fontName: string | null) {
@@ -634,6 +654,12 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
       <section v-if="selectedTextObject" class="editor-panel">
         <h2>文本编辑</h2>
         <div class="object-id">对象 ID：{{ selectedTextObject.id }}</div>
+        <div v-if="selectedTextObject.punct_width_squeeze" class="object-id" title="该字体为全角标点定义了压缩字宽（标点宽度替换特性）">
+          ⚠ 标点宽度替换
+        </div>
+        <div v-if="selectedTextObject.font_features?.length" class="object-id" :title="`OpenType 特性：${selectedTextObject.font_features?.join(', ')}`">
+          OpenType 特性：{{ selectedTextObject.font_features?.join(", ") }}
+        </div>
         <div class="font-meta">
           <div>PDF 字体：{{ editSession?.font_id ?? selectedTextObject.font_name ?? "未提供" }}</div>
           <div>显示字体：{{ selectedFontUsage.displayFamily }}</div>
@@ -721,6 +747,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                   :stroke="svgStroke(text)"
                   :stroke-width="svgStrokeWidth(text)"
                   :paint-order="svgPaintOrder(text)"
+                  :style="svgFontFeatureSettings(text) ? { fontFeatureSettings: svgFontFeatureSettings(text) } : undefined"
                   font-size="1"
                   dominant-baseline="alphabetic"
                   @pointerdown.stop
@@ -741,6 +768,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                 :stroke="svgStroke(text)"
                 :stroke-width="svgStrokeWidth(text)"
                 :paint-order="svgPaintOrder(text)"
+                :style="svgFontFeatureSettings(text) ? { fontFeatureSettings: svgFontFeatureSettings(text) } : undefined"
                 font-size="1"
                 xml:space="preserve"
                 dominant-baseline="alphabetic"
