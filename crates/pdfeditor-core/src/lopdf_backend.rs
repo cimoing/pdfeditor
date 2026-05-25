@@ -263,7 +263,7 @@ impl EngineDocument for LopdfDocument {
     fn page_structure(&self, page: PageIndex) -> CoreResult<PageStructure> {
         self.ensure_page(page)?;
         let page_info = self.page_info(page)?;
-        let text = self.merged_structured_text(page)?;
+        let text = self.structured_text(page)?;
         let visual_text = self.structured_visual_text(page)?;
         let images = self.structured_images(page)?;
         let mut watermarks = text
@@ -817,7 +817,7 @@ impl LopdfDocument {
 
     pub fn hit_test(&self, page: PageIndex, point: Point) -> CoreResult<Option<HitTestResult>> {
         self.ensure_page(page)?;
-        let mut text = self.merged_structured_text(page)?;
+        let mut text = self.structured_text(page)?;
         text.sort_by_key(|object| object.z_index);
         for object in text.into_iter().rev() {
             if !object.bounds.contains(point) {
@@ -1403,40 +1403,6 @@ impl LopdfDocument {
         }
 
         Ok(objects)
-    }
-
-    fn merged_structured_text(&self, page: PageIndex) -> CoreResult<Vec<StructuredTextObject>> {
-        let objects = self.structured_text(page)?;
-        let groups = detect_text_edit_groups(page, &objects);
-        if groups.is_empty() {
-            return Ok(objects);
-        }
-
-        let mut grouped_ids = HashSet::new();
-        let mut merged = Vec::new();
-        for group in groups {
-            if group.member_ids.len() <= 1 {
-                continue;
-            }
-            let members = group
-                .member_ids
-                .iter()
-                .filter_map(|member_id| objects.iter().find(|object| object.id == *member_id).cloned())
-                .collect::<Vec<_>>();
-            if members.len() <= 1 {
-                continue;
-            }
-            grouped_ids.extend(group.member_ids.iter().copied());
-            merged.push(merge_text_group_objects(&group, &members));
-        }
-
-        let mut result = objects
-            .into_iter()
-            .filter(|object| !grouped_ids.contains(&object.id))
-            .collect::<Vec<_>>();
-        result.extend(merged);
-        result.sort_by_key(|object| object.z_index);
-        Ok(result)
     }
 
     fn structured_visual_text(

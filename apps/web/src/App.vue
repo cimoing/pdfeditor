@@ -58,8 +58,7 @@ const selectedTextObject = computed<StructuredTextObject | null>(
   () => page.value?.text.find((item) => item.id === selectedTextId.value) ?? null
 );
 const activeGroupObjectIds = computed(() => {
-  const ids = layoutPreview.value?.group_object_ids ?? editSession.value?.group_object_ids ?? [];
-  return ids.length ? ids : selectedTextId.value != null ? [selectedTextId.value] : [];
+  return selectedTextId.value != null ? [selectedTextId.value] : [];
 });
 const selectedFontUsage = computed(() =>
   describePdfFontUsage(editSession.value?.font_id ?? selectedTextObject.value?.font_name ?? null, fontFamilies.value)
@@ -70,7 +69,6 @@ const renderTextObjects = computed(() => {
   if (!layoutPreview.value || !selectedTextObject.value || !editSession.value) {
     return pageText;
   }
-  const hiddenIds = new Set(layoutPreview.value.group_object_ids);
   const previewObject: StructuredTextObject = {
     ...selectedTextObject.value,
     bounds: layoutPreview.value.bbox,
@@ -80,7 +78,7 @@ const renderTextObjects = computed(() => {
     transform: editSession.value.matrix,
     glyphs: layoutPreview.value.glyphs
   };
-  return pageText.filter((text) => !hiddenIds.has(text.id)).concat(previewObject);
+  return pageText.map((text) => (text.id === selectedTextObject.value!.id ? previewObject : text));
 });
 
 const selectedViewportRect = computed(() => {
@@ -636,7 +634,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
       <section v-if="selectedTextObject" class="editor-panel">
         <h2>文本编辑</h2>
         <div class="object-id">对象 ID：{{ selectedTextObject.id }}</div>
-        <div v-if="activeGroupObjectIds.length > 1" class="object-id">联动对象：{{ activeGroupObjectIds.length }} 个</div>
         <div class="font-meta">
           <div>PDF 字体：{{ editSession?.font_id ?? selectedTextObject.font_name ?? "未提供" }}</div>
           <div>显示字体：{{ selectedFontUsage.displayFamily }}</div>
