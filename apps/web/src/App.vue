@@ -227,12 +227,17 @@ const canSaveEdit = computed(() => {
   return draftText.value !== editSession.value.original_text;
 });
 
+/** Overflow only matters when the user actually changed the text from the original. */
+const hasEffectiveOverflow = computed(() =>
+  Boolean(layoutPreview.value?.overflow) && draftText.value !== editSession.value?.original_text
+);
+
 const previewStatus = computed(() => {
   if (!selectedTextObject.value) return "点击页面高亮框或左侧列表，开始编辑文本对象。";
   if (isPreparingEdit.value) return "正在准备文本编辑会话...";
   if (!layoutPreview.value) return "修改文本后会实时生成布局预览。";
-  if (layoutPreview.value.overflow) return "当前文本超出原始文本边界，可以保存。";
   if (draftText.value === editSession.value?.original_text) return "当前内容与原始文本一致。";
+  if (layoutPreview.value.overflow) return "当前文本超出原始文本边界，可以保存。";
   return "预览通过，可以保存到当前 PDF。";
 });
 
@@ -394,11 +399,13 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
   const objectId = selectedTextId.value;
   const savedText = draftText.value;
   const savedBounds = layoutPreview.value?.bbox ?? editSession.value?.bbox ?? selectedTextObject.value?.bounds ?? null;
+  // Overflow saves skip re-opening the edit session to avoid an extra WASM round-trip.
+  const closeAfterSave = options.closeAfterSave ?? Boolean(layoutPreview.value?.overflow);
 
   try {
     const updatedBytes = await commitTextEdit(pdfBytes.value, objectId, savedText, pdfHandle.value);
     pdfBytes.value = new Uint8Array(updatedBytes);
-    if (options.closeAfterSave) {
+    if (closeAfterSave) {
       await loadPage();
       clearEditingState();
     } else {
@@ -455,12 +462,6 @@ function rectCenterDistanceSquared(left: StructuredTextObject["bounds"], right: 
 async function saveTextEditOnBlur() {
   if (isPreparingEdit.value || isSavingEdit.value) return;
   if (!selectedTextObject.value || !editSession.value) return;
-  if (layoutPreview.value?.overflow) {
-    status.value = "当前文本超出原始文本边界，失去焦点时未保存。";
-    await nextTick();
-    inlineEditor.value?.focus();
-    return;
-  }
   if (draftText.value === editSession.value.original_text) {
     clearSelection();
     return;
@@ -826,7 +827,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
             @input="onDraftInput"
           />
         </label>
-        <p class="helper-text" :class="{ danger: Boolean(layoutPreview?.overflow) }">
+        <p class="helper-text" :class="{ danger: hasEffectiveOverflow }">
           {{ previewStatus }}
         </p>
         <button class="save-button" :disabled="!canSaveEdit" @click="saveTextEdit()">
@@ -955,7 +956,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
           <svg
             v-if="selectedViewportRect"
             class="layout-preview"
-            :class="{ overflow: Boolean(layoutPreview?.overflow) }"
+            :class="{ overflow: hasEffectiveOverflow }"
             :viewBox="`0 0 ${currentViewport.width} ${currentViewport.height}`"
           >
             <rect
@@ -990,7 +991,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
               ref="inlineEditor"
               v-model="draftText"
               class="inline-text-editor"
-              :class="{ overflow: Boolean(layoutPreview?.overflow) }"
+              :class="{ overflow: hasEffectiveOverflow }"
               :style="inlineEditorStyle"
               :disabled="isPreparingEdit || isSavingEdit"
               spellcheck="false"
