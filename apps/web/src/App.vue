@@ -9,7 +9,7 @@ import {
   resolvePdfFontFamily,
   startTextEdit
 } from "./pdfEditor";
-import { pdfRectToViewportRect, viewportToPdf, type Matrix2D } from "./viewport";
+import { pdfRectToViewportRect, viewportToPdf, type Matrix2D, type ViewportRect } from "./viewport";
 import { usePdfDocument } from "./composables/usePdfDocument";
 import { usePdfEditor } from "./composables/usePdfEditor";
 
@@ -758,6 +758,22 @@ function svgGlyphTransform(glyph: LayoutGlyph, text: StructuredTextObject): stri
   return `matrix(${matrix.map((v) => roundSvg(v)).join(" ")})`;
 }
 
+/**
+ * Returns the viewport-space rect to use as the SVG clip boundary for a text
+ * object.  For the object currently being edited we always use the original
+ * session bbox (not the possibly-expanded layoutPreview bbox) so that overflow
+ * content is clipped to the original text box.
+ */
+function textClipRect(text: StructuredTextObject): ViewportRect {
+  const viewport = currentViewport.value;
+  if (!viewport) return { left: 0, top: 0, width: 0, height: 0 };
+  const bounds =
+    text.id === selectedTextId.value && editSession.value
+      ? editSession.value.bbox
+      : text.bounds;
+  return pdfRectToViewportRect(viewport, bounds);
+}
+
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
@@ -864,6 +880,20 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
             :viewBox="`0 0 ${currentViewport.width} ${currentViewport.height}`"
             aria-label="PDF svg text render"
           >
+            <defs>
+              <clipPath
+                v-for="text in renderTextObjects"
+                :key="`clip-${text.id}`"
+                :id="`clip-text-${text.id}`"
+              >
+                <rect
+                  :x="textClipRect(text).left"
+                  :y="textClipRect(text).top"
+                  :width="textClipRect(text).width"
+                  :height="textClipRect(text).height"
+                />
+              </clipPath>
+            </defs>
             <image
               v-for="image in renderImageObjects"
               :key="`image-${image.id}`"
@@ -886,6 +916,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
               <g
                 v-if="glyphsForSvg(text)"
                 :data-object-id="text.id"
+                :clip-path="`url(#clip-text-${text.id})`"
               >
                 <text
                   v-for="(glyph, glyphIndex) in (glyphsForSvg(text) ?? [])"
@@ -924,6 +955,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                 dominant-baseline="alphabetic"
                 :textLength="svgTextLength(text)"
                 :lengthAdjust="svgTextLength(text) != null ? 'spacingAndGlyphs' : undefined"
+                :clip-path="`url(#clip-text-${text.id})`"
                 @pointerdown.stop
                 @click.stop="beginTextEdit(text.id)"
               >
