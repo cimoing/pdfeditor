@@ -263,7 +263,10 @@ impl EngineDocument for LopdfDocument {
     fn page_structure(&self, page: PageIndex) -> CoreResult<PageStructure> {
         self.ensure_page(page)?;
         let page_info = self.page_info(page)?;
-        let text = self.structured_text(page)?;
+        let raw_text = self.structured_text(page)?;
+        // Merge scatter-group members into a single object per logical group so
+        // the page structure presents one entry per editable text unit.
+        let text = self.merge_structured_text_groups(raw_text);
         let visual_text = self.structured_visual_text(page)?;
         let images = self.structured_images(page)?;
         let mut watermarks = text
@@ -488,7 +491,15 @@ impl EngineDocument for LopdfDocument {
         // not valid inside a BT block, so the clip must be placed outside.
         // Search backwards from the first targeted op for the opening BT, and
         // forwards from the last targeted op for the closing ET.
-        let clip_bounds = edit_group.bounds;
+        //
+        // Use the most-accurate clip bounds: if the text already has a `clip_bounds`
+        // from a prior overflow save, preserve that (it represents the truly-original
+        // text width); otherwise fall back to the current accurate per-metrics bounds.
+        let layout_context = self.text_layout_context(id)?;
+        let clip_bounds = layout_context
+            .object
+            .clip_bounds
+            .unwrap_or(layout_context.object.bounds);
         let first_targeted_op = targeted_operation_indexes.keys().copied().next();
         let last_targeted_op = targeted_operation_indexes.keys().copied().last();
         let clip_open_before_bt = first_targeted_op.and_then(|first| {
@@ -933,7 +944,7 @@ impl LopdfDocument {
             page: context.page,
             original_text: context.object.content,
             group_object_ids: edit_group.member_ids,
-            bbox: context.object.bounds,
+            bbox: context.object.clip_bounds.unwrap_or(context.object.bounds),
             matrix: context.object.transform,
             font_id: context.object.font_name,
             font_size: context.object.font_size,
@@ -950,8 +961,9 @@ impl LopdfDocument {
         let edit_group = self.text_edit_group(id)?;
         let context = self.text_layout_context(id)?;
         let (glyphs, bbox) = self.layout_preview_glyphs(id, &text)?;
-        let overflow = bbox.size.width > context.object.bounds.size.width
-            || bbox.size.height > context.object.bounds.size.height;
+        let ref_bounds = context.object.clip_bounds.unwrap_or(context.object.bounds);
+        let overflow = bbox.size.width > ref_bounds.size.width
+            || bbox.size.height > ref_bounds.size.height;
 
         Ok(TextLayoutPreview {
             object_id: id,
@@ -1444,7 +1456,44 @@ impl LopdfDocument {
         let mut state = PageParseState::default();
         let mut objects = Vec::new();
 
+        // Track the active clipping rectangle set by `q re W n … Q` sequences so we
+        // can expose it as `clip_bounds` on each text object.
+        let mut clip_stack: Vec<Option<Rect>> = Vec::new();
+        let mut active_clip: Option<Rect> = None;
+        let mut pending_re: Option<Rect> = None;
+        let mut pending_w_clip: Option<Rect> = None;
+
         for (operation_index, operation) in content.operations.iter().enumerate() {
+            // Update clip-path tracking state before everything else.
+            match operation.operator.as_str() {
+                "q" => clip_stack.push(active_clip),
+                "Q" => {
+                    active_clip = clip_stack.pop().unwrap_or(None);
+                    pending_re = None;
+                    pending_w_clip = None;
+                }
+                "re" => {
+                    if operation.operands.len() >= 4 {
+                        let x = object_to_f32(&operation.operands[0]);
+                        let y = object_to_f32(&operation.operands[1]);
+                        let w = object_to_f32(&operation.operands[2]);
+                        let h = object_to_f32(&operation.operands[3]);
+                        if let (Some(x), Some(y), Some(w), Some(h)) = (x, y, w, h) {
+                            pending_re = Some(Rect::new(x, y, w, h));
+                        }
+                    }
+                }
+                "W" | "W*" => {
+                    pending_w_clip = pending_re.take();
+                }
+                "n" | "f" | "f*" | "F" | "S" | "s" | "B" | "B*" | "b" | "b*" => {
+                    if let Some(clip) = pending_w_clip.take() {
+                        active_clip = Some(clip);
+                    }
+                }
+                _ => {}
+            }
+
             update_page_state(&mut state, operation);
             let font_map = state
                 .text
@@ -1498,6 +1547,7 @@ impl LopdfDocument {
                         glyphs: Vec::new(),
                         punct_width_squeeze: false,
                         font_features: Vec::new(),
+                        clip_bounds: None,
                         runs: Vec::new(),
                     },
                     state: state.text.clone(),
@@ -1541,6 +1591,7 @@ impl LopdfDocument {
                     glyphs,
                     punct_width_squeeze,
                     font_features,
+                    clip_bounds: active_clip,
                     runs: vec![TextRun::new(
                         text,
                         state.text.font_name.clone(),
@@ -1553,6 +1604,58 @@ impl LopdfDocument {
         }
 
         Ok(objects)
+    }
+
+    /// Merges scatter-format text groups in a `structured_text` result so that
+    /// each logical edit group (adjacent Tj operations for the same run) becomes
+    /// a single `StructuredTextObject`.  Objects that do not belong to any group
+    /// are emitted unchanged.  The output preserves the original z-order based on
+    /// the primary member of each group.
+    fn merge_structured_text_groups(
+        &self,
+        objects: Vec<StructuredTextObject>,
+    ) -> Vec<StructuredTextObject> {
+        use std::collections::HashSet;
+        let id_to_object: HashMap<TextObjectId, &StructuredTextObject> =
+            objects.iter().map(|o| (o.id, o)).collect();
+        let mut emitted: HashSet<TextObjectId> = HashSet::new();
+        let mut merged = Vec::with_capacity(objects.len());
+
+        for object in &objects {
+            if emitted.contains(&object.id) {
+                continue;
+            }
+            // Look up the edit group for this object.
+            let group = match self.text_edit_groups.get(&object.id) {
+                Some(g) => g,
+                None => {
+                    emitted.insert(object.id);
+                    merged.push(object.clone());
+                    continue;
+                }
+            };
+            // Collect all group members that are present in `objects`.
+            let members: Vec<StructuredTextObject> = group
+                .member_ids
+                .iter()
+                .filter_map(|id| id_to_object.get(id).map(|o| (*o).clone()))
+                .collect();
+            // Mark all members as emitted so they are not processed again.
+            for id in &group.member_ids {
+                emitted.insert(*id);
+            }
+            if members.len() <= 1 {
+                // Single-member group — no merging needed.
+                if let Some(m) = members.into_iter().next() {
+                    merged.push(m);
+                } else {
+                    merged.push(object.clone());
+                }
+            } else {
+                merged.push(merge_text_group_objects(group, &members));
+            }
+        }
+        merged
     }
 
     fn structured_visual_text(
@@ -3521,6 +3624,7 @@ fn merge_text_group_objects(
         glyphs: Vec::new(),
         punct_width_squeeze: false,
         font_features: Vec::new(),
+        clip_bounds: None,
         runs: Vec::new(),
     });
     let content = members
@@ -3560,6 +3664,9 @@ fn merge_text_group_objects(
             }
             set.into_iter().collect()
         },
+        // All members of a group share the same surrounding clip (if any); take it from
+        // the primary member.
+        clip_bounds: primary.clip_bounds,
         runs: members
             .iter()
             .flat_map(|member| member.runs.iter().cloned())

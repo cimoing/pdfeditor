@@ -53,6 +53,7 @@ pub trait EngineDocument {
                 glyphs: Vec::new(),
                 punct_width_squeeze: false,
                 font_features: Vec::new(),
+                clip_bounds: None,
                 runs: object.runs,
             })
             .collect();

@@ -187,6 +187,11 @@ pub struct StructuredTextObject {
     /// Empty when the font has none of these features or is not an SFNT font.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub font_features: Vec<String>,
+    /// When the PDF content stream wraps this text in a `q re W n … Q` clipping path,
+    /// this is the rectangle from the `re` operand — i.e. the bounds the text should be
+    /// clipped to.  Absent when no explicit clip was set on the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_bounds: Option<Rect>,
 }
 
 const fn default_stroke_color() -> Color {

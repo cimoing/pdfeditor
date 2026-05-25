@@ -760,9 +760,11 @@ function svgGlyphTransform(glyph: LayoutGlyph, text: StructuredTextObject): stri
 
 /**
  * Returns the viewport-space rect to use as the SVG clip boundary for a text
- * object.  For the object currently being edited we always use the original
- * session bbox (not the possibly-expanded layoutPreview bbox) so that overflow
- * content is clipped to the original text box.
+ * object.  Priority:
+ *  1. Session bbox during editing — always the true original bounds.
+ *  2. clip_bounds from the PDF content stream — set when a prior overflow save
+ *     wrapped the text in `q re W n … Q`.
+ *  3. text.bounds as fallback (unedited text with no explicit clip).
  */
 function textClipRect(text: StructuredTextObject): ViewportRect {
   const viewport = currentViewport.value;
@@ -770,7 +772,7 @@ function textClipRect(text: StructuredTextObject): ViewportRect {
   const bounds =
     text.id === selectedTextId.value && editSession.value
       ? editSession.value.bbox
-      : text.bounds;
+      : text.clip_bounds ?? text.bounds;
   return pdfRectToViewportRect(viewport, bounds);
 }
 

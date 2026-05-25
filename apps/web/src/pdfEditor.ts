@@ -63,6 +63,9 @@ export interface StructuredTextObject {
   punct_width_squeeze?: boolean;
   /** OpenType layout features detected in the font (subset of: palt, halt, kern, liga, fwid, hwid). */
   font_features?: string[];
+  /** Clipping rectangle from a surrounding `q re W n … Q` sequence in the PDF content stream.
+   *  When present, the SVG overlay should clip this text to this rect rather than `bounds`. */
+  clip_bounds?: Rect;
 }
 
 export interface TextRunInfo {
