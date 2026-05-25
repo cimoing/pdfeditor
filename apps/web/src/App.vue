@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watchEffect } from "vue";
 import type { LayoutGlyph, StructuredImageObject, StructuredTextObject } from "./pdfEditor";
 import {
   commitTextEdit,
@@ -78,6 +78,70 @@ const selectedFontUsage = computed(() =>
   describePdfFontUsage(editSession.value?.font_id ?? selectedTextObject.value?.font_name ?? null, fontFamilies.value)
 );
 
+// ── Fallback-font width normalisation ─────────────────────────────────────
+/**
+ * Measures the average glyph advance width (in CSS px) for an array of single
+ * characters rendered in `cssFont` (e.g. `"14px KaiTi, 'Kaiti SC', serif"`).
+ * Uses the Canvas 2D text-measurement API — no DOM insertion, no reflow.
+ */
+function measureAverageCharWidth(cssFont: string, chars: string[]): number {
+  if (!chars.length) return 0;
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return 0;
+  ctx.font = cssFont;
+  const total = chars.reduce((sum, ch) => sum + ctx.measureText(ch).width, 0);
+  return total / chars.length;
+}
+
+/**
+ * Horizontal scale factor applied to the inline textarea so that fallback-font
+ * character widths visually match the PDF font's glyph advances.
+ * Stays at 1.0 when the embedded font is successfully loaded.
+ */
+const editorFontScaleX = ref(1.0);
+
+watchEffect(() => {
+  const session = editSession.value;
+  const text = selectedTextObject.value;
+  const viewport = currentViewport.value;
+  const fontUsage = selectedFontUsage.value;
+
+  // No correction needed when the actual embedded font is in use.
+  if (!session?.glyphs.length || !text || !viewport || !fontUsage.fellBack) {
+    editorFontScaleX.value = 1.0;
+    return;
+  }
+
+  // Average advance per character from the PDF font metrics.
+  // editSession.glyphs already incorporates TJ compression (layout_preview_glyphs
+  // in the backend applies the compression factor before returning the session).
+  const validGlyphs = session.glyphs.filter((g) => g.advance > 0);
+  if (!validGlyphs.length) {
+    editorFontScaleX.value = 1.0;
+    return;
+  }
+  const avgPdfAdvance = validGlyphs.reduce((s, g) => s + g.advance, 0) / validGlyphs.length;
+
+  // Convert PDF advance (in normalised glyph units) to viewport pixels.
+  const effFs = effectiveFontSize(text);
+  const targetPx = avgPdfAdvance * effFs * viewport.zoom;
+
+  // Measure the fallback font at the exact CSS size we will use in the textarea.
+  const cssFontSizePx = Math.max(10, effFs * viewport.zoom);
+  const cssFont = `${cssFontSizePx}px ${fontUsage.cssFontFamily}`;
+  const measuredPx = measureAverageCharWidth(cssFont, validGlyphs.map((g) => g.ch));
+
+  if (measuredPx < 0.5) {
+    editorFontScaleX.value = 1.0;
+    return;
+  }
+
+  // Clamp to a reasonable range: very large corrections usually indicate a
+  // measurement anomaly (invisible characters, unmapped glyphs, etc.).
+  editorFontScaleX.value = Math.max(0.5, Math.min(2.0, targetPx / measuredPx));
+});
+
 const renderTextObjects = computed(() => {
   const pageText = page.value?.text ?? [];
   if (!layoutPreview.value || !selectedTextObject.value || !editSession.value) {
@@ -128,18 +192,31 @@ const inlineEditorWrapStyle = computed(() => {
   };
 });
 
-/** Typography styles for the textarea itself. */
+/** Typography + scale styles for the textarea itself. */
 const inlineEditorStyle = computed(() => {
   const text = selectedTextObject.value;
   const viewport = currentViewport.value;
   if (!text || !viewport || !editSession.value) return {};
   const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
+  const scale = editorFontScaleX.value;
+  const needsScale = Math.abs(scale - 1.0) > 0.005;
   return {
     fontFamily: svgFontFamily(editSession.value.font_id ?? text.font_name),
     fontSize: `${fontSize}px`,
     fontWeight: fontWeightFor(editSession.value.font_id ?? text.font_name),
     color: colorToCss(text.color),
-    lineHeight: "1.2"
+    lineHeight: "1.2",
+    // When the fallback font's character widths differ from the PDF font, compress
+    // or stretch the textarea content horizontally so character widths match.
+    // The compensating `width` ensures the scaled textarea still fills the wrapper
+    // (scaleX anchors at left, so visual right edge stays at wrapper_width).
+    ...(needsScale
+      ? {
+          transform: `scaleX(${scale.toFixed(5)})`,
+          transformOrigin: "left top",
+          width: `${(100 / scale).toFixed(5)}%`
+        }
+      : {})
   };
 });
 
