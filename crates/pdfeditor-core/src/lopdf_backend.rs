@@ -483,6 +483,32 @@ impl EngineDocument for LopdfDocument {
             })
             .collect::<BTreeMap<_, _>>();
 
+        // Locate the BT..ET block that wraps the targeted operations so we can
+        // insert a clipping path around it.  PDF path operators (re, W, n) are
+        // not valid inside a BT block, so the clip must be placed outside.
+        // Search backwards from the first targeted op for the opening BT, and
+        // forwards from the last targeted op for the closing ET.
+        let clip_bounds = edit_group.bounds;
+        let first_targeted_op = targeted_operation_indexes.keys().copied().next();
+        let last_targeted_op = targeted_operation_indexes.keys().copied().last();
+        let clip_open_before_bt = first_targeted_op.and_then(|first| {
+            content.operations[..first]
+                .iter()
+                .rposition(|op| op.operator == "BT")
+        });
+        let clip_close_after_et = last_targeted_op.and_then(|last| {
+            content.operations[last..]
+                .iter()
+                .position(|op| op.operator == "ET")
+                .map(|rel| rel + last)
+        });
+        // Only clip when both markers are present and in the correct order.
+        let (clip_open_before_bt, clip_close_after_et) =
+            match (clip_open_before_bt, clip_close_after_et) {
+                (Some(bt), Some(et)) if bt < et => (Some(bt), Some(et)),
+                _ => (None, None),
+            };
+
         // Pre-pass: collect text_matrix and text state at each targeted operation.
         // State is recorded BEFORE the operation executes so we capture the matrix
         // that was active when the original Tj/TJ was rendered.
@@ -719,7 +745,26 @@ impl EngineDocument for LopdfDocument {
                     ))),
                 );
             } else {
+                // Emit `q re W n` immediately before the BT that opens the targeted block.
+                if Some(operation_index) == clip_open_before_bt {
+                    rebuilt_operations.push(Operation::new("q", vec![]));
+                    rebuilt_operations.push(Operation::new(
+                        "re",
+                        vec![
+                            Object::Real(clip_bounds.origin.x),
+                            Object::Real(clip_bounds.origin.y),
+                            Object::Real(clip_bounds.size.width),
+                            Object::Real(clip_bounds.size.height),
+                        ],
+                    ));
+                    rebuilt_operations.push(Operation::new("W", vec![]));
+                    rebuilt_operations.push(Operation::new("n", vec![]));
+                }
                 rebuilt_operations.push(operation);
+                // Emit `Q` immediately after the ET that closes the targeted block.
+                if Some(operation_index) == clip_close_after_et {
+                    rebuilt_operations.push(Operation::new("Q", vec![]));
+                }
             }
         }
         content.operations = rebuilt_operations;
