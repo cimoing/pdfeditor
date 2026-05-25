@@ -3580,10 +3580,10 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
                     .as_ref()
                     .map(|metrics| metrics.text_advance(bytes, &context.state))
             })
-            .unwrap_or_else(|| {
-                estimate_text_width(&ch.to_string(), context.object.font_size)
-                    / context.object.font_size.max(1.0)
-            });
+            // Fall back to per-character Unicode heuristics rather than a flat 0.6×
+            // estimate: CJK characters return 1.0 (full-width), ASCII returns
+            // proportional values, and other scripts get 0.6.
+            .unwrap_or_else(|| fallback_char_advance(ch));
 
         if index + 1 < chars.len() {
             advance += (context.state.char_spacing / context.object.font_size.max(1.0))
@@ -5954,20 +5954,26 @@ fn uses_direct_utf16_encoding(name: &str) -> bool {
 }
 
 fn is_ascii_range_to_fullwidth(source: &[u8], target: &str) -> bool {
-    // Some CJK fonts incorrectly map ASCII-range glyph bytes (CID ≤ 0x7F) to
+    // Some simple (single-byte) fonts incorrectly map printable ASCII byte values to
     // CJK or fullwidth Unicode codepoints in their ToUnicode CMap — for example
     // 0x2C (',') → U+FF0C ('，'), 0x2E ('.') → U+3002 ('。').
     // The actual glyph is a narrow ASCII design, so using these bytes to encode a
     // fullwidth/CJK character would produce a narrow glyph.  Suppress such entries
     // from the reverse map so encoding falls back to the STSong-Light font which
     // carries the correct fullwidth glyphs.
+    //
+    // This check is intentionally restricted to single-byte sources.  In 2-byte CID
+    // fonts (e.g. Adobe-GB1), small CID values like [0x00, 0x02] are legitimate
+    // positions for CJK characters (顿号, 句号, etc.) with correct full-width metrics.
+    // Suppressing those mappings would break advance-width calculation and re-encoding.
+    //
     // The forward map (decoding) is intentionally left unchanged.
-    let source_cid = match source.len() {
-        1 => source[0] as u32,
-        2 => u32::from_be_bytes([0, 0, source[0], source[1]]),
-        _ => return false,
-    };
-    source_cid <= 0x7F && target.chars().all(is_cjk_or_fullwidth)
+    if source.len() != 1 {
+        return false;
+    }
+    let source_byte = source[0] as u32;
+    // Only printable ASCII range (0x20–0x7E); control bytes are not ASCII glyph codes.
+    (0x20..=0x7E).contains(&source_byte) && target.chars().all(is_cjk_or_fullwidth)
 }
 
 fn win_ansi_to_unicode(code: u8) -> Option<u16> {

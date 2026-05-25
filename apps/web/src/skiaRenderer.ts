@@ -540,7 +540,12 @@ function isIgnorableForGlyphCheck(content: string) {
 
 function isFullwidthContent(content: string): boolean {
   const cp = content.codePointAt(0) ?? 0;
-  return content.length <= 2 && cp >= 0xFF00 && cp <= 0xFFEF;
+  // U+3000–303F: CJK Symbols and Punctuation (full-width, e.g. 、。)
+  // U+FF00–FFEF: Fullwidth/halfwidth compatibility forms
+  return content.length <= 2 && (
+    (cp >= 0x3000 && cp <= 0x303F) ||
+    (cp >= 0xFF00 && cp <= 0xFFEF)
+  );
 }
 
 function glyphAdvance(
@@ -590,7 +595,11 @@ function isAsciiSingleChar(content: string) {
 }
 
 function isSinglePunctuation(content: string) {
-  return /^[\p{P}\u3000-\u303F\uFF00-\uFF65]$/u.test(content);
+  // U+3000-303F (CJK Symbols like \u3001\u3002) are excluded even though \p{P} covers them:
+  // these are genuinely full-width characters whose PDF advances (1em) are correct.
+  const cp = content.codePointAt(0) ?? 0;
+  if (cp >= 0x3000 && cp <= 0x303F) return false;
+  return /^[\p{P}\uFF00-\uFF65]$/u.test(content);
 }
 
 function splitGlyphsByLine(text: StructuredTextObject): LayoutGlyph[][] | null {
