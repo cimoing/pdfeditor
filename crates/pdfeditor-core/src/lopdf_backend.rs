@@ -486,11 +486,25 @@ impl EngineDocument for LopdfDocument {
         // Pre-pass: collect text_matrix and text state at each targeted operation.
         // State is recorded BEFORE the operation executes so we capture the matrix
         // that was active when the original Tj/TJ was rendered.
+        // Also compute the TJ compression factor per operation so the scatter can
+        // reproduce the same horizontal tightening in the replacement text.
         let mut pre_pass_state = PageParseState::default();
         let mut operation_states: HashMap<usize, ([f32; 6], TextParseState)> = HashMap::new();
+        let mut tj_compression_by_op: HashMap<usize, f32> = HashMap::new();
         for (op_index, operation) in content.operations.iter().enumerate() {
             if targeted_operation_indexes.contains_key(&op_index) {
                 operation_states.insert(op_index, (pre_pass_state.text_matrix, pre_pass_state.text.clone()));
+                let op_font_map = pre_pass_state.text.font_name.as_ref()
+                    .and_then(|n| font_maps.get(n));
+                let op_metrics = pre_pass_state.text.font_name.as_ref()
+                    .and_then(|n| font_metrics.get(n));
+                let factor = tj_compression_factor(
+                    operation,
+                    op_font_map,
+                    op_metrics,
+                    &pre_pass_state.text,
+                );
+                tj_compression_by_op.insert(op_index, factor);
             }
             update_page_state(&mut pre_pass_state, operation);
             let metrics_for_advance = pre_pass_state.text.font_name.as_ref()
@@ -590,6 +604,12 @@ impl EngineDocument for LopdfDocument {
                 // All characters use `anchor_text_matrix` (first member's matrix) as the base
                 // so chars are always placed starting from the group's original x position,
                 // with `global_scatter_pts` advancing continuously across members.
+                //
+                // If the original operation was a TJ with positive spacing adjustments
+                // (i.e. characters were packed tighter than font metrics alone), we reproduce
+                // the same proportional compression on the replacement text so the saved PDF
+                // matches the visual density of the original.
+                let tj_compression = tj_compression_by_op.get(&operation_index).copied().unwrap_or(1.0);
                 let chars: Vec<char> = replacement_segment.chars().collect();
                 let mut first_tj_index: Option<usize> = None;
                 // Tracks whether we have switched to the fallback font for the current char.
@@ -671,7 +691,10 @@ impl EngineDocument for LopdfDocument {
                                     / member_plan.font_size.max(1.0)
                             })
                     };
-                    global_scatter_pts += glyph_advance * member_plan.font_size;
+                    // Apply TJ compression to glyph advance (char_spacing is a separate
+                    // PDF state and is NOT compressed — it is already accounted for
+                    // independently of the TJ displacement mechanism).
+                    global_scatter_pts += glyph_advance * member_plan.font_size * tj_compression;
                     // Add inter-character spacing in points (between chars, not after the last).
                     if char_idx + 1 < chars.len() {
                         global_scatter_pts +=
@@ -899,7 +922,32 @@ impl LopdfDocument {
         let edit_group = self.text_edit_group(id)?;
         if edit_group.member_ids.len() <= 1 {
             let context = self.text_layout_context(id)?;
-            let (glyphs, width) = layout_glyphs(text, &context);
+            let (mut glyphs, width) = layout_glyphs(text, &context);
+            let factor = context.tj_compression;
+            if factor < 0.999 {
+                // Re-position every glyph with the compressed cursor so the preview
+                // bbox width and per-glyph highlights match the compressed PDF layout.
+                let mut cursor = 0.0f32;
+                for glyph in &mut glyphs {
+                    let adv = glyph.advance * factor;
+                    let (x, y) = transform_point(context.object.transform, cursor, 0.0);
+                    let glyph_transform = multiply_matrix(
+                        context.object.transform,
+                        [1.0, 0.0, 0.0, 1.0, cursor, 0.0],
+                    );
+                    let bbox = transformed_rect_bounds(glyph_transform, adv.max(0.0), 1.2);
+                    glyph.x = x;
+                    glyph.y = y;
+                    glyph.advance = adv;
+                    glyph.width = bbox.size.width;
+                    glyph.bbox = bbox;
+                    cursor += adv;
+                }
+                return Ok((
+                    glyphs,
+                    bounds_for_text_width(width * factor, context.object.transform),
+                ));
+            }
             return Ok((glyphs, bounds_for_text_width(width, context.object.transform)));
         }
 
@@ -1143,12 +1191,21 @@ impl LopdfDocument {
             .and_then(|name| font_metrics.get(name))
             .cloned();
 
+        let tj_compression = content
+            .operations
+            .get(text_ref.operation_index)
+            .map(|op| {
+                tj_compression_factor(op, font_map.as_ref(), metrics.as_ref(), &page_state.text)
+            })
+            .unwrap_or(1.0);
+
         Ok(TextLayoutContext {
             page: text_ref.page,
             object,
             state: page_state.text,
             font_map,
             metrics,
+            tj_compression,
         })
     }
 
@@ -1187,12 +1244,21 @@ impl LopdfDocument {
             .and_then(|name| font_metrics.get(name))
             .cloned();
 
+        let tj_compression = content
+            .operations
+            .get(text_ref.operation_index)
+            .map(|op| {
+                tj_compression_factor(op, font_map.as_ref(), metrics.as_ref(), &page_state.text)
+            })
+            .unwrap_or(1.0);
+
         Ok(TextLayoutContext {
             page: text_ref.page,
             object,
             state: page_state.text,
             font_map,
             metrics,
+            tj_compression,
         })
     }
 
@@ -1392,6 +1458,8 @@ impl LopdfDocument {
                     state: state.text.clone(),
                     font_map: font_map.cloned(),
                     metrics: metrics.cloned(),
+                    // Not used for rendering (only for editing), set to 1.0 here.
+                    tj_compression: 1.0,
                 };
                 let (glyphs, width) = layout_glyphs_tj(operation, &layout_context);
                 let bounds = operation_text_advance(operation, metrics, &state.text)
@@ -2953,6 +3021,10 @@ struct TextLayoutContext {
     state: TextParseState,
     font_map: Option<ToUnicodeMap>,
     metrics: Option<FontMetrics>,
+    /// Spacing compression factor derived from TJ displacement values (1.0 = no compression).
+    /// A value < 1.0 means the original PDF placed characters closer together than pure
+    /// font-metric advances would, via positive numeric items in a TJ array.
+    tj_compression: f32,
 }
 
 impl Default for PageParseState {
@@ -3727,6 +3799,53 @@ fn layout_glyphs_tj(operation: &Operation, context: &TextLayoutContext) -> (Vec<
     }
 
     (glyphs, cursor)
+}
+
+/// Returns the ratio of actual advance to pure font-metric advance for a TJ operation.
+///
+/// The ratio is < 1.0 when the array contains positive displacement values that tighten
+/// spacing (e.g. `[(char) 500 (char)]` makes the second character 0.5 em closer).
+/// Returns 1.0 for non-TJ operations, empty arrays, or when there is no net compression.
+fn tj_compression_factor(
+    operation: &Operation,
+    font_map: Option<&ToUnicodeMap>,
+    metrics: Option<&FontMetrics>,
+    state: &TextParseState,
+) -> f32 {
+    if operation.operator.as_str() != "TJ" {
+        return 1.0;
+    }
+    let Some(array) = operation.operands.first().and_then(|o| o.as_array().ok()) else {
+        return 1.0;
+    };
+
+    let mut font_metric_advance = 0.0f32;
+    let mut total_positive_adj = 0.0f32;
+
+    for item in array {
+        if let Some(text) = object_text(item, font_map) {
+            for ch in text.chars() {
+                let encoded = font_map.and_then(|fm| fm.encode(&ch.to_string()));
+                let adv = encoded
+                    .as_deref()
+                    .and_then(|bytes| metrics.map(|m| m.text_advance(bytes, state)))
+                    .unwrap_or_else(|| fallback_char_advance(ch));
+                font_metric_advance += adv;
+            }
+        } else if let Some(wi) = object_to_f32(item) {
+            if wi > 0.0 {
+                // Positive TJ value = tighten spacing; scale by Th so the units match
+                // the per-character advances returned by text_advance.
+                total_positive_adj += wi / 1000.0 * (state.horizontal_scaling / 100.0);
+            }
+        }
+    }
+
+    if font_metric_advance < 0.01 || total_positive_adj < 0.001 {
+        return 1.0;
+    }
+
+    ((font_metric_advance - total_positive_adj) / font_metric_advance).max(0.1)
 }
 
 fn unit_bounds_after_transform(transform: [f32; 6]) -> Rect {

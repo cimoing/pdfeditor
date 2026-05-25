@@ -49,6 +49,20 @@ const {
 const fontAssetMap = computed(() => new Map(fontAssets.value.map((font) => [font.resource_name, font])));
 const inlineEditor = ref<HTMLTextAreaElement | null>(null);
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
+
+// ── Edit-box resize state ──────────────────────────────────────────────────
+/** Width override in viewport pixels set by dragging the right edge. */
+const editBoxWidthOverride = ref<number | null>(null);
+/** Left offset override in viewport pixels set by dragging the left edge. */
+const editBoxLeftOverride = ref<number | null>(null);
+
+interface EdgeDragState {
+  edge: "left" | "right";
+  startX: number;
+  initialLeft: number;
+  initialWidth: number;
+}
+let edgeDragState: EdgeDragState | null = null;
 const textCount = computed(() => page.value?.text.length ?? 0);
 const imageCount = computed(() => page.value?.images.length ?? 0);
 const pageTextObjects = computed(() => page.value?.text ?? []);
@@ -98,17 +112,29 @@ const previewGlyphRects = computed(() => {
   }));
 });
 
-const inlineEditorStyle = computed(() => {
+/** Layout styles (position, size) for the editor wrapper div. */
+const inlineEditorWrapStyle = computed(() => {
   const text = selectedTextObject.value;
   const viewport = currentViewport.value;
   if (!text || !viewport || !editSession.value) return {};
   const rect = pdfRectToViewportRect(viewport, editSession.value.bbox);
   const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
+  const naturalWidth = Math.max(rect.width, fontSize * 4);
   return {
-    left: `${rect.left}px`,
+    left: `${editBoxLeftOverride.value ?? rect.left}px`,
     top: `${rect.top}px`,
-    width: `${Math.max(rect.width, fontSize * 4)}px`,
-    minHeight: `${Math.max(rect.height, fontSize * 1.4)}px`,
+    width: `${editBoxWidthOverride.value ?? naturalWidth}px`,
+    minHeight: `${Math.max(rect.height, fontSize * 1.4)}px`
+  };
+});
+
+/** Typography styles for the textarea itself. */
+const inlineEditorStyle = computed(() => {
+  const text = selectedTextObject.value;
+  const viewport = currentViewport.value;
+  if (!text || !viewport || !editSession.value) return {};
+  const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
+  return {
     fontFamily: svgFontFamily(editSession.value.font_id ?? text.font_name),
     fontSize: `${fontSize}px`,
     fontWeight: fontWeightFor(editSession.value.font_id ?? text.font_name),
@@ -136,7 +162,51 @@ const previewStatus = computed(() => {
 onBeforeUnmount(() => {
   cleanupPdf();
   clearPreviewTimer();
+  stopEdgeDrag();
 });
+
+function resetEditBoxOverrides() {
+  editBoxWidthOverride.value = null;
+  editBoxLeftOverride.value = null;
+}
+
+function stopEdgeDrag() {
+  if (!edgeDragState) return;
+  edgeDragState = null;
+  window.removeEventListener("pointermove", onEdgeDragMove);
+  window.removeEventListener("pointerup", onEdgeDragEnd);
+}
+
+function onEdgeDragStart(event: PointerEvent, edge: "left" | "right") {
+  const text = selectedTextObject.value;
+  const viewport = currentViewport.value;
+  if (!text || !viewport || !editSession.value) return;
+  const rect = pdfRectToViewportRect(viewport, editSession.value.bbox);
+  const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
+  const naturalWidth = Math.max(rect.width, fontSize * 4);
+  const initialLeft = editBoxLeftOverride.value ?? rect.left;
+  const initialWidth = editBoxWidthOverride.value ?? naturalWidth;
+  edgeDragState = { edge, startX: event.clientX, initialLeft, initialWidth };
+  window.addEventListener("pointermove", onEdgeDragMove);
+  window.addEventListener("pointerup", onEdgeDragEnd);
+  event.preventDefault();
+}
+
+function onEdgeDragMove(event: PointerEvent) {
+  if (!edgeDragState) return;
+  const dx = event.clientX - edgeDragState.startX;
+  if (edgeDragState.edge === "right") {
+    editBoxWidthOverride.value = Math.max(40, edgeDragState.initialWidth + dx);
+  } else {
+    const newWidth = Math.max(40, edgeDragState.initialWidth - dx);
+    editBoxWidthOverride.value = newWidth;
+    editBoxLeftOverride.value = edgeDragState.initialLeft + (edgeDragState.initialWidth - newWidth);
+  }
+}
+
+function onEdgeDragEnd() {
+  stopEdgeDrag();
+}
 
 async function onFileChange(event: Event) {
   const input = event.target as HTMLInputElement;
@@ -169,6 +239,7 @@ function onLoadPageClick() {
 
 async function beginTextEdit(objectId: number) {
   if (!pdfBytes.value) return;
+  resetEditBoxOverrides();
   clearPreviewTimer();
   selectedTextId.value = objectId;
   isPreparingEdit.value = true;
@@ -321,6 +392,7 @@ async function saveTextEditOnBlur() {
 }
 
 function clearSelection() {
+  resetEditBoxOverrides();
   clearEditingState();
 }
 
@@ -827,21 +899,36 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
             />
           </svg>
 
-          <textarea
+          <div
             v-if="editSession && selectedTextObject"
-            ref="inlineEditor"
-            v-model="draftText"
-            class="inline-text-editor"
-            :class="{ overflow: Boolean(layoutPreview?.overflow) }"
-            :style="inlineEditorStyle"
-            :disabled="isPreparingEdit || isSavingEdit"
-            spellcheck="false"
-            @input="onDraftInput"
-            @keydown="onInlineEditorKeydown"
-            @blur="saveTextEditOnBlur"
-            @pointerdown.stop
-            @click.stop
-          />
+            class="inline-editor-wrap"
+            :style="inlineEditorWrapStyle"
+          >
+            <div
+              class="editor-edge editor-edge-left"
+              title="拖拽调整编辑框宽度"
+              @pointerdown.prevent.stop="onEdgeDragStart($event, 'left')"
+            />
+            <textarea
+              ref="inlineEditor"
+              v-model="draftText"
+              class="inline-text-editor"
+              :class="{ overflow: Boolean(layoutPreview?.overflow) }"
+              :style="inlineEditorStyle"
+              :disabled="isPreparingEdit || isSavingEdit"
+              spellcheck="false"
+              @input="onDraftInput"
+              @keydown="onInlineEditorKeydown"
+              @blur="saveTextEditOnBlur"
+              @pointerdown.stop
+              @click.stop
+            />
+            <div
+              class="editor-edge editor-edge-right"
+              title="拖拽调整编辑框宽度"
+              @pointerdown.prevent.stop="onEdgeDragStart($event, 'right')"
+            />
+          </div>
         </div>
       </div>
       <div v-else class="empty-state">加载 PDF 后显示 PNG 背景与 SVG 文本层，并可直接点击文本进行编辑</div>
