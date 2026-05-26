@@ -226,10 +226,19 @@ const inlineEditorStyle = computed(() => {
   const text = selectedTextObject.value;
   const viewport = currentViewport.value;
   if (!text || !viewport || !editSession.value) return {};
-  const rect = pdfRectToViewportRect(viewport, editSession.value.bbox);
   const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
   const scale = editorFontScaleX.value;
   const needsScale = Math.abs(scale - 1.0) > 0.005;
+
+  // PDF Tc (char_spacing) and Tw (word_spacing) are in user-space units (PDF points).
+  // The horizontal scaling Tz (horizontal_scaling / 100) also applies to these values.
+  // Convert to CSS px: × Tz × viewport.zoom.
+  // Divide by editorFontScaleX so that the scaleX CSS transform (applied for
+  // fallback-font width compensation) does not double-scale the spacing values.
+  const th = text.horizontal_scaling / 100;
+  const charSpacingPx = text.char_spacing * th * viewport.zoom / scale;
+  const wordSpacingPx = text.word_spacing * th * viewport.zoom / scale;
+
   return {
     fontFamily: svgFontFamily(editSession.value.font_id ?? text.font_name),
     fontSize: `${fontSize}px`,
@@ -237,6 +246,10 @@ const inlineEditorStyle = computed(() => {
     color: colorToCss(text.color),
     lineHeight: "1.2",
     height: `${fontSize * 1.4}px`,
+    // Reproduce PDF char spacing (Tc) and word spacing (Tw) in the editor so the
+    // visual gap between characters matches the rendered background image.
+    ...(Math.abs(charSpacingPx) > 0.01 ? { letterSpacing: `${charSpacingPx.toFixed(3)}px` } : {}),
+    ...(Math.abs(wordSpacingPx) > 0.01 ? { wordSpacing: `${wordSpacingPx.toFixed(3)}px` } : {}),
     // When the fallback font's character widths differ from the PDF font, compress
     // or stretch the textarea content horizontally so character widths match.
     // The compensating `width` ensures the scaled textarea still fills the wrapper
