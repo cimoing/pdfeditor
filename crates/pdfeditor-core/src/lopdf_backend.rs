@@ -1195,6 +1195,20 @@ impl LopdfDocument {
             return Ok(group.clone());
         }
 
+        if let Some(text_ref) = self.text_refs.get(&id).cloned() {
+            let structured = self.structured_text(text_ref.page)?;
+            if let Some(object) = structured.into_iter().find(|object| object.id == id) {
+                return Ok(TextEditGroup {
+                    page: text_ref.page,
+                    member_ids: vec![id],
+                    bounds: object.clip_bounds.unwrap_or(object.bounds),
+                    matrix: object.transform,
+                    font_name: object.font_name,
+                    font_size: object.font_size,
+                });
+            }
+        }
+
         let object = self.find_text_object(id)?;
         let matrix = [
             object.font_size,

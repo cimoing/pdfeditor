@@ -590,6 +590,28 @@ fn lopdf_backend_requires_exact_rounded_baseline_for_line_grouping() {
 }
 
 #[test]
+fn lopdf_backend_preserves_rotated_text_edit_matrix() {
+    let source = write_lopdf_rotated_text_pdf("lopdf-rotated-text-edit");
+    let bytes = fs::read(source).unwrap();
+    let document = open_lopdf_document_from_bytes(&bytes).unwrap();
+    let text = document
+        .page_structure(PageIndex(0))
+        .unwrap()
+        .text
+        .into_iter()
+        .find(|object| object.content == "Vertical")
+        .expect("rotated text object");
+
+    assert!(text.angle_degrees.abs() > 89.0);
+
+    let session = document.start_text_edit(text.id).unwrap();
+    assert_eq!(session.original_text, "Vertical");
+    assert_eq!(session.matrix, text.transform);
+    assert!(session.matrix[1].abs() > 11.0);
+    assert!(session.matrix[0].abs() < 0.01);
+}
+
+#[test]
 fn lopdf_backend_exports_background_png_from_bytes_for_wasm() {
     let source = write_lopdf_background_pdf("lopdf-background-bytes");
     let bytes = fs::read(source).unwrap();
@@ -1567,6 +1589,74 @@ fn write_lopdf_positioned_text_runs_pdf(
             Operation::new("Tj", vec![Object::string_literal(first.2)]),
             positioned_text_operation(second),
             Operation::new("Tj", vec![Object::string_literal(second.2)]),
+            Operation::new("ET", vec![]),
+        ],
+    };
+    let content_id = document.add_object(Stream::new(
+        dictionary! {},
+        content.encode().expect("encode PDF content stream"),
+    ));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(300), Object::Integer(300)],
+    });
+    document.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    document.compress();
+    document.save(&path).expect("save generated PDF");
+    path
+}
+
+fn write_lopdf_rotated_text_pdf(name: &str) -> PathBuf {
+    let path = temp_path(name, "pdf");
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let font_id = document.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "FirstChar" => 0,
+        "Widths" => Object::Array((0..=255).map(|_| Object::Integer(600)).collect()),
+    });
+    let resources_id = document.add_object(dictionary! {
+        "Font" => dictionary! {
+            "F1" => font_id,
+        },
+    });
+    let content = Content {
+        operations: vec![
+            Operation::new("BT", vec![]),
+            Operation::new(
+                "Tf",
+                vec![Object::Name(b"F1".to_vec()), Object::Integer(12)],
+            ),
+            Operation::new(
+                "Tm",
+                vec![
+                    Object::Integer(0),
+                    Object::Integer(1),
+                    Object::Integer(-1),
+                    Object::Integer(0),
+                    Object::Integer(40),
+                    Object::Integer(60),
+                ],
+            ),
+            Operation::new("Tj", vec![Object::string_literal("Vertical")]),
             Operation::new("ET", vec![]),
         ],
     };
