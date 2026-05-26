@@ -9,7 +9,7 @@ import {
   resolvePdfFontFamily,
   startTextEdit
 } from "./pdfEditor";
-import { pdfRectToViewportRect, viewportToPdf, type Matrix2D, type ViewportRect } from "./viewport";
+import { pdfRectToViewportRect, pdfToViewport, viewportToPdf, type Matrix2D, type ViewportRect } from "./viewport";
 import { usePdfDocument } from "./composables/usePdfDocument";
 import { usePdfEditor } from "./composables/usePdfEditor";
 
@@ -47,7 +47,7 @@ const {
 } = usePdfEditor();
 
 const fontAssetMap = computed(() => new Map(fontAssets.value.map((font) => [font.resource_name, font])));
-const inlineEditor = ref<HTMLTextAreaElement | null>(null);
+const inlineEditor = ref<HTMLInputElement | null>(null);
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 
 // ── Edit-box resize state ──────────────────────────────────────────────────
@@ -55,6 +55,13 @@ const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 const editBoxWidthOverride = ref<number | null>(null);
 /** Left offset override in viewport pixels set by dragging the left edge. */
 const editBoxLeftOverride = ref<number | null>(null);
+/**
+ * Canvas-relative left pixel position of the first rendered SVG glyph for the
+ * current edit session. Queried from the DOM after Vue renders so we align with
+ * the actual visual pixel left edge regardless of font glyph-origin conventions
+ * (some CJK fonts have the origin at the character's right end, not left end).
+ */
+const svgFirstGlyphLeft = ref<number | null>(null);
 
 interface EdgeDragState {
   edge: "left" | "right";
@@ -181,14 +188,36 @@ const inlineEditorWrapStyle = computed(() => {
   const text = selectedTextObject.value;
   const viewport = currentViewport.value;
   if (!text || !viewport || !editSession.value) return {};
-  const rect = pdfRectToViewportRect(viewport, editSession.value.bbox);
   const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
-  const naturalWidth = Math.max(rect.width, fontSize * 4);
+
+  // Position: layoutPreview.glyphs covers the full edit group (same data the SVG uses
+  // when a preview is active). Fall back to text.glyphs[0] or matrix translation.
+  // editSession.bbox can be degenerate (full-page) for some PDFs, so we avoid it.
+  const m = editSession.value.matrix;
+  const textGlyphs = text.glyphs ?? [];
+  const firstGlyph = textGlyphs[0] ?? null;
+  const originY = firstGlyph ? firstGlyph.y : m[5];
+  const baseline = pdfToViewport(viewport, m[4], originY);
+  // svgFirstGlyphLeft is set from DOM after render and reflects the actual visual
+  // pixel left edge of the character (independent of the font's glyph-origin convention).
+  const inputLeft = svgFirstGlyphLeft.value ?? baseline.x;
+  const inputTop = baseline.y - fontSize;
+
+  // Width: sum of glyph advances (in em units) × viewport font size.
+  // editSession.glyphs carry the advance widths; fall back to 8-char estimate.
+  const effFs = effectiveFontSize(text);
+  const sessionGlyphs = editSession.value.glyphs;
+  const totalAdvance = sessionGlyphs.length
+    ? sessionGlyphs.reduce((s, g) => s + Math.max(g.advance, 0), 0)
+    : 0;
+  const naturalWidth = totalAdvance > 0
+    ? Math.max(totalAdvance * effFs * viewport.zoom, fontSize * 4)
+    : fontSize * 8;
+
   return {
-    left: `${editBoxLeftOverride.value ?? rect.left}px`,
-    top: `${rect.top}px`,
-    width: `${editBoxWidthOverride.value ?? naturalWidth}px`,
-    minHeight: `${Math.max(rect.height, fontSize * 1.4)}px`
+    left: `${editBoxLeftOverride.value ?? inputLeft}px`,
+    top: `${inputTop}px`,
+    width: `${editBoxWidthOverride.value ?? naturalWidth}px`
   };
 });
 
@@ -197,6 +226,7 @@ const inlineEditorStyle = computed(() => {
   const text = selectedTextObject.value;
   const viewport = currentViewport.value;
   if (!text || !viewport || !editSession.value) return {};
+  const rect = pdfRectToViewportRect(viewport, editSession.value.bbox);
   const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
   const scale = editorFontScaleX.value;
   const needsScale = Math.abs(scale - 1.0) > 0.005;
@@ -206,6 +236,7 @@ const inlineEditorStyle = computed(() => {
     fontWeight: fontWeightFor(editSession.value.font_id ?? text.font_name),
     color: colorToCss(text.color),
     lineHeight: "1.2",
+    height: `${fontSize * 1.4}px`,
     // When the fallback font's character widths differ from the PDF font, compress
     // or stretch the textarea content horizontally so character widths match.
     // The compensating `width` ensures the scaled textarea still fills the wrapper
@@ -250,6 +281,7 @@ onBeforeUnmount(() => {
 function resetEditBoxOverrides() {
   editBoxWidthOverride.value = null;
   editBoxLeftOverride.value = null;
+  svgFirstGlyphLeft.value = null;
 }
 
 function stopEdgeDrag() {
@@ -263,10 +295,18 @@ function onEdgeDragStart(event: PointerEvent, edge: "left" | "right") {
   const text = selectedTextObject.value;
   const viewport = currentViewport.value;
   if (!text || !viewport || !editSession.value) return;
-  const rect = pdfRectToViewportRect(viewport, editSession.value.bbox);
   const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
-  const naturalWidth = Math.max(rect.width, fontSize * 4);
-  const initialLeft = editBoxLeftOverride.value ?? rect.left;
+  const m = editSession.value.matrix;
+  const textGlyphs = text.glyphs ?? [];
+  const originY = textGlyphs.length > 0 ? textGlyphs[0].y : m[5];
+  const baseline = pdfToViewport(viewport, m[4], originY);
+  const effFs = effectiveFontSize(text);
+  const sessionGlyphs = editSession.value.glyphs;
+  const totalAdvance = sessionGlyphs.length ? sessionGlyphs.reduce((s, g) => s + Math.max(g.advance, 0), 0) : 0;
+  const naturalWidth = totalAdvance > 0
+    ? Math.max(totalAdvance * effFs * viewport.zoom, fontSize * 4)
+    : fontSize * 8;
+  const initialLeft = editBoxLeftOverride.value ?? svgFirstGlyphLeft.value ?? baseline.x;
   const initialWidth = editBoxWidthOverride.value ?? naturalWidth;
   edgeDragState = { edge, startX: event.clientX, initialLeft, initialWidth };
   window.addEventListener("pointermove", onEdgeDragMove);
@@ -338,6 +378,20 @@ async function beginTextEdit(objectId: number) {
     if (currentSelection !== getSelectionToken()) return;
     status.value = `已选中文本对象 ${objectId}，可直接修改并保存`;
     await nextTick();
+    // Query the actual rendered left edge of the first SVG glyph so the editor
+    // box aligns with the character's visual pixel start regardless of whether
+    // the font's glyph origin is at the left or right side of the em square.
+    svgFirstGlyphLeft.value = null;
+    // Per-glyph path uses <g data-object-id>; legacy path uses clip-path attribute.
+    const gEl =
+      document.querySelector<SVGElement>(`[data-object-id="${objectId}"] text`) ??
+      document.querySelector<SVGElement>(`text[clip-path="url(#clip-text-${objectId})"]`);
+    const canvasEl = document.querySelector<HTMLElement>(".page-canvas");
+    if (gEl && canvasEl) {
+      const gRect = gEl.getBoundingClientRect();
+      const canvasRect = canvasEl.getBoundingClientRect();
+      svgFirstGlyphLeft.value = gRect.left - canvasRect.left;
+    }
     inlineEditor.value?.focus();
     inlineEditor.value?.select();
   } catch (error) {
@@ -367,7 +421,7 @@ function onInlineEditorKeydown(event: KeyboardEvent) {
     clearSelection();
     return;
   }
-  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+  if (event.key === "Enter") {
     event.preventDefault();
     void saveTextEdit({ closeAfterSave: true });
   }
@@ -1021,9 +1075,10 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
               title="拖拽调整编辑框宽度"
               @pointerdown.prevent.stop="onEdgeDragStart($event, 'left')"
             />
-            <textarea
+            <input
               ref="inlineEditor"
               v-model="draftText"
+              type="text"
               class="inline-text-editor"
               :class="{ overflow: hasEffectiveOverflow }"
               :style="inlineEditorStyle"
