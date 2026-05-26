@@ -2,11 +2,11 @@ use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream, StringFormat};
 use pdfeditor_core::{
     open_lopdf_document_from_bytes, page_background_png_from_pdf_bytes,
-    page_structure_from_pdf_bytes, save_pdf_document_to_bytes, write_page_structure_pdf,
-    write_pdf_background_png, write_pdf_page_images, BackgroundRenderOptions, Color,
-    DocumentSession, EngineDocument, LopdfEngine, MockPdfEngine, OpenOptions, PageBitmapCache,
-    PageIndex, PageInfo, PageStructure, Point, Rect, RenderedPage, ResourceBudget, SaveOptions,
-    Size, StructuredTextObject, TextObjectId, TextRun, TextStyle,
+    page_font_assets_from_pdf_bytes, page_structure_from_pdf_bytes, save_pdf_document_to_bytes,
+    write_page_structure_pdf, write_pdf_background_png, write_pdf_page_images,
+    BackgroundRenderOptions, Color, DocumentSession, EngineDocument, LopdfEngine, MockPdfEngine,
+    OpenOptions, PageBitmapCache, PageIndex, PageInfo, PageStructure, Point, Rect, RenderedPage,
+    ResourceBudget, SaveOptions, Size, StructuredTextObject, TextObjectId, TextRun, TextStyle,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -52,6 +52,38 @@ fn records_text_edits_and_clears_dirty_state_after_save() {
 
     assert!(!session.is_dirty());
     assert!(target.exists());
+}
+
+#[test]
+fn converts_embedded_type1_fonts_to_browser_loadable_opentype() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("gpt.pdf");
+    let bytes = fs::read(path).expect("read gpt.pdf fixture");
+    let fonts = page_font_assets_from_pdf_bytes(&bytes, PageIndex(0)).unwrap();
+    let converted = fonts
+        .iter()
+        .filter(|font| matches!(font.resource_name.as_str(), "F101" | "F92" | "F29" | "F62"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(converted.len(), 4);
+    for font in converted {
+        assert_eq!(font.format, "opentype", "{}", font.resource_name);
+        assert_eq!(font.mime_type, "font/otf", "{}", font.resource_name);
+        assert_eq!(&font.bytes[0..4], b"OTTO", "{}", font.resource_name);
+        assert!(
+            sfnt_table(&font.bytes, b"CFF ").is_some(),
+            "{} should contain a CFF table",
+            font.resource_name
+        );
+        assert!(
+            sfnt_table(&font.bytes, b"cmap").is_some(),
+            "{} should contain a Unicode cmap",
+            font.resource_name
+        );
+    }
 }
 
 #[test]
@@ -471,10 +503,7 @@ fn lopdf_backend_groups_consecutive_text_for_editing() {
     assert_eq!(session.original_text, "Go to www.example.test now");
     assert_eq!(preview.group_object_ids.len(), 3);
     assert_eq!(preview.text, "Go to openai.com now");
-    assert_eq!(
-        preview.glyphs.len(),
-        "Go to openai.com now".chars().count()
-    );
+    assert_eq!(preview.glyphs.len(), "Go to openai.com now".chars().count());
 }
 
 #[test]
@@ -508,7 +537,10 @@ fn lopdf_backend_advances_consecutive_structured_text_runs() {
     assert_eq!(structure.text.len(), 1);
     assert_eq!(structure.text[0].content, "Go to www.example.test now");
     assert!(structure.text[0].bounds.size.width > 0.0);
-    assert_eq!(structure.text[0].glyphs.len(), "Go to www.example.test now".chars().count());
+    assert_eq!(
+        structure.text[0].glyphs.len(),
+        "Go to www.example.test now".chars().count()
+    );
 }
 
 #[test]
@@ -803,7 +835,10 @@ fn lopdf_backend_preserves_hex_unicode_text_when_updating_chinese() {
     let texts = reopened.text_objects(PageIndex(0)).unwrap();
     let structured = reopened.page_structure(PageIndex(0)).unwrap().text;
     // scatter stores one char per text object; font_size is on each individual char
-    let first_char = texts.iter().next().expect("expected scattered text objects");
+    let first_char = texts
+        .iter()
+        .next()
+        .expect("expected scattered text objects");
     // page_structure uses merged_structured_text which groups adjacent scattered chars
     let updated_structured = structured
         .iter()
@@ -888,10 +923,8 @@ fn lopdf_backend_uses_narrow_advances_for_ascii_inside_cjk_text() {
     let page_dict = updated_pdf.get_dictionary(page_id).unwrap();
     let resources = test_dictionary_from_object(&updated_pdf, page_dict.get(b"Resources").unwrap());
     let fonts = test_dictionary_from_object(&updated_pdf, resources.get(b"Font").unwrap());
-    let fallback_font = test_dictionary_from_object(
-        &updated_pdf,
-        fonts.get(b"PdfEditorFallbackCjk").unwrap(),
-    );
+    let fallback_font =
+        test_dictionary_from_object(&updated_pdf, fonts.get(b"PdfEditorFallbackCjk").unwrap());
     let descendant = fallback_font
         .get(b"DescendantFonts")
         .unwrap()
@@ -903,9 +936,15 @@ fn lopdf_backend_uses_narrow_advances_for_ascii_inside_cjk_text() {
     let fallback_widths = descendant.get(b"W").unwrap().as_array().unwrap();
     let ascii_widths = fallback_widths[1].as_array().unwrap();
     assert_eq!(test_integer(&fallback_widths[0]), 0);
-    assert!(test_integer(&ascii_widths[b'l' as usize]) < test_integer(&ascii_widths[b'A' as usize]));
-    assert!(test_integer(&ascii_widths[b'/' as usize]) < test_integer(&ascii_widths[b'A' as usize]));
-    assert!(test_integer(&ascii_widths[b'W' as usize]) > test_integer(&ascii_widths[b'A' as usize]));
+    assert!(
+        test_integer(&ascii_widths[b'l' as usize]) < test_integer(&ascii_widths[b'A' as usize])
+    );
+    assert!(
+        test_integer(&ascii_widths[b'/' as usize]) < test_integer(&ascii_widths[b'A' as usize])
+    );
+    assert!(
+        test_integer(&ascii_widths[b'W' as usize]) > test_integer(&ascii_widths[b'A' as usize])
+    );
 
     let content = Content::decode(&updated_pdf.get_page_content(page_id).unwrap()).unwrap();
     let mut active_font = String::new();
@@ -1575,4 +1614,23 @@ fn test_integer(object: &Object) -> i64 {
         Object::Integer(value) => *value,
         _ => panic!("expected integer object"),
     }
+}
+
+fn sfnt_table<'a>(data: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
+    if data.len() < 12 {
+        return None;
+    }
+    let num_tables = u16::from_be_bytes([data[4], data[5]]) as usize;
+    for index in 0..num_tables {
+        let record = 12 + index * 16;
+        if data.get(record..record + 4)? != tag {
+            continue;
+        }
+        let offset =
+            u32::from_be_bytes(data.get(record + 8..record + 12)?.try_into().ok()?) as usize;
+        let length =
+            u32::from_be_bytes(data.get(record + 12..record + 16)?.try_into().ok()?) as usize;
+        return data.get(offset..offset + length);
+    }
+    None
 }
