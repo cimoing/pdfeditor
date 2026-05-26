@@ -1128,16 +1128,17 @@ impl LopdfDocument {
                         page.0,
                         operation_index as u32,
                     )));
+                    let font_size = round_pdf_value(state.font_size);
                     let bounds = Rect::new(
-                        state.x,
-                        state.y,
-                        estimate_text_width(&text, state.font_size),
-                        state.font_size * 1.2,
+                        round_pdf_value(state.x),
+                        round_pdf_value(state.y),
+                        estimate_text_width(&text, font_size),
+                        round_pdf_value(font_size * 1.2),
                     );
                     let run = TextRun::new(
                         text.clone(),
                         state.font_name.clone(),
-                        state.font_size,
+                        font_size,
                         state.color,
                     );
                     objects.push(TextObject {
@@ -1146,7 +1147,7 @@ impl LopdfDocument {
                         bounds,
                         content: text,
                         font_name: state.font_name.clone(),
-                        font_size: state.font_size,
+                        font_size,
                         color: state.color,
                         runs: vec![run],
                     });
@@ -1583,6 +1584,7 @@ impl LopdfDocument {
                     operation_index as u32,
                 )));
                 let transform = text_render_transform(&state);
+                let font_size = round_pdf_value(state.text.font_size);
                 let layout_context = TextLayoutContext {
                     page,
                     object: StructuredTextObject {
@@ -1590,7 +1592,7 @@ impl LopdfDocument {
                         bounds: Rect::new(0.0, 0.0, 0.0, 0.0),
                         content: text.clone(),
                         font_name: state.text.font_name.clone(),
-                        font_size: state.text.font_size,
+                        font_size,
                         color: state.text.color,
                         stroke_color: state.text.stroke_color,
                         stroke_width: state.text.stroke_width,
@@ -1617,7 +1619,8 @@ impl LopdfDocument {
                 let bounds = operation_text_advance(operation, metrics, &state.text)
                     .or_else(|| (!glyphs.is_empty()).then_some(width))
                     .map(|width| bounds_for_text_width(width, transform))
-                    .unwrap_or_else(|| bounds_for_text(&text, state.text.font_size, transform));
+                    .unwrap_or_else(|| bounds_for_text(&text, font_size, transform));
+                let bounds = round_rect(bounds);
                 let punct_width_squeeze = match (font_map, metrics) {
                     (Some(fm), Some(m)) => font_has_punct_width_squeeze(m, fm),
                     _ => false,
@@ -1634,7 +1637,7 @@ impl LopdfDocument {
                     bounds,
                     content: text.clone(),
                     font_name: state.text.font_name.clone(),
-                    font_size: state.text.font_size,
+                    font_size,
                     color: state.text.color,
                     stroke_color: state.text.stroke_color,
                     stroke_width: state.text.stroke_width,
@@ -1652,7 +1655,7 @@ impl LopdfDocument {
                     runs: vec![TextRun::new(
                         text,
                         state.text.font_name.clone(),
-                        state.text.font_size,
+                        font_size,
                         state.text.color,
                     )],
                 });
@@ -3687,7 +3690,20 @@ fn bounds_for_text(content: &str, font_size: f32, transform: [f32; 6]) -> Rect {
 }
 
 fn bounds_for_text_width(width: f32, transform: [f32; 6]) -> Rect {
-    transformed_rect_bounds(transform, width.max(0.0), 1.2)
+    round_rect(transformed_rect_bounds(transform, width.max(0.0), 1.2))
+}
+
+fn round_pdf_value(value: f32) -> f32 {
+    (value * 100.0).round() / 100.0
+}
+
+fn round_rect(rect: Rect) -> Rect {
+    Rect::new(
+        round_pdf_value(rect.origin.x),
+        round_pdf_value(rect.origin.y),
+        round_pdf_value(rect.size.width),
+        round_pdf_value(rect.size.height),
+    )
 }
 
 fn merge_text_group_objects(
@@ -3844,16 +3860,17 @@ fn build_text_edit_group(page: PageIndex, members: &[StructuredTextObject]) -> T
         .iter()
         .map(|member| member.font_size)
         .fold(first.font_size, f32::max);
+    let font_size = round_pdf_value(font_size);
 
     TextEditGroup {
         page,
         member_ids: members.iter().map(|member| member.id).collect(),
-        bounds: Rect::new(
+        bounds: round_rect(Rect::new(
             left,
             bottom,
             (right - left).max(0.0),
             (top - bottom).max(0.0),
-        ),
+        )),
         matrix: first.transform,
         font_name,
         font_size,
@@ -3865,11 +3882,10 @@ fn can_join_text_edit_group(
     next: &StructuredTextObject,
     baseline_gap: Option<f32>,
 ) -> bool {
-    let y_tolerance = previous.font_size.max(next.font_size) * 0.35 + 1.0;
-    if (previous.transform[5] - next.transform[5]).abs() > y_tolerance {
+    if round_pdf_value(previous.transform[5]) != round_pdf_value(next.transform[5]) {
         return false;
     }
-    if (previous.font_size - next.font_size).abs() > 1.0 {
+    if round_pdf_value(previous.font_size) != round_pdf_value(next.font_size) {
         return false;
     }
     let gap = text_group_gap(previous, next);
@@ -3877,19 +3893,19 @@ fn can_join_text_edit_group(
     if gap < -max_overlap {
         return false;
     }
-    let max_gap = previous.font_size.max(next.font_size) * 2.0;
+    let max_gap = previous.font_size.max(next.font_size) * 0.95;
     if gap > max_gap {
         return false;
     }
     if let Some(expected_gap) = baseline_gap {
-        let tolerance = previous.font_size.max(next.font_size) * 0.4 + 1.0;
+        let tolerance = previous.font_size.max(next.font_size) * 0.25;
         return (gap - expected_gap).abs() <= tolerance;
     }
     true
 }
 
 fn text_group_gap(previous: &StructuredTextObject, next: &StructuredTextObject) -> f32 {
-    next.bounds.origin.x - (previous.bounds.origin.x + previous.bounds.size.width)
+    round_pdf_value(next.bounds.origin.x - (previous.bounds.origin.x + previous.bounds.size.width))
 }
 
 fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, f32) {
@@ -4447,7 +4463,7 @@ fn normalized_color_channel(value: f32) -> u8 {
 }
 
 fn estimate_text_width(content: &str, font_size: f32) -> f32 {
-    content.chars().count() as f32 * font_size.max(1.0) * 0.6
+    round_pdf_value(content.chars().count() as f32 * font_size.max(1.0) * 0.6)
 }
 
 fn estimated_unicode_width_units(code: u32) -> f32 {
