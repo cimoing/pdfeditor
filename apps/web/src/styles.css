@@ -100,8 +100,7 @@ h2 {
   cursor: pointer;
 }
 
-.editor-panel,
-.text-list {
+.editor-panel {
   border-top: 1px solid #d6dce2;
   padding-top: 16px;
 }
@@ -162,27 +161,6 @@ textarea {
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
-}
-
-.text-list {
-  display: grid;
-  gap: 6px;
-}
-
-.text-list button {
-  overflow: hidden;
-  padding: 7px 9px;
-  border: 1px solid #d6dce2;
-  background: #fff;
-  text-align: left;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  cursor: pointer;
-}
-
-.text-list button.selected {
-  border-color: #1f6feb;
-  background: #edf4ff;
 }
 
 .canvas-pane {

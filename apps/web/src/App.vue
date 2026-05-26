@@ -53,7 +53,7 @@ const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 // ── Edit-box resize state ──────────────────────────────────────────────────
 /** Width override in viewport pixels set by dragging the right edge. */
 const editBoxWidthOverride = ref<number | null>(null);
-/** Left offset override in viewport pixels set by dragging the left edge. */
+/** Local x-axis offset override in viewport pixels set by dragging the left edge. */
 const editBoxLeftOverride = ref<number | null>(null);
 /**
  * Canvas-relative left pixel position of the first rendered SVG glyph for the
@@ -66,21 +66,17 @@ const svgFirstGlyphLeft = ref<number | null>(null);
 interface EdgeDragState {
   edge: "left" | "right";
   startX: number;
+  startY: number;
+  axisX: { x: number; y: number };
   initialLeft: number;
   initialWidth: number;
 }
 let edgeDragState: EdgeDragState | null = null;
-const textCount = computed(() => page.value?.text.length ?? 0);
-const imageCount = computed(() => page.value?.images.length ?? 0);
-const pageTextObjects = computed(() => page.value?.text ?? []);
 const renderImageObjects = computed(() => page.value?.images.filter((image) => image.objectUrl) ?? []);
 
 const selectedTextObject = computed<StructuredTextObject | null>(
   () => page.value?.text.find((item) => item.id === selectedTextId.value) ?? null
 );
-const activeGroupObjectIds = computed(() => {
-  return selectedTextId.value != null ? [selectedTextId.value] : [];
-});
 const selectedFontUsage = computed(() =>
   describePdfFontUsage(editSession.value?.font_id ?? selectedTextObject.value?.font_name ?? null, fontFamilies.value)
 );
@@ -183,30 +179,55 @@ const previewGlyphRects = computed(() => {
   }));
 });
 
-/** Layout styles (position, size) for the editor wrapper div. */
-const inlineEditorWrapStyle = computed(() => {
-  const text = selectedTextObject.value;
+interface InlineEditorGeometry {
+  fontSize: number;
+  naturalWidth: number;
+  origin: { x: number; y: number };
+  axisX: { x: number; y: number };
+  axisY: { x: number; y: number };
+}
+
+function vectorLength(vector: { x: number; y: number }) {
+  return Math.hypot(vector.x, vector.y);
+}
+
+function normalizeVector(vector: { x: number; y: number }, fallback: { x: number; y: number }) {
+  const length = vectorLength(vector);
+  if (length < 0.0001) return fallback;
+  return { x: vector.x / length, y: vector.y / length };
+}
+
+function isNearlyHorizontal(axisX: { x: number; y: number }, axisY: { x: number; y: number }) {
+  return Math.abs(axisX.y) < 0.01 && Math.abs(axisY.x) < 0.01;
+}
+
+function inlineEditorGeometry(text: StructuredTextObject): InlineEditorGeometry | null {
   const viewport = currentViewport.value;
-  if (!text || !viewport || !editSession.value) return {};
+  const session = editSession.value;
+  if (!viewport || !session) return null;
+
   const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
+  const matrix = session.matrix;
+  const firstGlyph = text.glyphs?.[0] ?? null;
+  const baseline = firstGlyph
+    ? pdfToViewport(viewport, firstGlyph.x, firstGlyph.y)
+    : pdfToViewport(viewport, matrix[4], matrix[5]);
 
-  // Position: layoutPreview.glyphs covers the full edit group (same data the SVG uses
-  // when a preview is active). Fall back to text.glyphs[0] or matrix translation.
-  // editSession.bbox can be degenerate (full-page) for some PDFs, so we avoid it.
-  const m = editSession.value.matrix;
-  const textGlyphs = text.glyphs ?? [];
-  const firstGlyph = textGlyphs[0] ?? null;
-  const originY = firstGlyph ? firstGlyph.y : m[5];
-  const baseline = pdfToViewport(viewport, m[4], originY);
-  // svgFirstGlyphLeft is set from DOM after render and reflects the actual visual
-  // pixel left edge of the character (independent of the font's glyph-origin convention).
-  const inputLeft = svgFirstGlyphLeft.value ?? baseline.x;
-  const inputTop = baseline.y - fontSize;
+  const xEnd = pdfToViewport(viewport, matrix[4] + matrix[0], matrix[5] + matrix[1]);
+  const downEnd = pdfToViewport(viewport, matrix[4] - matrix[2], matrix[5] - matrix[3]);
+  const matrixOrigin = pdfToViewport(viewport, matrix[4], matrix[5]);
+  const axisX = normalizeVector({ x: xEnd.x - matrixOrigin.x, y: xEnd.y - matrixOrigin.y }, { x: 1, y: 0 });
+  const axisY = normalizeVector({ x: downEnd.x - matrixOrigin.x, y: downEnd.y - matrixOrigin.y }, { x: 0, y: 1 });
+  const visualBaseline = isNearlyHorizontal(axisX, axisY) && svgFirstGlyphLeft.value != null
+    ? { x: svgFirstGlyphLeft.value, y: baseline.y }
+    : baseline;
+  const origin = {
+    x: visualBaseline.x - axisY.x * fontSize,
+    y: visualBaseline.y - axisY.y * fontSize
+  };
 
-  // Width: sum of glyph advances (in em units) × viewport font size.
-  // editSession.glyphs carry the advance widths; fall back to 8-char estimate.
   const effFs = effectiveFontSize(text);
-  const sessionGlyphs = editSession.value.glyphs;
+  const sessionGlyphs = session.glyphs;
   const totalAdvance = sessionGlyphs.length
     ? sessionGlyphs.reduce((s, g) => s + Math.max(g.advance, 0), 0)
     : 0;
@@ -214,10 +235,33 @@ const inlineEditorWrapStyle = computed(() => {
     ? Math.max(totalAdvance * effFs * viewport.zoom, fontSize * 4)
     : fontSize * 8;
 
+  return { fontSize, naturalWidth, origin, axisX, axisY };
+}
+
+/** Layout styles (position, size) for the editor wrapper div. */
+const inlineEditorWrapStyle = computed(() => {
+  const text = selectedTextObject.value;
+  if (!text) return {};
+  const geometry = inlineEditorGeometry(text);
+  if (!geometry) return {};
+  const startOffset = editBoxLeftOverride.value ?? 0;
+  const left = geometry.origin.x + geometry.axisX.x * startOffset;
+  const top = geometry.origin.y + geometry.axisX.y * startOffset;
+
   return {
-    left: `${editBoxLeftOverride.value ?? inputLeft}px`,
-    top: `${inputTop}px`,
-    width: `${editBoxWidthOverride.value ?? naturalWidth}px`
+    left: "0px",
+    top: "0px",
+    width: `${editBoxWidthOverride.value ?? geometry.naturalWidth}px`,
+    height: `${geometry.fontSize * 1.4}px`,
+    transform: `matrix(${[
+      geometry.axisX.x,
+      geometry.axisX.y,
+      geometry.axisY.x,
+      geometry.axisY.y,
+      left,
+      top
+    ].map((value) => roundSvg(value)).join(", ")})`,
+    transformOrigin: "0 0"
   };
 });
 
@@ -306,22 +350,12 @@ function stopEdgeDrag() {
 
 function onEdgeDragStart(event: PointerEvent, edge: "left" | "right") {
   const text = selectedTextObject.value;
-  const viewport = currentViewport.value;
-  if (!text || !viewport || !editSession.value) return;
-  const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
-  const m = editSession.value.matrix;
-  const textGlyphs = text.glyphs ?? [];
-  const originY = textGlyphs.length > 0 ? textGlyphs[0].y : m[5];
-  const baseline = pdfToViewport(viewport, m[4], originY);
-  const effFs = effectiveFontSize(text);
-  const sessionGlyphs = editSession.value.glyphs;
-  const totalAdvance = sessionGlyphs.length ? sessionGlyphs.reduce((s, g) => s + Math.max(g.advance, 0), 0) : 0;
-  const naturalWidth = totalAdvance > 0
-    ? Math.max(totalAdvance * effFs * viewport.zoom, fontSize * 4)
-    : fontSize * 8;
-  const initialLeft = editBoxLeftOverride.value ?? svgFirstGlyphLeft.value ?? baseline.x;
-  const initialWidth = editBoxWidthOverride.value ?? naturalWidth;
-  edgeDragState = { edge, startX: event.clientX, initialLeft, initialWidth };
+  if (!text) return;
+  const geometry = inlineEditorGeometry(text);
+  if (!geometry) return;
+  const initialLeft = editBoxLeftOverride.value ?? 0;
+  const initialWidth = editBoxWidthOverride.value ?? geometry.naturalWidth;
+  edgeDragState = { edge, startX: event.clientX, startY: event.clientY, axisX: geometry.axisX, initialLeft, initialWidth };
   window.addEventListener("pointermove", onEdgeDragMove);
   window.addEventListener("pointerup", onEdgeDragEnd);
   event.preventDefault();
@@ -330,10 +364,12 @@ function onEdgeDragStart(event: PointerEvent, edge: "left" | "right") {
 function onEdgeDragMove(event: PointerEvent) {
   if (!edgeDragState) return;
   const dx = event.clientX - edgeDragState.startX;
+  const dy = event.clientY - edgeDragState.startY;
+  const delta = dx * edgeDragState.axisX.x + dy * edgeDragState.axisX.y;
   if (edgeDragState.edge === "right") {
-    editBoxWidthOverride.value = Math.max(40, edgeDragState.initialWidth + dx);
+    editBoxWidthOverride.value = Math.max(40, edgeDragState.initialWidth + delta);
   } else {
-    const newWidth = Math.max(40, edgeDragState.initialWidth - dx);
+    const newWidth = Math.max(40, edgeDragState.initialWidth - delta);
     editBoxWidthOverride.value = newWidth;
     editBoxLeftOverride.value = edgeDragState.initialLeft + (edgeDragState.initialWidth - newWidth);
   }
@@ -649,11 +685,6 @@ function exportCurrentPdf() {
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-function textObjectLabel(text: StructuredTextObject) {
-  const normalized = text.content.replace(/\s+/g, " ").trim();
-  return normalized || `文本对象 ${text.id}`;
-}
-
 function svgTextTransform(text: StructuredTextObject) {
   const viewport = currentViewport.value;
   if (!viewport) return "";
@@ -879,13 +910,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 
       <p class="status">{{ status }}</p>
 
-      <section v-if="page" class="render-summary">
-        <h2>渲染摘要</h2>
-        <div>SVG 文本对象：{{ textCount }}</div>
-        <div>背景图片对象：{{ imageCount }}</div>
-        <div>旋转角度：{{ page.page.rotation ?? 0 }}°</div>
-      </section>
-
       <section v-if="selectedTextObject" class="editor-panel">
         <h2>文本编辑</h2>
         <div class="object-id">对象 ID：{{ selectedTextObject.id }}</div>
@@ -920,18 +944,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
         </button>
       </section>
 
-      <section v-if="pageTextObjects.length" class="text-list">
-        <h2>文本对象列表</h2>
-        <button
-          v-for="text in pageTextObjects"
-          :key="text.id"
-          :class="{ selected: activeGroupObjectIds.includes(text.id) }"
-          :title="text.content"
-          @click="beginTextEdit(text.id)"
-        >
-          {{ textObjectLabel(text) }}
-        </button>
-      </section>
     </aside>
 
     <section class="canvas-pane">
