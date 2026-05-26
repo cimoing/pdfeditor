@@ -492,6 +492,12 @@ impl EngineDocument for LopdfDocument {
         // Search backwards from the first targeted op for the opening BT, and
         // forwards from the last targeted op for the closing ET.
         //
+        // IMPORTANT: only apply the clip when the BT..ET block contains *only*
+        // the targeted text-drawing operations.  If other Tj/TJ ops are present
+        // in the same BT..ET block (a common PDF structure where many objects
+        // share a single text block), wrapping the whole block with a narrow clip
+        // rect would make every non-targeted text object invisible.
+        //
         // Use the most-accurate clip bounds: if the text already has a `clip_bounds`
         // from a prior overflow save, preserve that (it represents the truly-original
         // text width); otherwise fall back to the current accurate per-metrics bounds.
@@ -513,10 +519,28 @@ impl EngineDocument for LopdfDocument {
                 .position(|op| op.operator == "ET")
                 .map(|rel| rel + last)
         });
-        // Only clip when both markers are present and in the correct order.
+        // Only clip when both markers are present, in the correct order, AND the
+        // BT..ET block contains no non-targeted text-drawing operations.
+        let text_drawing_ops: HashSet<&str> =
+            ["Tj", "TJ", "'", "\""].iter().copied().collect();
         let (clip_open_before_bt, clip_close_after_et) =
             match (clip_open_before_bt, clip_close_after_et) {
-                (Some(bt), Some(et)) if bt < et => (Some(bt), Some(et)),
+                (Some(bt), Some(et)) if bt < et => {
+                    // Check: are there any Tj/TJ/etc. operations between bt..=et
+                    // that are NOT in the targeted set?
+                    let has_non_targeted_text = content.operations[bt..=et]
+                        .iter()
+                        .enumerate()
+                        .any(|(rel_idx, op)| {
+                            text_drawing_ops.contains(op.operator.as_str())
+                                && !targeted_operation_indexes.contains_key(&(bt + rel_idx))
+                        });
+                    if has_non_targeted_text {
+                        (None, None)
+                    } else {
+                        (Some(bt), Some(et))
+                    }
+                }
                 _ => (None, None),
             };
 
