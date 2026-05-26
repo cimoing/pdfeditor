@@ -527,6 +527,33 @@ fn lopdf_backend_commits_grouped_text_edits_across_operations() {
 }
 
 #[test]
+fn lopdf_backend_preserves_following_relative_text_after_group_edit() {
+    let source = write_lopdf_relative_text_block_pdf("lopdf-relative-after-edit");
+    let bytes = fs::read(source).unwrap();
+    let mut document = open_lopdf_document_from_bytes(&bytes).unwrap();
+    let object = document
+        .page_structure(PageIndex(0))
+        .unwrap()
+        .text
+        .into_iter()
+        .find(|object| object.content.starts_with("2 "))
+        .expect("line 2 text");
+
+    document
+        .update_text_object(object.id, "2 Business name changed".to_string(), None)
+        .unwrap();
+
+    let updated = document.page_structure(PageIndex(0)).unwrap();
+    let following = updated
+        .text
+        .iter()
+        .find(|object| object.content.starts_with("3a "))
+        .expect("following relative line");
+    assert!((following.transform[4] - 61.6).abs() < 0.01);
+    assert!((following.transform[5] - 627.973).abs() < 0.01);
+}
+
+#[test]
 fn lopdf_backend_advances_consecutive_structured_text_runs() {
     let source = write_lopdf_consecutive_text_runs_pdf("lopdf-consecutive-runs");
     let engine = LopdfEngine;
@@ -1525,6 +1552,82 @@ fn write_lopdf_consecutive_text_runs_pdf(name: &str) -> PathBuf {
                 ])],
             ),
             Operation::new("Tj", vec![Object::string_literal("now")]),
+            Operation::new("ET", vec![]),
+        ],
+    };
+    let content_id = document.add_object(Stream::new(
+        dictionary! {},
+        content.encode().expect("encode PDF content stream"),
+    ));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(300), Object::Integer(300)],
+    });
+    document.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    document.compress();
+    document.save(&path).expect("save generated PDF");
+    path
+}
+
+fn write_lopdf_relative_text_block_pdf(name: &str) -> PathBuf {
+    let path = temp_path(name, "pdf");
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let font_id = document.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "FirstChar" => 0,
+        "Widths" => Object::Array((0..=255).map(|_| Object::Integer(600)).collect()),
+    });
+    let resources_id = document.add_object(dictionary! {
+        "Font" => dictionary! {
+            "F1" => font_id,
+        },
+    });
+    let content = Content {
+        operations: vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), Object::Integer(7)]),
+            Operation::new(
+                "Tm",
+                vec![
+                    Object::Integer(7),
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(7),
+                    Object::Real(61.6),
+                    Object::Real(651.969),
+                ],
+            ),
+            Operation::new("Tj", vec![Object::string_literal("2")]),
+            Operation::new(
+                "Tj",
+                vec![Object::string_literal(
+                    " Business name/disregarded entity name",
+                )],
+            ),
+            Operation::new("Td", vec![Object::Integer(0), Object::Real(-3.428)]),
+            Operation::new(
+                "Tj",
+                vec![Object::string_literal("3a Check the appropriate box")],
+            ),
             Operation::new("ET", vec![]),
         ],
     };

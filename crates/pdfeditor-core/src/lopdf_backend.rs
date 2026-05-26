@@ -466,6 +466,23 @@ impl EngineDocument for LopdfDocument {
         } else {
             None
         };
+        let whole_operation_replacements = if !use_group_fallback && !needs_char_fallback {
+            member_plans
+                .iter()
+                .zip(segments.iter())
+                .map(|(member, segment)| {
+                    replacement_text_object(
+                        &member.template,
+                        segment.clone(),
+                        member.font_map.as_ref(),
+                    )
+                    .map(|object| (member.id, object))
+                })
+                .collect::<Result<HashMap<_, _>, _>>()
+                .ok()
+        } else {
+            None
+        };
         let segment_map = member_plans
             .iter()
             .zip(segments)
@@ -610,6 +627,20 @@ impl EngineDocument for LopdfDocument {
                 let member_plan = member_map.get(member_id).ok_or_else(|| {
                     CoreError::NotFound(format!("text object {}", (((*member_id).0).0)))
                 })?;
+                if let Some(replacements) = whole_operation_replacements.as_ref() {
+                    if let Some(replacement_object) = replacements.get(member_id).cloned() {
+                        let tj_index = rebuilt_operations.len();
+                        rebuilt_operations.push(Operation::new("Tj", vec![replacement_object]));
+                        updated_member_ids.insert(
+                            *member_id,
+                            TextObjectId(PdfObjectId(encode_text_object_id(
+                                edit_group.page.0,
+                                tj_index as u32,
+                            ))),
+                        );
+                        continue;
+                    }
+                }
                 let replacement_segment = segment_map.get(member_id).cloned().ok_or_else(|| {
                     CoreError::Engine("missing replacement segment for grouped text".to_string())
                 })?;
