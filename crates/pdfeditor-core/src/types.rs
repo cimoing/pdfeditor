@@ -252,6 +252,14 @@ pub struct LayoutGlyph {
     pub advance: f32,
     pub width: f32,
     pub bbox: Rect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg_fill_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg_stroke_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg_stroke_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg_transform: Option<[f32; 6]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

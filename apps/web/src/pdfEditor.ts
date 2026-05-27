@@ -126,6 +126,10 @@ export interface LayoutGlyph {
   advance: number;
   width: number;
   bbox: Rect;
+  svg_fill_path?: string | null;
+  svg_stroke_path?: string | null;
+  svg_stroke_width?: number | null;
+  svg_transform?: [number, number, number, number, number, number] | null;
 }
 
 export interface TextEditSessionInfo {
@@ -413,6 +417,10 @@ function normalizeLayoutGlyphs(glyphs: LayoutGlyph[] | undefined): LayoutGlyph[]
   return glyphs?.map((glyph) => ({
     ...glyph,
     font_name: glyph.font_name ?? null,
+    svg_fill_path: glyph.svg_fill_path ?? null,
+    svg_stroke_path: glyph.svg_stroke_path ?? null,
+    svg_stroke_width: glyph.svg_stroke_width ?? null,
+    svg_transform: glyph.svg_transform ?? null,
     ch: normalizeCompatibilityText(glyph.ch)
   })) ?? [];
 }

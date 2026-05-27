@@ -828,6 +828,23 @@ function svgGlyphTransform(glyph: LayoutGlyph, text: StructuredTextObject): stri
   return `matrix(${matrix.map((v) => roundSvg(v)).join(" ")})`;
 }
 
+function glyphHasSvgPath(glyph: LayoutGlyph) {
+  return Boolean(glyph.svg_fill_path || glyph.svg_stroke_path);
+}
+
+function svgGlyphPathTransform(glyph: LayoutGlyph): string {
+  const viewport = currentViewport.value;
+  if (!viewport) return "";
+  const matrix = glyph.svg_transform
+    ? multiplyMatrices(viewport.transform, glyph.svg_transform)
+    : viewport.transform;
+  return `matrix(${matrix.map((v) => roundSvg(v)).join(" ")})`;
+}
+
+function svgGlyphPathStrokeWidth(glyph: LayoutGlyph) {
+  return glyph.svg_stroke_width == null ? undefined : roundSvg(glyph.svg_stroke_width);
+}
+
 /**
  * Returns the viewport-space rect to use as the SVG clip boundary for a text
  * object.  Priority:
@@ -971,22 +988,47 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                 :data-object-id="text.id"
                 :clip-path="`url(#clip-text-${text.id})`"
               >
-                <text
+                <template
                   v-for="(glyph, glyphIndex) in (glyphsForSvg(text) ?? [])"
                   :key="`glyph-${text.id}-${glyphIndex}`"
-                  :transform="svgGlyphTransform(glyph, text)"
-                  :font-family="svgFontFamily(glyph.font_name ?? text.font_name)"
-                  :font-weight="fontWeightFor(glyph.font_name ?? text.font_name)"
-                  :fill="svgFill(text)"
-                  :stroke="svgStroke(text)"
-                  :stroke-width="svgStrokeWidth(text)"
-                  :paint-order="svgPaintOrder(text)"
-                  :style="svgFontFeatureSettings(text) ? { fontFeatureSettings: svgFontFeatureSettings(text) } : undefined"
-                  font-size="1"
-                  dominant-baseline="alphabetic"
-                  @pointerdown.stop
-                  @click.stop="beginTextEdit(text.id)"
-                >{{ glyph.ch }}</text>
+                >
+                  <g
+                    v-if="glyphHasSvgPath(glyph)"
+                    :transform="svgGlyphPathTransform(glyph)"
+                    @pointerdown.stop
+                    @click.stop="beginTextEdit(text.id)"
+                  >
+                    <path
+                      v-if="glyph.svg_fill_path"
+                      :d="glyph.svg_fill_path"
+                      :fill="svgFill(text)"
+                      stroke="none"
+                      fill-rule="nonzero"
+                    />
+                    <path
+                      v-if="glyph.svg_stroke_path"
+                      :d="glyph.svg_stroke_path"
+                      fill="none"
+                      :stroke="svgStroke(text) === 'none' ? svgFill(text) : svgStroke(text)"
+                      :stroke-width="svgGlyphPathStrokeWidth(glyph)"
+                    />
+                  </g>
+                  <text
+                    v-else
+                    :transform="svgGlyphTransform(glyph, text)"
+                    :font-family="svgFontFamily(glyph.font_name ?? text.font_name)"
+                    :font-weight="fontWeightFor(glyph.font_name ?? text.font_name)"
+                    :fill="svgFill(text)"
+                    :stroke="svgStroke(text)"
+                    :stroke-width="svgStrokeWidth(text)"
+                    :paint-order="svgPaintOrder(text)"
+                    :style="svgFontFeatureSettings(text) ? { fontFeatureSettings: svgFontFeatureSettings(text) } : undefined"
+                    font-size="1"
+                    dominant-baseline="alphabetic"
+                    @pointerdown.stop
+                    @click.stop="beginTextEdit(text.id)"
+                  >{{ glyph.ch }}</text>
+                </template>
               </g>
               <!--
                 Legacy textLength rendering for text objects without glyph position data.

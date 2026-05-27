@@ -263,7 +263,7 @@ impl EngineDocument for LopdfDocument {
     fn page_structure(&self, page: PageIndex) -> CoreResult<PageStructure> {
         self.ensure_page(page)?;
         let page_info = self.page_info(page)?;
-        let raw_text = self.structured_text(page)?;
+        let raw_text = self.structured_text_for_render(page)?;
         // Merge scatter-group members into a single object per logical group so
         // the page structure presents one entry per editable text unit.
         let text = self.merge_structured_text_groups(raw_text);
@@ -1557,6 +1557,18 @@ impl LopdfDocument {
     }
 
     fn structured_text(&self, page: PageIndex) -> CoreResult<Vec<StructuredTextObject>> {
+        self.structured_text_impl(page, false)
+    }
+
+    fn structured_text_for_render(&self, page: PageIndex) -> CoreResult<Vec<StructuredTextObject>> {
+        self.structured_text_impl(page, true)
+    }
+
+    fn structured_text_impl(
+        &self,
+        page: PageIndex,
+        include_type3_paths: bool,
+    ) -> CoreResult<Vec<StructuredTextObject>> {
         let page_id = self.page_id(page)?;
         let content = self.decoded_page_content(page_id)?;
         let page_fonts = self.document.get_page_fonts(page_id).ok();
@@ -1565,6 +1577,7 @@ impl LopdfDocument {
         let font_feature_map = self.page_font_features(page_id);
         let mut state = PageParseState::default();
         let mut objects = Vec::new();
+        let mut type3_path_cache = HashMap::<(String, u8), Option<Type3GlyphSvgPaths>>::new();
 
         // Track the active clipping rectangle set by `q re W n … Q` sequences so we
         // can expose it as `clip_bounds` on each text object.
@@ -1615,9 +1628,11 @@ impl LopdfDocument {
                 .font_name
                 .as_ref()
                 .and_then(|name| font_metrics.get(name));
-            let is_background_only_text = state.text.font_name.as_ref().is_some_and(|font_name| {
-                is_type3_font_name(page_fonts.as_ref(), font_name) || !state.text.is_svg_safe()
-            });
+            let is_background_only_text = state
+                .text
+                .font_name
+                .as_ref()
+                .is_some_and(|_| !state.text.is_svg_safe());
             if let Some(text) = operation_text(operation, font_map) {
                 if text.is_empty() {
                     advance_page_text_state(&mut state, operation, metrics);
@@ -1663,7 +1678,20 @@ impl LopdfDocument {
                     // Not used for rendering (only for editing), set to 1.0 here.
                     tj_compression: 1.0,
                 };
-                let (glyphs, width) = layout_glyphs_tj(operation, &layout_context);
+                let (mut glyphs, width) = layout_glyphs_tj(operation, &layout_context);
+                if include_type3_paths {
+                    if let Some(font_name) = state.text.font_name.as_ref() {
+                        self.attach_type3_glyph_paths(
+                            page_fonts.as_ref(),
+                            font_name,
+                            operation,
+                            font_map,
+                            transform,
+                            &mut glyphs,
+                            &mut type3_path_cache,
+                        );
+                    }
+                }
                 let bounds = operation_text_advance(operation, metrics, &state.text)
                     .or_else(|| (!glyphs.is_empty()).then_some(width))
                     .map(|width| bounds_for_text_width(width, transform, metrics))
@@ -1772,7 +1800,6 @@ impl LopdfDocument {
     ) -> CoreResult<Vec<StructuredVisualTextObject>> {
         let page_id = self.page_id(page)?;
         let content = self.decoded_page_content(page_id)?;
-        let page_fonts = self.document.get_page_fonts(page_id).ok();
         let font_maps = self.page_font_maps(page_id);
         let font_metrics = self.page_font_metrics(page_id);
         let mut state = PageParseState::default();
@@ -1790,9 +1817,11 @@ impl LopdfDocument {
                 .font_name
                 .as_ref()
                 .and_then(|name| font_metrics.get(name));
-            let is_background_only_text = state.text.font_name.as_ref().is_some_and(|font_name| {
-                is_type3_font_name(page_fonts.as_ref(), font_name) || !state.text.is_svg_safe()
-            });
+            let is_background_only_text = state
+                .text
+                .font_name
+                .as_ref()
+                .is_some_and(|_| !state.text.is_svg_safe());
 
             if let Some(_text) = operation_text(operation, font_map) {
                 if is_background_only_text {
@@ -2192,20 +2221,33 @@ impl LopdfDocument {
 
     fn draw_background_only_text(
         &self,
-        pixmap: &mut Pixmap,
-        page_fonts: Option<&BTreeMap<Vec<u8>, &Dictionary>>,
-        font_maps: &HashMap<String, ToUnicodeMap>,
-        state: &PageParseState,
-        operation: &Operation,
-        page_height: f32,
-        scale: f32,
+        _pixmap: &mut Pixmap,
+        _page_fonts: Option<&BTreeMap<Vec<u8>, &Dictionary>>,
+        _font_maps: &HashMap<String, ToUnicodeMap>,
+        _state: &PageParseState,
+        _operation: &Operation,
+        _page_height: f32,
+        _scale: f32,
     ) -> CoreResult<bool> {
-        let Some(font_name) = state.text.font_name.as_ref() else {
-            return Ok(false);
-        };
+        // Type3 glyphs are converted to SVG paths on each LayoutGlyph so the
+        // browser can render and edit them as foreground text objects.
+        // Keeping them in the background would duplicate the visible text.
+        Ok(false)
+    }
+
+    fn attach_type3_glyph_paths(
+        &self,
+        page_fonts: Option<&BTreeMap<Vec<u8>, &Dictionary>>,
+        font_name: &str,
+        operation: &Operation,
+        font_map: Option<&ToUnicodeMap>,
+        text_transform: [f32; 6],
+        glyphs: &mut [LayoutGlyph],
+        path_cache: &mut HashMap<(String, u8), Option<Type3GlyphSvgPaths>>,
+    ) {
         let Some(font) = page_fonts.and_then(|fonts| fonts.get(font_name.as_bytes()).copied())
         else {
-            return Ok(false);
+            return;
         };
         if font
             .get(b"Subtype")
@@ -2214,53 +2256,35 @@ impl LopdfDocument {
             .as_deref()
             != Some("Type3")
         {
-            return Ok(false);
+            return;
         }
-        let decoded = font_maps
-            .get(font_name)
-            .and_then(|font_map| operation_text(operation, Some(font_map)))
-            .unwrap_or_default();
-        let raw_bytes = if decoded.is_empty() {
-            operation_text_bytes(operation).unwrap_or_default()
-        } else {
-            font_maps
-                .get(font_name)
-                .and_then(|font_map| font_map.encode(&decoded))
-                .unwrap_or_else(|| operation_text_bytes(operation).unwrap_or_default())
-        };
-        if raw_bytes.is_empty() {
-            return Ok(false);
-        }
-
         let Some(type3) = Type3FontRenderInfo::from_font(&self.document, font) else {
-            return Ok(false);
+            return;
         };
-        let transform = text_render_transform(state);
-        let mut text_cursor = 0.0f32;
-        let mut drew = false;
-        for byte in raw_bytes {
-            let Some(char_proc) = type3.char_proc(byte) else {
-                text_cursor += type3.advance(byte);
-                continue;
-            };
-            let glyph_transform = multiply_matrix(
-                transform,
-                multiply_matrix([1.0, 0.0, 0.0, 1.0, text_cursor, 0.0], type3.font_matrix),
-            );
-            if draw_type3_char_proc(
-                pixmap,
-                &char_proc,
-                glyph_transform,
-                state.text.color,
-                page_height,
-                scale,
-            )? {
-                drew = true;
-            }
-            text_cursor += type3.advance(byte);
+        let raw_bytes = type3_operation_glyph_bytes(operation, font_map);
+        if raw_bytes.len() != glyphs.len() {
+            return;
         }
-
-        Ok(drew)
+        let mut cursor = 0.0f32;
+        for (glyph, code) in glyphs.iter_mut().zip(raw_bytes) {
+            let cache_key = (font_name.to_string(), code);
+            let svg = path_cache.entry(cache_key).or_insert_with(|| {
+                type3
+                    .char_proc(code)
+                    .and_then(|char_proc| type3_char_proc_svg_paths(char_proc, type3.font_matrix))
+            });
+            if let Some(svg) = svg {
+                let glyph_transform =
+                    multiply_matrix(text_transform, [1.0, 0.0, 0.0, 1.0, cursor, 0.0]);
+                if svg.fill_path.is_some() || svg.stroke_path.is_some() {
+                    glyph.svg_fill_path = svg.fill_path.clone();
+                    glyph.svg_stroke_path = svg.stroke_path.clone();
+                    glyph.svg_stroke_width = svg.stroke_width.map(round_pdf_value);
+                    glyph.svg_transform = Some(glyph_transform);
+                }
+            }
+            cursor += type3.advance(code);
+        }
     }
 
     fn write_page_images(
@@ -2484,6 +2508,53 @@ impl PdfPath {
             }
         }
         builder.finish()
+    }
+
+    fn to_svg_path_data(&self) -> Option<String> {
+        if self.segments.is_empty() {
+            return None;
+        }
+
+        let mut data = String::new();
+        for segment in &self.segments {
+            match *segment {
+                PathSegment::MoveTo(x, y) => {
+                    data.push_str(&format!("M{} {}", round_svg_number(x), round_svg_number(y)));
+                }
+                PathSegment::LineTo(x, y) => {
+                    data.push_str(&format!("L{} {}", round_svg_number(x), round_svg_number(y)));
+                }
+                PathSegment::CurveTo(p1, p2, p3) => {
+                    data.push_str(&format!(
+                        "C{} {},{} {},{} {}",
+                        round_svg_number(p1.0),
+                        round_svg_number(p1.1),
+                        round_svg_number(p2.0),
+                        round_svg_number(p2.1),
+                        round_svg_number(p3.0),
+                        round_svg_number(p3.1)
+                    ));
+                }
+                PathSegment::Close => data.push('Z'),
+            }
+        }
+        Some(data)
+    }
+}
+
+fn round_svg_number(value: f32) -> String {
+    let rounded = round_pdf_value(value);
+    if (rounded.fract()).abs() < 0.0001 {
+        format!("{}", rounded as i32)
+    } else {
+        let mut value = format!("{rounded:.4}");
+        while value.contains('.') && value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+        value
     }
 }
 
@@ -2726,6 +2797,7 @@ fn glyph_name_to_unicode(name: &str) -> Option<String> {
     Some(ch.to_string())
 }
 
+#[allow(dead_code)]
 fn draw_type3_char_proc(
     pixmap: &mut Pixmap,
     content: &Content,
@@ -2850,6 +2922,138 @@ fn draw_type3_char_proc(
     Ok(drew)
 }
 
+#[derive(Debug, Clone, Default)]
+struct Type3GlyphSvgPaths {
+    fill_path: Option<String>,
+    stroke_path: Option<String>,
+    stroke_width: Option<f32>,
+}
+
+fn type3_char_proc_svg_paths(content: &Content, glyph_transform: [f32; 6]) -> Option<Type3GlyphSvgPaths> {
+    let mut path = PdfPath::default();
+    let mut state = Type3GraphicsState::new(glyph_transform);
+    let mut stack = Vec::new();
+    let mut fill_path = PdfPath::default();
+    let mut stroke_path = PdfPath::default();
+    let mut stroke_width = None;
+
+    for operation in &content.operations {
+        match operation.operator.as_str() {
+            "q" => stack.push(state),
+            "Q" => {
+                if let Some(previous) = stack.pop() {
+                    state = previous;
+                }
+            }
+            "cm" => {
+                if let Some(matrix) = operation_matrix(operation) {
+                    state.transform = multiply_matrix(state.transform, matrix);
+                }
+            }
+            "w" => {
+                if let Some(width) = operation.operands.first().and_then(object_to_f32) {
+                    state.line_width = width.max(0.0);
+                }
+            }
+            "m" => {
+                if let Some((x, y)) = type3_operation_point(operation, 0, 2) {
+                    let point = transform_point(state.transform, x, y);
+                    path.move_to(point.0, point.1);
+                }
+            }
+            "l" => {
+                if let Some((x, y)) = type3_operation_point(operation, 0, 2) {
+                    let point = transform_point(state.transform, x, y);
+                    path.line_to(point.0, point.1);
+                }
+            }
+            "c" => {
+                if let (Some(p1), Some(p2), Some(p3)) = (
+                    type3_operation_point(operation, 0, 6),
+                    type3_operation_point(operation, 2, 6),
+                    type3_operation_point(operation, 4, 6),
+                ) {
+                    path.curve_to(
+                        transform_point(state.transform, p1.0, p1.1),
+                        transform_point(state.transform, p2.0, p2.1),
+                        transform_point(state.transform, p3.0, p3.1),
+                    );
+                }
+            }
+            "v" => {
+                if let (Some(p2), Some(p3)) = (
+                    type3_operation_point(operation, 0, 4),
+                    type3_operation_point(operation, 2, 4),
+                ) {
+                    let current = path.current_point().unwrap_or((0.0, 0.0));
+                    path.curve_to(
+                        current,
+                        transform_point(state.transform, p2.0, p2.1),
+                        transform_point(state.transform, p3.0, p3.1),
+                    );
+                }
+            }
+            "y" => {
+                if let (Some(p1), Some(p3)) = (
+                    type3_operation_point(operation, 0, 4),
+                    type3_operation_point(operation, 2, 4),
+                ) {
+                    let p1 = transform_point(state.transform, p1.0, p1.1);
+                    let p3 = transform_point(state.transform, p3.0, p3.1);
+                    path.curve_to(p1, p3, p3);
+                }
+            }
+            "re" => {
+                if let Some([x, y, w, h]) = type3_operation_operands::<4>(operation) {
+                    let p0 = transform_point(state.transform, x, y);
+                    let p1 = transform_point(state.transform, x + w, y);
+                    let p2 = transform_point(state.transform, x + w, y + h);
+                    let p3 = transform_point(state.transform, x, y + h);
+                    path.move_to(p0.0, p0.1);
+                    path.line_to(p1.0, p1.1);
+                    path.line_to(p2.0, p2.1);
+                    path.line_to(p3.0, p3.1);
+                    path.close();
+                }
+            }
+            "h" => path.close(),
+            "n" => path.clear(),
+            "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*" | "d0" | "d1" => {
+                if matches!(operation.operator.as_str(), "s" | "b" | "b*") {
+                    path.close();
+                }
+                if matches!(
+                    operation.operator.as_str(),
+                    "f" | "F" | "f*" | "B" | "B*" | "b" | "b*"
+                ) {
+                    fill_path.segments.extend(path.segments.iter().copied());
+                }
+                if matches!(
+                    operation.operator.as_str(),
+                    "S" | "s" | "B" | "B*" | "b" | "b*"
+                ) {
+                    stroke_width = Some(type3_stroke_width(&state, 1.0));
+                    stroke_path.segments.extend(path.segments.iter().copied());
+                }
+                if matches!(
+                    operation.operator.as_str(),
+                    "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*"
+                ) {
+                    path.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let result = Type3GlyphSvgPaths {
+        fill_path: fill_path.to_svg_path_data(),
+        stroke_path: stroke_path.to_svg_path_data(),
+        stroke_width,
+    };
+    (result.fill_path.is_some() || result.stroke_path.is_some()).then_some(result)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Type3GraphicsState {
     transform: [f32; 6],
@@ -2897,6 +3101,7 @@ fn type3_operation_operand_slice(
     Some(&operation.operands[start..])
 }
 
+#[allow(dead_code)]
 fn fill_type3_path(
     pixmap: &mut Pixmap,
     path: &PdfPath,
@@ -2919,6 +3124,7 @@ fn fill_type3_path(
     true
 }
 
+#[allow(dead_code)]
 fn stroke_type3_path(
     pixmap: &mut Pixmap,
     path: &PdfPath,
@@ -4050,6 +4256,10 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
             advance,
             width: bbox.size.width,
             bbox,
+            svg_fill_path: None,
+            svg_stroke_path: None,
+            svg_stroke_width: None,
+            svg_transform: None,
         });
         cursor += advance;
     }
@@ -4145,6 +4355,10 @@ fn layout_glyphs_tj(operation: &Operation, context: &TextLayoutContext) -> (Vec<
                     advance,
                     width: bbox.size.width,
                     bbox,
+                    svg_fill_path: None,
+                    svg_stroke_path: None,
+                    svg_stroke_width: None,
+                    svg_transform: None,
                 });
                 cursor += advance;
             }
@@ -4336,6 +4550,16 @@ fn operation_text_bytes(operation: &Operation) -> Option<Vec<u8>> {
     }
 }
 
+fn type3_operation_glyph_bytes(operation: &Operation, font_map: Option<&ToUnicodeMap>) -> Vec<u8> {
+    let decoded = operation_text(operation, font_map).unwrap_or_default();
+    if !decoded.is_empty() {
+        if let Some(bytes) = font_map.and_then(|map| map.encode(&decoded)) {
+            return bytes;
+        }
+    }
+    operation_text_bytes(operation).unwrap_or_default()
+}
+
 fn operation_text_advance(
     operation: &Operation,
     metrics: Option<&FontMetrics>,
@@ -4521,21 +4745,6 @@ fn object_color_space(object: &Object) -> Option<String> {
         Object::Array(array) => array.first().and_then(object_name_bytes),
         _ => None,
     }
-}
-
-fn is_type3_font_name(
-    page_fonts: Option<&BTreeMap<Vec<u8>, &Dictionary>>,
-    font_name: &str,
-) -> bool {
-    page_fonts
-        .and_then(|fonts| fonts.get(font_name.as_bytes()).copied())
-        .is_some_and(|font| {
-            font.get(b"Subtype")
-                .ok()
-                .and_then(object_name_bytes)
-                .as_deref()
-                == Some("Type3")
-        })
 }
 
 fn object_text(object: &Object, font_map: Option<&ToUnicodeMap>) -> Option<String> {
