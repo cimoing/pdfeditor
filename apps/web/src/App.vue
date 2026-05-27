@@ -423,24 +423,30 @@ async function beginTextEdit(objectId: number) {
     if (currentSelection !== getSelectionToken()) return;
     editSession.value = session;
     draftText.value = session.original_text;
+    // Query svgFirstGlyphLeft from the original SVG render (layoutPreview is
+    // still null here, so renderTextObjects returns the page's extracted glyphs
+    // which include TJ kerning offsets).  Reading after refreshPreview would use
+    // the preview glyphs that always start at cursor=0, causing the editor to be
+    // shifted left whenever the PDF has a leading TJ displacement.
+    svgFirstGlyphLeft.value = null;
+    await nextTick();
+    {
+      // Per-glyph path uses <g data-object-id>; legacy path uses clip-path attribute.
+      const primaryId = session.group_object_ids[0] ?? objectId;
+      const gEl =
+        document.querySelector<SVGElement>(`[data-object-id="${primaryId}"] text`) ??
+        document.querySelector<SVGElement>(`text[clip-path="url(#clip-text-${primaryId})"]`);
+      const canvasEl = document.querySelector<HTMLElement>(".page-canvas");
+      if (gEl && canvasEl) {
+        const gRect = gEl.getBoundingClientRect();
+        const canvasRect = canvasEl.getBoundingClientRect();
+        svgFirstGlyphLeft.value = gRect.left - canvasRect.left;
+      }
+    }
     await refreshPreview(objectId, session.original_text, currentSelection);
     if (currentSelection !== getSelectionToken()) return;
     status.value = `已选中文本对象 ${objectId}，可直接修改并保存`;
     await nextTick();
-    // Query the actual rendered left edge of the first SVG glyph so the editor
-    // box aligns with the character's visual pixel start regardless of whether
-    // the font's glyph origin is at the left or right side of the em square.
-    svgFirstGlyphLeft.value = null;
-    // Per-glyph path uses <g data-object-id>; legacy path uses clip-path attribute.
-    const gEl =
-      document.querySelector<SVGElement>(`[data-object-id="${objectId}"] text`) ??
-      document.querySelector<SVGElement>(`text[clip-path="url(#clip-text-${objectId})"]`);
-    const canvasEl = document.querySelector<HTMLElement>(".page-canvas");
-    if (gEl && canvasEl) {
-      const gRect = gEl.getBoundingClientRect();
-      const canvasRect = canvasEl.getBoundingClientRect();
-      svgFirstGlyphLeft.value = gRect.left - canvasRect.left;
-    }
     inlineEditor.value?.focus();
     inlineEditor.value?.select();
   } catch (error) {
