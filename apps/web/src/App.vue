@@ -4,7 +4,6 @@ import type { LayoutGlyph, StructuredImageObject, StructuredTextObject } from ".
 import {
   commitTextEdit,
   describePdfFontUsage,
-  hitTestPdf,
   previewTextLayout,
   resolvePdfFontFamily,
   startTextEdit
@@ -565,19 +564,20 @@ function clampZoom(value: number) {
   return Math.min(3, Math.max(0.25, Math.round(value * 10) / 10));
 }
 
-async function onCanvasPointerDown(event: PointerEvent) {
+async function onCanvasClick(event: MouseEvent) {
   if (!pdfBytes.value || !currentViewport.value || !page.value) return;
+  if (window.getSelection()?.toString()) return;
 
   const target = event.currentTarget as HTMLElement;
   const rect = target.getBoundingClientRect();
   const offsetX = event.clientX - rect.left;
   const offsetY = event.clientY - rect.top;
   const pdfPoint = viewportToPdf(currentViewport.value, offsetX, offsetY);
+  const hitObject = findTextObjectAtPoint(pdfPoint.x, pdfPoint.y);
 
   try {
-    const hitResult = await hitTestPdf(pdfBytes.value, pageNumber.value, pdfPoint.x, pdfPoint.y, pdfHandle.value);
-    if (hitResult && hitResult.object_type === "text") {
-      await beginTextEdit(hitResult.object_id);
+    if (hitObject) {
+      await beginTextEdit(hitObject.id);
     } else if (editSession.value) {
       await saveTextEditOnBlur();
     } else {
@@ -586,6 +586,46 @@ async function onCanvasPointerDown(event: PointerEvent) {
   } catch (error) {
     console.error("Hit test failed", error);
   }
+}
+
+function findTextObjectAtPoint(pdfX: number, pdfY: number) {
+  const viewport = currentViewport.value;
+  if (!viewport || !page.value) return null;
+  const tolerance = Math.max(2 / viewport.zoom, 1);
+  const candidates = renderTextObjects.value;
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const text = candidates[index];
+    const hitBounds = intersectRects(text.bounds, text.clip_bounds) ?? text.bounds;
+    if (rectContainsPoint(hitBounds, pdfX, pdfY, tolerance)) {
+      return text;
+    }
+  }
+  return null;
+}
+
+function intersectRects(
+  first: StructuredTextObject["bounds"],
+  second: StructuredTextObject["bounds"] | null | undefined
+) {
+  if (!second) return first;
+  const left = Math.max(first.origin.x, second.origin.x);
+  const bottom = Math.max(first.origin.y, second.origin.y);
+  const right = Math.min(first.origin.x + first.size.width, second.origin.x + second.size.width);
+  const top = Math.min(first.origin.y + first.size.height, second.origin.y + second.size.height);
+  if (right < left || top < bottom) return null;
+  return {
+    origin: { x: left, y: bottom },
+    size: { width: right - left, height: top - bottom }
+  };
+}
+
+function rectContainsPoint(rect: StructuredTextObject["bounds"], x: number, y: number, tolerance = 0) {
+  return (
+    x >= rect.origin.x - tolerance &&
+    x <= rect.origin.x + rect.size.width + tolerance &&
+    y >= rect.origin.y - tolerance &&
+    y <= rect.origin.y + rect.size.height + tolerance
+  );
 }
 
 function pageViewportStyle() {
@@ -941,7 +981,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 
     <section class="canvas-pane">
       <div v-if="page && backgroundUrl && currentViewport" class="page-viewport" :style="pageViewportStyle()">
-        <div class="page-canvas" :style="pageCanvasStyle()" @pointerdown="onCanvasPointerDown">
+        <div class="page-canvas" :style="pageCanvasStyle()" @click="onCanvasClick">
           <img
             class="background"
             :style="backgroundStyle()"
@@ -1010,9 +1050,8 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                 >
                   <g
                     v-if="glyphHasSvgPath(glyph)"
+                    class="type3-glyph-path"
                     :transform="svgGlyphPathTransform(glyph)"
-                    @pointerdown.stop
-                    @click.stop="beginTextEdit(text.id)"
                   >
                     <path
                       v-if="glyph.svg_fill_path"
@@ -1041,8 +1080,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                     :style="svgFontFeatureSettings(text) ? { fontFeatureSettings: svgFontFeatureSettings(text) } : undefined"
                     font-size="1"
                     dominant-baseline="alphabetic"
-                    @pointerdown.stop
-                    @click.stop="beginTextEdit(text.id)"
                   >{{ glyph.ch }}</text>
                 </template>
               </g>
@@ -1067,8 +1104,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                 :textLength="svgTextLength(text)"
                 :lengthAdjust="svgTextLength(text) != null ? 'spacingAndGlyphs' : undefined"
                 :clip-path="`url(#clip-text-${text.id})`"
-                @pointerdown.stop
-                @click.stop="beginTextEdit(text.id)"
               >
                 <template v-if="svgTextRuns(text)">
                   <tspan
