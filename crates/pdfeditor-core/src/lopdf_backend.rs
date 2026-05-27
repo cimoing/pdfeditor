@@ -10,7 +10,10 @@ use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, StringFormat};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
-use tiny_skia::{Color as SkiaColor, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{
+    Color as SkiaColor, FillRule, IntSize, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke,
+    Transform,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct LopdfEngine;
@@ -96,7 +99,8 @@ pub fn write_pdf_page_images(
 }
 
 pub fn page_structure_from_pdf_bytes(bytes: &[u8], page: PageIndex) -> CoreResult<PageStructure> {
-    let document = open_lopdf_document_from_bytes(bytes)?;
+    let mut document = open_lopdf_document_from_bytes_unindexed(bytes)?;
+    document.ensure_text_index_for_page(page)?;
     document.page_structure(page)
 }
 
@@ -105,7 +109,7 @@ pub fn page_background_png_from_pdf_bytes(
     page: PageIndex,
     options: BackgroundRenderOptions,
 ) -> CoreResult<Vec<u8>> {
-    let document = open_lopdf_document_from_bytes(bytes)?;
+    let document = open_lopdf_document_from_bytes_unindexed(bytes)?;
     document
         .background_png_bytes(page, options)
         .map(|(png, _)| png)
@@ -116,7 +120,7 @@ pub fn page_image_png_from_pdf_bytes(
     page: PageIndex,
     image_id: ImageObjectId,
 ) -> CoreResult<Vec<u8>> {
-    let document = open_lopdf_document_from_bytes(bytes)?;
+    let document = open_lopdf_document_from_bytes_unindexed(bytes)?;
     let images = document.page_image_png_bytes(page)?;
     images
         .into_iter()
@@ -129,7 +133,7 @@ pub fn page_font_assets_from_pdf_bytes(
     bytes: &[u8],
     page: PageIndex,
 ) -> CoreResult<Vec<PageFontAsset>> {
-    let document = open_lopdf_document_from_bytes(bytes)?;
+    let document = open_lopdf_document_from_bytes_unindexed(bytes)?;
     document.page_font_assets(page)
 }
 
@@ -138,7 +142,8 @@ pub fn page_load_bundle_from_pdf_bytes(
     page: PageIndex,
     options: BackgroundRenderOptions,
 ) -> CoreResult<PageLoadBundle> {
-    let document = open_lopdf_document_from_bytes(bytes)?;
+    let mut document = open_lopdf_document_from_bytes_unindexed(bytes)?;
+    document.ensure_text_index_for_page(page)?;
     document.page_load_bundle(page, options)
 }
 
@@ -160,6 +165,20 @@ pub fn open_lopdf_document_from_bytes(bytes: &[u8]) -> CoreResult<LopdfDocument>
     };
     result.extract_text_objects()?;
     Ok(result)
+}
+
+pub fn open_lopdf_document_from_bytes_unindexed(bytes: &[u8]) -> CoreResult<LopdfDocument> {
+    let document = Document::load_mem(bytes)
+        .map_err(|err| CoreError::InvalidPdf(format!("failed to load PDF bytes: {err}")))?;
+    let page_labels = document.get_pages();
+    let pages = page_labels.values().copied().collect::<Vec<_>>();
+    Ok(LopdfDocument {
+        document,
+        pages,
+        text_objects: HashMap::new(),
+        text_refs: HashMap::new(),
+        text_edit_groups: HashMap::new(),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -266,7 +285,7 @@ impl EngineDocument for LopdfDocument {
         let raw_text = self.structured_text_for_render(page)?;
         // Merge scatter-group members into a single object per logical group so
         // the page structure presents one entry per editable text unit.
-        let text = self.merge_structured_text_groups(raw_text);
+        let text = self.merge_structured_text_groups(page, raw_text);
         let visual_text = self.structured_visual_text(page)?;
         let images = self.structured_images(page)?;
         let mut watermarks = text
@@ -1075,10 +1094,17 @@ impl LopdfDocument {
                         context.object.transform,
                         [1.0, 0.0, 0.0, 1.0, cursor, 0.0],
                     );
-                    let (descent, ascent) = context.metrics.as_ref()
+                    let (descent, ascent) = context
+                        .metrics
+                        .as_ref()
                         .map(FontMetrics::vertical_extent)
                         .unwrap_or((-0.2, 1.0));
-                    let bbox = transformed_rect_bounds_range(glyph_transform, adv.max(0.0), descent, ascent);
+                    let bbox = transformed_rect_bounds_range(
+                        glyph_transform,
+                        adv.max(0.0),
+                        descent,
+                        ascent,
+                    );
                     glyph.x = x;
                     glyph.y = y;
                     glyph.advance = adv;
@@ -1088,7 +1114,11 @@ impl LopdfDocument {
                 }
                 return Ok((
                     glyphs,
-                    bounds_for_text_width(width * factor, context.object.transform, context.metrics.as_ref()),
+                    bounds_for_text_width(
+                        width * factor,
+                        context.object.transform,
+                        context.metrics.as_ref(),
+                    ),
                 ));
             }
             return Ok((
@@ -1137,70 +1167,81 @@ impl LopdfDocument {
 
         for page_index in 0..self.pages.len() {
             let page = PageIndex(page_index as u32);
-            let page_id = self.page_id(page)?;
-            let content_bytes = self.document.get_page_content(page_id).map_err(|err| {
-                CoreError::Engine(format!("failed to read page content stream: {err}"))
-            })?;
-            let content = Content::decode(&content_bytes).map_err(|err| {
-                CoreError::Engine(format!("failed to decode content stream: {err}"))
-            })?;
-            let font_maps = self.page_font_maps(page_id);
-            let mut state = TextParseState::default();
-            let mut objects = Vec::new();
-
-            for (operation_index, operation) in content.operations.iter().enumerate() {
-                update_text_state(&mut state, operation);
-                let font_map = state
-                    .font_name
-                    .as_ref()
-                    .and_then(|name| font_maps.get(name));
-                if let Some(text) = operation_text(operation, font_map) {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let object_id = TextObjectId(PdfObjectId(encode_text_object_id(
-                        page.0,
-                        operation_index as u32,
-                    )));
-                    let font_size = round_pdf_value(state.font_size);
-                    let bounds = Rect::new(
-                        round_pdf_value(state.x),
-                        round_pdf_value(state.y),
-                        estimate_text_width(&text, font_size),
-                        round_pdf_value(font_size * 1.2),
-                    );
-                    let run = TextRun::new(
-                        text.clone(),
-                        state.font_name.clone(),
-                        font_size,
-                        state.color,
-                    );
-                    objects.push(TextObject {
-                        id: object_id,
-                        page,
-                        bounds,
-                        content: text,
-                        font_name: state.font_name.clone(),
-                        font_size,
-                        color: state.color,
-                        runs: vec![run],
-                    });
-                    self.text_refs.insert(
-                        object_id,
-                        TextObjectRef {
-                            page,
-                            operation_index,
-                            font_name: state.font_name.clone(),
-                        },
-                    );
-                }
-            }
-
-            self.text_objects.insert(page, objects);
-            let structured = self.structured_text(page)?;
-            self.register_text_edit_groups(page, &structured);
+            self.extract_text_objects_for_page(page)?;
         }
 
+        Ok(())
+    }
+
+    pub fn ensure_text_index_for_page(&mut self, page: PageIndex) -> CoreResult<()> {
+        if self.text_objects.contains_key(&page) {
+            return Ok(());
+        }
+        self.extract_text_objects_for_page(page)
+    }
+
+    fn extract_text_objects_for_page(&mut self, page: PageIndex) -> CoreResult<()> {
+        let page_id = self.page_id(page)?;
+        let content_bytes = self.document.get_page_content(page_id).map_err(|err| {
+            CoreError::Engine(format!("failed to read page content stream: {err}"))
+        })?;
+        let content = Content::decode(&content_bytes)
+            .map_err(|err| CoreError::Engine(format!("failed to decode content stream: {err}")))?;
+        let font_maps = self.page_font_maps(page_id);
+        let mut state = TextParseState::default();
+        let mut objects = Vec::new();
+
+        for (operation_index, operation) in content.operations.iter().enumerate() {
+            update_text_state(&mut state, operation);
+            let font_map = state
+                .font_name
+                .as_ref()
+                .and_then(|name| font_maps.get(name));
+            if let Some(text) = operation_text(operation, font_map) {
+                if text.is_empty() {
+                    continue;
+                }
+                let object_id = TextObjectId(PdfObjectId(encode_text_object_id(
+                    page.0,
+                    operation_index as u32,
+                )));
+                let font_size = round_pdf_value(state.font_size);
+                let bounds = Rect::new(
+                    round_pdf_value(state.x),
+                    round_pdf_value(state.y),
+                    estimate_text_width(&text, font_size),
+                    round_pdf_value(font_size * 1.2),
+                );
+                let run = TextRun::new(
+                    text.clone(),
+                    state.font_name.clone(),
+                    font_size,
+                    state.color,
+                );
+                objects.push(TextObject {
+                    id: object_id,
+                    page,
+                    bounds,
+                    content: text,
+                    font_name: state.font_name.clone(),
+                    font_size,
+                    color: state.color,
+                    runs: vec![run],
+                });
+                self.text_refs.insert(
+                    object_id,
+                    TextObjectRef {
+                        page,
+                        operation_index,
+                        font_name: state.font_name.clone(),
+                    },
+                );
+            }
+        }
+
+        self.text_objects.insert(page, objects);
+        let structured = self.structured_text(page)?;
+        self.register_text_edit_groups(page, &structured);
         Ok(())
     }
 
@@ -1587,7 +1628,11 @@ impl LopdfDocument {
         let mut pending_w_clip: Option<Rect> = None;
 
         for (operation_index, operation) in content.operations.iter().enumerate() {
-            // Update clip-path tracking state before everything else.
+            update_page_state(&mut state, operation);
+
+            // Track clip paths in page coordinates. The `re` operator operands
+            // are expressed in the current graphics CTM, so storing them raw clips
+            // the wrong area on pages that scale or flip user space.
             match operation.operator.as_str() {
                 "q" => clip_stack.push(active_clip),
                 "Q" => {
@@ -1602,7 +1647,8 @@ impl LopdfDocument {
                         let w = object_to_f32(&operation.operands[2]);
                         let h = object_to_f32(&operation.operands[3]);
                         if let (Some(x), Some(y), Some(w), Some(h)) = (x, y, w, h) {
-                            pending_re = Some(Rect::new(x, y, w, h));
+                            pending_re =
+                                Some(round_rect(transformed_rect_at(state.ctm, x, y, w, h)));
                         }
                     }
                 }
@@ -1617,7 +1663,6 @@ impl LopdfDocument {
                 _ => {}
             }
 
-            update_page_state(&mut state, operation);
             let font_map = state
                 .text
                 .font_name
@@ -1749,11 +1794,28 @@ impl LopdfDocument {
     /// the primary member of each group.
     fn merge_structured_text_groups(
         &self,
+        page: PageIndex,
         objects: Vec<StructuredTextObject>,
     ) -> Vec<StructuredTextObject> {
         use std::collections::HashSet;
         let id_to_object: HashMap<TextObjectId, &StructuredTextObject> =
             objects.iter().map(|o| (o.id, o)).collect();
+        let local_groups;
+        let groups = if self.text_edit_groups.is_empty() {
+            local_groups = detect_text_edit_groups(page, &objects)
+                .into_iter()
+                .flat_map(|group| {
+                    group
+                        .member_ids
+                        .iter()
+                        .map(|id| (*id, group.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<HashMap<_, _>>();
+            &local_groups
+        } else {
+            &self.text_edit_groups
+        };
         let mut emitted: HashSet<TextObjectId> = HashSet::new();
         let mut merged = Vec::with_capacity(objects.len());
 
@@ -1762,7 +1824,7 @@ impl LopdfDocument {
                 continue;
             }
             // Look up the edit group for this object.
-            let group = match self.text_edit_groups.get(&object.id) {
+            let group = match groups.get(&object.id) {
                 Some(g) => g,
                 None => {
                     emitted.insert(object.id);
@@ -2185,7 +2247,20 @@ impl LopdfDocument {
                     }
                     path.clear();
                 }
-                "Do" => {}
+                "Do" => {
+                    if let Some(name) = operation.operands.first().and_then(object_name) {
+                        if self.draw_top_level_form_xobject_background(
+                            &mut pixmap,
+                            &state,
+                            &self.page_xobjects(page_id),
+                            &name,
+                            page_info.size.height,
+                            scale,
+                        )? {
+                            drawn_operations += 1;
+                        }
+                    }
+                }
                 "Tj" | "TJ" | "'" | "\"" => {
                     if self.draw_background_only_text(
                         &mut pixmap,
@@ -2233,6 +2308,288 @@ impl LopdfDocument {
         // browser can render and edit them as foreground text objects.
         // Keeping them in the background would duplicate the visible text.
         Ok(false)
+    }
+
+    fn draw_top_level_form_xobject_background(
+        &self,
+        pixmap: &mut Pixmap,
+        state: &GraphicsParseState,
+        xobjects: &HashMap<String, (ObjectId, lopdf::Stream)>,
+        name: &str,
+        page_height: f32,
+        scale: f32,
+    ) -> CoreResult<bool> {
+        let Some((_object_id, stream)) = xobjects.get(name) else {
+            return Ok(false);
+        };
+        if stream
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(object_name_bytes)
+            .as_deref()
+            != Some("Form")
+        {
+            // Top-level image XObjects are already exposed as structured images
+            // and rendered by the web SVG overlay. Form contents are not, so
+            // non-text Form artwork belongs in the background bitmap.
+            return Ok(false);
+        }
+        self.draw_form_xobject_background(
+            pixmap,
+            state.ctm,
+            xobjects,
+            stream,
+            page_height,
+            scale,
+            0,
+        )
+    }
+
+    fn draw_form_xobject_background(
+        &self,
+        pixmap: &mut Pixmap,
+        parent_ctm: [f32; 6],
+        inherited_xobjects: &HashMap<String, (ObjectId, lopdf::Stream)>,
+        stream: &lopdf::Stream,
+        page_height: f32,
+        scale: f32,
+        depth: usize,
+    ) -> CoreResult<bool> {
+        if depth > 8 {
+            return Ok(false);
+        }
+        let matrix = stream
+            .dict
+            .get(b"Matrix")
+            .ok()
+            .and_then(object_matrix)
+            .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let form_ctm = multiply_matrix(parent_ctm, matrix);
+        let bytes = stream_content_bytes(stream).unwrap_or_else(|| stream.content.clone());
+        let content = Content::decode(&bytes)
+            .map_err(|err| CoreError::Engine(format!("failed to decode form XObject: {err}")))?;
+        let mut xobjects = inherited_xobjects.clone();
+        if let Ok(resources) = stream.dict.get(b"Resources").and_then(Object::as_dict) {
+            collect_xobjects(&self.document, resources, &mut xobjects);
+        }
+        self.draw_background_content_fragment(
+            pixmap,
+            &content,
+            &xobjects,
+            page_height,
+            scale,
+            form_ctm,
+            depth + 1,
+        )
+    }
+
+    fn draw_background_content_fragment(
+        &self,
+        pixmap: &mut Pixmap,
+        content: &Content,
+        xobjects: &HashMap<String, (ObjectId, lopdf::Stream)>,
+        page_height: f32,
+        scale: f32,
+        initial_ctm: [f32; 6],
+        depth: usize,
+    ) -> CoreResult<bool> {
+        let mut state = GraphicsParseState {
+            ctm: initial_ctm,
+            ..GraphicsParseState::default()
+        };
+        let mut path = PdfPath::default();
+        let mut drew = false;
+
+        for operation in &content.operations {
+            match operation.operator.as_str() {
+                "q" => state.stack.push(state.snapshot()),
+                "Q" => {
+                    if let Some(snapshot) = state.stack.pop() {
+                        state.restore(snapshot);
+                    }
+                }
+                "cm" => {
+                    if let Some(matrix) = operation_matrix(operation) {
+                        state.ctm = multiply_matrix(state.ctm, matrix);
+                    }
+                }
+                "w" => {
+                    if let Some(width) = operation.operands.first().and_then(object_to_f32) {
+                        state.line_width = width.max(0.0);
+                    }
+                }
+                "RG" => {
+                    if let Some(color) = rgb_color(operation) {
+                        state.stroke_color = color;
+                    }
+                }
+                "rg" => {
+                    if let Some(color) = rgb_color(operation) {
+                        state.fill_color = color;
+                    }
+                }
+                "G" => {
+                    if let Some(color) = gray_color(operation) {
+                        state.stroke_color = color;
+                    }
+                }
+                "g" => {
+                    if let Some(color) = gray_color(operation) {
+                        state.fill_color = color;
+                    }
+                }
+                "m" => {
+                    if let Some((x, y)) = operation_point(operation, 0) {
+                        let point = transform_point(state.ctm, x, y);
+                        path.move_to(point.0, point.1);
+                    }
+                }
+                "l" => {
+                    if let Some((x, y)) = operation_point(operation, 0) {
+                        let point = transform_point(state.ctm, x, y);
+                        path.line_to(point.0, point.1);
+                    }
+                }
+                "c" => {
+                    if let (Some(p1), Some(p2), Some(p3)) = (
+                        operation_point(operation, 0),
+                        operation_point(operation, 2),
+                        operation_point(operation, 4),
+                    ) {
+                        path.curve_to(
+                            transform_point(state.ctm, p1.0, p1.1),
+                            transform_point(state.ctm, p2.0, p2.1),
+                            transform_point(state.ctm, p3.0, p3.1),
+                        );
+                    }
+                }
+                "v" => {
+                    if let (Some(p2), Some(p3)) =
+                        (operation_point(operation, 0), operation_point(operation, 2))
+                    {
+                        let current = path.current_point().unwrap_or((0.0, 0.0));
+                        path.curve_to(
+                            current,
+                            transform_point(state.ctm, p2.0, p2.1),
+                            transform_point(state.ctm, p3.0, p3.1),
+                        );
+                    }
+                }
+                "y" => {
+                    if let (Some(p1), Some(p3)) =
+                        (operation_point(operation, 0), operation_point(operation, 2))
+                    {
+                        let p1 = transform_point(state.ctm, p1.0, p1.1);
+                        let p3 = transform_point(state.ctm, p3.0, p3.1);
+                        path.curve_to(p1, p3, p3);
+                    }
+                }
+                "re" => {
+                    if let (Some(x), Some(y), Some(w), Some(h)) = (
+                        operation.operands.first().and_then(object_to_f32),
+                        operation.operands.get(1).and_then(object_to_f32),
+                        operation.operands.get(2).and_then(object_to_f32),
+                        operation.operands.get(3).and_then(object_to_f32),
+                    ) {
+                        let p0 = transform_point(state.ctm, x, y);
+                        let p1 = transform_point(state.ctm, x + w, y);
+                        let p2 = transform_point(state.ctm, x + w, y + h);
+                        let p3 = transform_point(state.ctm, x, y + h);
+                        path.move_to(p0.0, p0.1);
+                        path.line_to(p1.0, p1.1);
+                        path.line_to(p2.0, p2.1);
+                        path.line_to(p3.0, p3.1);
+                        path.close();
+                    }
+                }
+                "h" => path.close(),
+                "n" => path.clear(),
+                "S" => {
+                    drew |= stroke_pdf_path(pixmap, &path, &state, page_height, scale);
+                    path.clear();
+                }
+                "s" => {
+                    path.close();
+                    drew |= stroke_pdf_path(pixmap, &path, &state, page_height, scale);
+                    path.clear();
+                }
+                "f" | "F" | "f*" => {
+                    drew |= fill_pdf_path(pixmap, &path, &state, page_height, scale);
+                    path.clear();
+                }
+                "B" | "B*" => {
+                    let filled = fill_pdf_path(pixmap, &path, &state, page_height, scale);
+                    let stroked = stroke_pdf_path(pixmap, &path, &state, page_height, scale);
+                    drew |= filled || stroked;
+                    path.clear();
+                }
+                "b" | "b*" => {
+                    path.close();
+                    let filled = fill_pdf_path(pixmap, &path, &state, page_height, scale);
+                    let stroked = stroke_pdf_path(pixmap, &path, &state, page_height, scale);
+                    drew |= filled || stroked;
+                    path.clear();
+                }
+                "Do" => {
+                    if let Some(name) = operation.operands.first().and_then(object_name) {
+                        drew |= self.draw_nested_xobject_background(
+                            pixmap,
+                            state.ctm,
+                            xobjects,
+                            &name,
+                            page_height,
+                            scale,
+                            depth,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(drew)
+    }
+
+    fn draw_nested_xobject_background(
+        &self,
+        pixmap: &mut Pixmap,
+        ctm: [f32; 6],
+        xobjects: &HashMap<String, (ObjectId, lopdf::Stream)>,
+        name: &str,
+        page_height: f32,
+        scale: f32,
+        depth: usize,
+    ) -> CoreResult<bool> {
+        let Some((_object_id, stream)) = xobjects.get(name) else {
+            return Ok(false);
+        };
+        match stream
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(object_name_bytes)
+            .as_deref()
+        {
+            Some("Image") => Ok(draw_image_xobject_background(
+                pixmap,
+                &self.document,
+                stream,
+                ctm,
+                page_height,
+                scale,
+            )),
+            Some("Form") => self.draw_form_xobject_background(
+                pixmap,
+                ctm,
+                xobjects,
+                stream,
+                page_height,
+                scale,
+                depth,
+            ),
+            _ => Ok(false),
+        }
     }
 
     fn attach_type3_glyph_paths(
@@ -2929,7 +3286,10 @@ struct Type3GlyphSvgPaths {
     stroke_width: Option<f32>,
 }
 
-fn type3_char_proc_svg_paths(content: &Content, glyph_transform: [f32; 6]) -> Option<Type3GlyphSvgPaths> {
+fn type3_char_proc_svg_paths(
+    content: &Content,
+    glyph_transform: [f32; 6],
+) -> Option<Type3GlyphSvgPaths> {
     let mut path = PdfPath::default();
     let mut state = Type3GraphicsState::new(glyph_transform);
     let mut stack = Vec::new();
@@ -3199,6 +3559,47 @@ fn fill_pdf_path(
         &paint,
         FillRule::Winding,
         Transform::identity(),
+        None,
+    );
+    true
+}
+
+fn draw_image_xobject_background(
+    pixmap: &mut Pixmap,
+    document: &Document,
+    stream: &lopdf::Stream,
+    ctm: [f32; 6],
+    page_height: f32,
+    scale: f32,
+) -> bool {
+    let Some(image) = decode_basic_image_xobject(document, stream) else {
+        return false;
+    };
+    let Some(size) = IntSize::from_wh(image.width, image.height) else {
+        return false;
+    };
+    let Some(source) = Pixmap::from_vec(image.premultiplied_rgba, size) else {
+        return false;
+    };
+    let pixel_to_unit = [
+        1.0 / image.width as f32,
+        0.0,
+        0.0,
+        -1.0 / image.height as f32,
+        0.0,
+        1.0,
+    ];
+    let pdf_to_pixel = [scale, 0.0, 0.0, -scale, 0.0, page_height * scale];
+    let matrix = multiply_matrix(pdf_to_pixel, multiply_matrix(ctm, pixel_to_unit));
+    let transform = Transform::from_row(
+        matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5],
+    );
+    pixmap.draw_pixmap(
+        0,
+        0,
+        source.as_ref(),
+        &PixmapPaint::default(),
+        transform,
         None,
     );
     true
@@ -3962,12 +4363,7 @@ fn bounds_for_text_width(width: f32, transform: [f32; 6], metrics: Option<&FontM
     ))
 }
 
-fn transformed_rect_bounds_range(
-    transform: [f32; 6],
-    width: f32,
-    y_min: f32,
-    y_max: f32,
-) -> Rect {
+fn transformed_rect_bounds_range(transform: [f32; 6], width: f32, y_min: f32, y_max: f32) -> Rect {
     let points = [
         transform_point(transform, 0.0, y_min),
         transform_point(transform, width, y_min),
@@ -4243,10 +4639,13 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
         let (x, y) = transform_point(context.object.transform, cursor, 0.0);
         let glyph_transform =
             multiply_matrix(context.object.transform, [1.0, 0.0, 0.0, 1.0, cursor, 0.0]);
-        let (descent, ascent) = context.metrics.as_ref()
+        let (descent, ascent) = context
+            .metrics
+            .as_ref()
             .map(FontMetrics::vertical_extent)
             .unwrap_or((-0.2, 1.0));
-        let bbox = transformed_rect_bounds_range(glyph_transform, advance.max(0.0), descent, ascent);
+        let bbox =
+            transformed_rect_bounds_range(glyph_transform, advance.max(0.0), descent, ascent);
         glyphs.push(LayoutGlyph {
             ch: ch.to_string(),
             glyph_id,
@@ -4342,10 +4741,17 @@ fn layout_glyphs_tj(operation: &Operation, context: &TextLayoutContext) -> (Vec<
                 let (x, y) = transform_point(context.object.transform, cursor, 0.0);
                 let glyph_transform =
                     multiply_matrix(context.object.transform, [1.0, 0.0, 0.0, 1.0, cursor, 0.0]);
-                let (descent, ascent) = context.metrics.as_ref()
+                let (descent, ascent) = context
+                    .metrics
+                    .as_ref()
                     .map(FontMetrics::vertical_extent)
                     .unwrap_or((-0.2, 1.0));
-                let bbox = transformed_rect_bounds_range(glyph_transform, advance.max(0.0), descent, ascent);
+                let bbox = transformed_rect_bounds_range(
+                    glyph_transform,
+                    advance.max(0.0),
+                    descent,
+                    ascent,
+                );
                 glyphs.push(LayoutGlyph {
                     ch: ch.to_string(),
                     glyph_id,
@@ -4482,6 +4888,11 @@ fn transformed_rect_bounds(transform: [f32; 6], width: f32, height: f32) -> Rect
         .map(|point| point.1)
         .fold(f32::NEG_INFINITY, f32::max);
     Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+fn transformed_rect_at(transform: [f32; 6], x: f32, y: f32, width: f32, height: f32) -> Rect {
+    let rect_transform = multiply_matrix(transform, [1.0, 0.0, 0.0, 1.0, x, y]);
+    transformed_rect_bounds(rect_transform, width, height)
 }
 
 fn transform_point(transform: [f32; 6], x: f32, y: f32) -> (f32, f32) {
@@ -7957,6 +8368,7 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
             if let Ok(content) = stream.decompressed_content() {
                 let mut map = parse_to_unicode_cmap(&content);
                 map.identity_utf16 = identity_utf16;
+                add_type3_encoding_fallbacks(font, &mut map);
                 return Some(map);
             }
         }
@@ -7973,7 +8385,9 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
         if !encoding.is_empty() {
             let mut map = ToUnicodeMap::default();
             for (code, name) in encoding {
-                if let Some(text) = glyph_name_to_unicode(&name) {
+                if let Some(text) = glyph_name_to_unicode(&name)
+                    .or_else(|| generated_digit_glyph_name_to_unicode(&name))
+                {
                     map.insert(vec![code], text);
                 }
             }
@@ -8020,6 +8434,52 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
     }
 
     None
+}
+
+fn add_type3_encoding_fallbacks(font: &Dictionary, map: &mut ToUnicodeMap) {
+    if font
+        .get(b"Subtype")
+        .ok()
+        .and_then(object_name_bytes)
+        .as_deref()
+        != Some("Type3")
+    {
+        return;
+    }
+    for (code, name) in type3_encoding(font) {
+        if map
+            .forward
+            .get(&vec![code])
+            .is_some_and(|text| !text.is_empty())
+        {
+            continue;
+        }
+        if let Some(text) =
+            glyph_name_to_unicode(&name).or_else(|| generated_digit_glyph_name_to_unicode(&name))
+        {
+            map.insert(vec![code], text);
+        }
+    }
+}
+
+fn generated_digit_glyph_name_to_unicode(name: &str) -> Option<String> {
+    let digit = match name {
+        // Chromium/Skia-generated Type3 subset glyph names seen in PDFs where
+        // ToUnicode maps the actual digit glyphs to U+0000. The glyph names are
+        // not standard Adobe names, so keep the recovery deliberately narrow.
+        "g547" => '0',
+        "g549" => '1',
+        "g54A" => '2',
+        "g54B" => '3',
+        "g54C" => '4',
+        "g54E" => '5',
+        "g54F" => '6',
+        "g550" => '7',
+        "g551" => '8',
+        "g552" => '9',
+        _ => return None,
+    };
+    Some(digit.to_string())
 }
 
 fn uses_direct_utf16_encoding(name: &str) -> bool {

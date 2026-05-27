@@ -1,4 +1,4 @@
-use crate::lopdf_backend::LopdfDocument;
+use crate::lopdf_backend::{open_lopdf_document_from_bytes_unindexed, LopdfDocument};
 use crate::{
     open_lopdf_document_from_bytes, page_background_png_from_pdf_bytes,
     page_font_assets_from_pdf_bytes, page_image_png_from_pdf_bytes,
@@ -52,7 +52,7 @@ pub fn pdf_page_bundle(pdf_bytes: &[u8], page_number: u32) -> Result<Vec<u8>, Js
 
 #[wasm_bindgen]
 pub fn pdf_open_document(pdf_bytes: &[u8]) -> Result<u32, JsValue> {
-    let document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
+    let document = open_lopdf_document_from_bytes_unindexed(pdf_bytes).map_err(core_error_to_js)?;
     Ok(DOCUMENT_STORE.with(|store| store.borrow_mut().insert(document)))
 }
 
@@ -72,11 +72,14 @@ pub fn pdf_close_document(handle: u32) -> Result<(), JsValue> {
 pub fn pdf_page_bundle_by_handle(handle: u32, page_number: u32) -> Result<Vec<u8>, JsValue> {
     let page = wasm_page_index(page_number)?;
     DOCUMENT_STORE.with(|store| {
-        let store = store.borrow();
+        let mut store = store.borrow_mut();
         let document = store
             .documents
-            .get(&handle)
+            .get_mut(&handle)
             .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        document
+            .ensure_text_index_for_page(page)
+            .map_err(core_error_to_js)?;
         let bundle = document
             .page_load_bundle(page, BackgroundRenderOptions::default())
             .map_err(core_error_to_js)?;
@@ -109,11 +112,14 @@ pub fn pdf_hit_test_by_handle(
 ) -> Result<String, JsValue> {
     let page = wasm_page_index(page_number)?;
     DOCUMENT_STORE.with(|store| {
-        let store = store.borrow();
+        let mut store = store.borrow_mut();
         let document = store
             .documents
-            .get(&handle)
+            .get_mut(&handle)
             .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        document
+            .ensure_text_index_for_page(page)
+            .map_err(core_error_to_js)?;
         let result = document
             .hit_test(page, Point::new(pdf_x as f32, pdf_y as f32))
             .map_err(core_error_to_js)?;
@@ -139,11 +145,14 @@ pub fn pdf_start_text_edit(pdf_bytes: &[u8], object_id: u64) -> Result<String, J
 #[wasm_bindgen]
 pub fn pdf_start_text_edit_by_handle(handle: u32, object_id: u64) -> Result<String, JsValue> {
     DOCUMENT_STORE.with(|store| {
-        let store = store.borrow();
+        let mut store = store.borrow_mut();
         let document = store
             .documents
-            .get(&handle)
+            .get_mut(&handle)
             .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        document
+            .ensure_text_index_for_page(page_from_text_object_id(object_id))
+            .map_err(core_error_to_js)?;
         let result = document
             .start_text_edit(TextObjectId(PdfObjectId(object_id)))
             .map_err(core_error_to_js)?;
@@ -176,11 +185,14 @@ pub fn pdf_preview_text_layout_by_handle(
     text: &str,
 ) -> Result<String, JsValue> {
     DOCUMENT_STORE.with(|store| {
-        let store = store.borrow();
+        let mut store = store.borrow_mut();
         let document = store
             .documents
-            .get(&handle)
+            .get_mut(&handle)
             .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        document
+            .ensure_text_index_for_page(page_from_text_object_id(object_id))
+            .map_err(core_error_to_js)?;
         let result = document
             .preview_text_layout(TextObjectId(PdfObjectId(object_id)), text.to_string())
             .map_err(core_error_to_js)?;
@@ -215,6 +227,9 @@ pub fn pdf_commit_text_edit_by_handle(
             .documents
             .get_mut(&handle)
             .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        document
+            .ensure_text_index_for_page(page_from_text_object_id(object_id))
+            .map_err(core_error_to_js)?;
         document
             .update_text_object(TextObjectId(PdfObjectId(object_id)), text.to_string(), None)
             .map_err(core_error_to_js)?;
@@ -342,6 +357,9 @@ pub fn pdf_apply_text_edits(pdf_bytes: &[u8], edits_json: &str) -> Result<Vec<u8
         match edit.kind.as_str() {
             "replace_text" | "update_text" => {
                 document
+                    .ensure_text_index_for_page(page_from_text_object_id(edit.id))
+                    .map_err(core_error_to_js)?;
+                document
                     .update_text_object(TextObjectId(PdfObjectId(edit.id)), edit.content, None)
                     .map_err(core_error_to_js)?;
             }
@@ -354,6 +372,10 @@ pub fn pdf_apply_text_edits(pdf_bytes: &[u8], edits_json: &str) -> Result<Vec<u8
     }
 
     save_pdf_document_to_bytes(&document).map_err(core_error_to_js)
+}
+
+fn page_from_text_object_id(object_id: u64) -> PageIndex {
+    PageIndex((object_id >> 32) as u32)
 }
 
 #[wasm_bindgen]
@@ -370,6 +392,9 @@ pub fn pdf_apply_text_edits_by_handle(handle: u32, edits_json: &str) -> Result<V
         for edit in request.edits {
             match edit.kind.as_str() {
                 "replace_text" | "update_text" => {
+                    document
+                        .ensure_text_index_for_page(page_from_text_object_id(edit.id))
+                        .map_err(core_error_to_js)?;
                     document
                         .update_text_object(TextObjectId(PdfObjectId(edit.id)), edit.content, None)
                         .map_err(core_error_to_js)?;

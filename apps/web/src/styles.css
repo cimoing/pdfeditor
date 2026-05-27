@@ -219,6 +219,15 @@ button:disabled {
   -webkit-user-select: text;
 }
 
+.page-svg .copyable-text-run {
+  fill: currentColor;
+  fill-opacity: 0.01;
+  stroke: none;
+  pointer-events: none;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 .layout-preview {
   inset: 0;
   z-index: 2;

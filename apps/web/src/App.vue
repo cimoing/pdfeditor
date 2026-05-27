@@ -832,6 +832,10 @@ function glyphHasSvgPath(glyph: LayoutGlyph) {
   return Boolean(glyph.svg_fill_path || glyph.svg_stroke_path);
 }
 
+function textHasSvgPaths(text: StructuredTextObject) {
+  return Boolean(glyphsForSvg(text)?.some((glyph) => glyphHasSvgPath(glyph)));
+}
+
 function svgGlyphPathTransform(glyph: LayoutGlyph): string {
   const viewport = currentViewport.value;
   if (!viewport) return "";
@@ -988,6 +992,18 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                 :data-object-id="text.id"
                 :clip-path="`url(#clip-text-${text.id})`"
               >
+                <text
+                  v-if="textHasSvgPaths(text)"
+                  class="copyable-text-run"
+                  :transform="svgTextTransform(text)"
+                  :font-family="svgFontFamily(text.font_name)"
+                  :font-weight="fontWeightFor(text.font_name)"
+                  font-size="1"
+                  dominant-baseline="alphabetic"
+                  xml:space="preserve"
+                  :textLength="svgTextLength(text)"
+                  :lengthAdjust="svgTextLength(text) != null ? 'spacingAndGlyphs' : undefined"
+                >{{ text.content }}</text>
                 <template
                   v-for="(glyph, glyphIndex) in (glyphsForSvg(text) ?? [])"
                   :key="`glyph-${text.id}-${glyphIndex}`"
