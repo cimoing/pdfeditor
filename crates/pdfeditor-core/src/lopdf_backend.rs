@@ -3883,10 +3883,8 @@ fn detect_text_edit_groups(
         .cloned()
         .collect::<Vec<_>>();
     sorted.sort_by(|left, right| {
-        left.bounds
-            .origin
-            .y
-            .partial_cmp(&right.bounds.origin.y)
+        left.transform[5]
+            .partial_cmp(&right.transform[5])
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
                 left.bounds
