@@ -55,13 +55,6 @@ const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 const editBoxWidthOverride = ref<number | null>(null);
 /** Local x-axis offset override in viewport pixels set by dragging the left edge. */
 const editBoxLeftOverride = ref<number | null>(null);
-/**
- * Canvas-relative left pixel position of the first rendered SVG glyph for the
- * current edit session. Queried from the DOM after Vue renders so we align with
- * the actual visual pixel left edge regardless of font glyph-origin conventions
- * (some CJK fonts have the origin at the character's right end, not left end).
- */
-const svgFirstGlyphLeft = ref<number | null>(null);
 
 interface EdgeDragState {
   edge: "left" | "right";
@@ -197,9 +190,6 @@ function normalizeVector(vector: { x: number; y: number }, fallback: { x: number
   return { x: vector.x / length, y: vector.y / length };
 }
 
-function isNearlyHorizontal(axisX: { x: number; y: number }, axisY: { x: number; y: number }) {
-  return Math.abs(axisX.y) < 0.01 && Math.abs(axisY.x) < 0.01;
-}
 
 function inlineEditorGeometry(text: StructuredTextObject): InlineEditorGeometry | null {
   const viewport = currentViewport.value;
@@ -218,12 +208,9 @@ function inlineEditorGeometry(text: StructuredTextObject): InlineEditorGeometry 
   const matrixOrigin = pdfToViewport(viewport, matrix[4], matrix[5]);
   const axisX = normalizeVector({ x: xEnd.x - matrixOrigin.x, y: xEnd.y - matrixOrigin.y }, { x: 1, y: 0 });
   const axisY = normalizeVector({ x: downEnd.x - matrixOrigin.x, y: downEnd.y - matrixOrigin.y }, { x: 0, y: 1 });
-  const visualBaseline = isNearlyHorizontal(axisX, axisY) && svgFirstGlyphLeft.value != null
-    ? { x: svgFirstGlyphLeft.value, y: baseline.y }
-    : baseline;
   const origin = {
-    x: visualBaseline.x - axisY.x * fontSize,
-    y: visualBaseline.y - axisY.y * fontSize
+    x: baseline.x - axisY.x * fontSize,
+    y: baseline.y - axisY.y * fontSize
   };
 
   const effFs = effectiveFontSize(text);
@@ -338,7 +325,6 @@ onBeforeUnmount(() => {
 function resetEditBoxOverrides() {
   editBoxWidthOverride.value = null;
   editBoxLeftOverride.value = null;
-  svgFirstGlyphLeft.value = null;
 }
 
 function stopEdgeDrag() {
@@ -423,26 +409,6 @@ async function beginTextEdit(objectId: number) {
     if (currentSelection !== getSelectionToken()) return;
     editSession.value = session;
     draftText.value = session.original_text;
-    // Query svgFirstGlyphLeft from the original SVG render (layoutPreview is
-    // still null here, so renderTextObjects returns the page's extracted glyphs
-    // which include TJ kerning offsets).  Reading after refreshPreview would use
-    // the preview glyphs that always start at cursor=0, causing the editor to be
-    // shifted left whenever the PDF has a leading TJ displacement.
-    svgFirstGlyphLeft.value = null;
-    await nextTick();
-    {
-      // Per-glyph path uses <g data-object-id>; legacy path uses clip-path attribute.
-      const primaryId = session.group_object_ids[0] ?? objectId;
-      const gEl =
-        document.querySelector<SVGElement>(`[data-object-id="${primaryId}"] text`) ??
-        document.querySelector<SVGElement>(`text[clip-path="url(#clip-text-${primaryId})"]`);
-      const canvasEl = document.querySelector<HTMLElement>(".page-canvas");
-      if (gEl && canvasEl) {
-        const gRect = gEl.getBoundingClientRect();
-        const canvasRect = canvasEl.getBoundingClientRect();
-        svgFirstGlyphLeft.value = gRect.left - canvasRect.left;
-      }
-    }
     await refreshPreview(objectId, session.original_text, currentSelection);
     if (currentSelection !== getSelectionToken()) return;
     status.value = `已选中文本对象 ${objectId}，可直接修改并保存`;
