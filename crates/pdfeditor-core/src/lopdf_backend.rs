@@ -1075,7 +1075,7 @@ impl LopdfDocument {
                         context.object.transform,
                         [1.0, 0.0, 0.0, 1.0, cursor, 0.0],
                     );
-                    let bbox = transformed_rect_bounds(glyph_transform, adv.max(0.0), 1.2);
+                    let bbox = transformed_rect_bounds_range(glyph_transform, adv.max(0.0), -0.2, 1.0);
                     glyph.x = x;
                     glyph.y = y;
                     glyph.advance = adv;
@@ -3735,7 +3735,46 @@ fn bounds_for_text(content: &str, font_size: f32, transform: [f32; 6]) -> Rect {
 }
 
 fn bounds_for_text_width(width: f32, transform: [f32; 6]) -> Rect {
-    round_rect(transformed_rect_bounds(transform, width.max(0.0), 1.2))
+    // Use [-0.2, 1.0] in normalised text space (1 unit = 1 font-size) so that
+    // descenders below the baseline (letters like 'p', 'y', 'g') are included.
+    // Total height remains 1.2 em; only the origin shifts downward by 0.2 em.
+    round_rect(transformed_rect_bounds_range(
+        transform,
+        width.max(0.0),
+        -0.2,
+        1.0,
+    ))
+}
+
+fn transformed_rect_bounds_range(
+    transform: [f32; 6],
+    width: f32,
+    y_min: f32,
+    y_max: f32,
+) -> Rect {
+    let points = [
+        transform_point(transform, 0.0, y_min),
+        transform_point(transform, width, y_min),
+        transform_point(transform, 0.0, y_max),
+        transform_point(transform, width, y_max),
+    ];
+    let min_x = points
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = points
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = points
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = points
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
 fn round_pdf_value(value: f32) -> f32 {
@@ -3990,7 +4029,7 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
         let (x, y) = transform_point(context.object.transform, cursor, 0.0);
         let glyph_transform =
             multiply_matrix(context.object.transform, [1.0, 0.0, 0.0, 1.0, cursor, 0.0]);
-        let bbox = transformed_rect_bounds(glyph_transform, advance.max(0.0), 1.2);
+        let bbox = transformed_rect_bounds_range(glyph_transform, advance.max(0.0), -0.2, 1.0);
         glyphs.push(LayoutGlyph {
             ch: ch.to_string(),
             glyph_id,
@@ -4082,7 +4121,7 @@ fn layout_glyphs_tj(operation: &Operation, context: &TextLayoutContext) -> (Vec<
                 let (x, y) = transform_point(context.object.transform, cursor, 0.0);
                 let glyph_transform =
                     multiply_matrix(context.object.transform, [1.0, 0.0, 0.0, 1.0, cursor, 0.0]);
-                let bbox = transformed_rect_bounds(glyph_transform, advance.max(0.0), 1.2);
+                let bbox = transformed_rect_bounds_range(glyph_transform, advance.max(0.0), -0.2, 1.0);
                 glyphs.push(LayoutGlyph {
                     ch: ch.to_string(),
                     glyph_id,
