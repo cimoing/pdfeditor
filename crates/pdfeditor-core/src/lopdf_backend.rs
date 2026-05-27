@@ -1075,7 +1075,10 @@ impl LopdfDocument {
                         context.object.transform,
                         [1.0, 0.0, 0.0, 1.0, cursor, 0.0],
                     );
-                    let bbox = transformed_rect_bounds_range(glyph_transform, adv.max(0.0), -0.2, 1.0);
+                    let (descent, ascent) = context.metrics.as_ref()
+                        .map(FontMetrics::vertical_extent)
+                        .unwrap_or((-0.2, 1.0));
+                    let bbox = transformed_rect_bounds_range(glyph_transform, adv.max(0.0), descent, ascent);
                     glyph.x = x;
                     glyph.y = y;
                     glyph.advance = adv;
@@ -1085,12 +1088,12 @@ impl LopdfDocument {
                 }
                 return Ok((
                     glyphs,
-                    bounds_for_text_width(width * factor, context.object.transform),
+                    bounds_for_text_width(width * factor, context.object.transform, context.metrics.as_ref()),
                 ));
             }
             return Ok((
                 glyphs,
-                bounds_for_text_width(width, context.object.transform),
+                bounds_for_text_width(width, context.object.transform, context.metrics.as_ref()),
             ));
         }
 
@@ -1663,8 +1666,8 @@ impl LopdfDocument {
                 let (glyphs, width) = layout_glyphs_tj(operation, &layout_context);
                 let bounds = operation_text_advance(operation, metrics, &state.text)
                     .or_else(|| (!glyphs.is_empty()).then_some(width))
-                    .map(|width| bounds_for_text_width(width, transform))
-                    .unwrap_or_else(|| bounds_for_text(&text, font_size, transform));
+                    .map(|width| bounds_for_text_width(width, transform, metrics))
+                    .unwrap_or_else(|| bounds_for_text(&text, font_size, transform, metrics));
                 let bounds = round_rect(bounds);
                 let punct_width_squeeze = match (font_map, metrics) {
                     (Some(fm), Some(m)) => font_has_punct_width_squeeze(m, fm),
@@ -1800,7 +1803,7 @@ impl LopdfDocument {
                                 page.0,
                                 operation_index as u32,
                             ))),
-                            bounds: bounds_for_text_width(width, transform),
+                            bounds: bounds_for_text_width(width, transform, metrics),
                             font_name: state.text.font_name.clone(),
                             font_size: state.text.font_size,
                             transform,
@@ -3729,20 +3732,27 @@ fn text_render_transform(state: &PageParseState) -> [f32; 6] {
     )
 }
 
-fn bounds_for_text(content: &str, font_size: f32, transform: [f32; 6]) -> Rect {
+fn bounds_for_text(
+    content: &str,
+    font_size: f32,
+    transform: [f32; 6],
+    metrics: Option<&FontMetrics>,
+) -> Rect {
     let width = estimate_text_width(content, font_size) / font_size.max(1.0);
-    bounds_for_text_width(width, transform)
+    bounds_for_text_width(width, transform, metrics)
 }
 
-fn bounds_for_text_width(width: f32, transform: [f32; 6]) -> Rect {
-    // Use [-0.2, 1.0] in normalised text space (1 unit = 1 font-size) so that
-    // descenders below the baseline (letters like 'p', 'y', 'g') are included.
-    // Total height remains 1.2 em; only the origin shifts downward by 0.2 em.
+fn bounds_for_text_width(width: f32, transform: [f32; 6], metrics: Option<&FontMetrics>) -> Rect {
+    // Use font-derived ascender/descender when available; fall back to [-0.2, 1.0].
+    // The range is in normalised text space (1 unit = 1 font-size).
+    let (descent, ascent) = metrics
+        .map(FontMetrics::vertical_extent)
+        .unwrap_or((-0.2, 1.0));
     round_rect(transformed_rect_bounds_range(
         transform,
         width.max(0.0),
-        -0.2,
-        1.0,
+        descent,
+        ascent,
     ))
 }
 
@@ -4029,7 +4039,10 @@ fn layout_glyphs(text: &str, context: &TextLayoutContext) -> (Vec<LayoutGlyph>, 
         let (x, y) = transform_point(context.object.transform, cursor, 0.0);
         let glyph_transform =
             multiply_matrix(context.object.transform, [1.0, 0.0, 0.0, 1.0, cursor, 0.0]);
-        let bbox = transformed_rect_bounds_range(glyph_transform, advance.max(0.0), -0.2, 1.0);
+        let (descent, ascent) = context.metrics.as_ref()
+            .map(FontMetrics::vertical_extent)
+            .unwrap_or((-0.2, 1.0));
+        let bbox = transformed_rect_bounds_range(glyph_transform, advance.max(0.0), descent, ascent);
         glyphs.push(LayoutGlyph {
             ch: ch.to_string(),
             glyph_id,
@@ -4121,7 +4134,10 @@ fn layout_glyphs_tj(operation: &Operation, context: &TextLayoutContext) -> (Vec<
                 let (x, y) = transform_point(context.object.transform, cursor, 0.0);
                 let glyph_transform =
                     multiply_matrix(context.object.transform, [1.0, 0.0, 0.0, 1.0, cursor, 0.0]);
-                let bbox = transformed_rect_bounds_range(glyph_transform, advance.max(0.0), -0.2, 1.0);
+                let (descent, ascent) = context.metrics.as_ref()
+                    .map(FontMetrics::vertical_extent)
+                    .unwrap_or((-0.2, 1.0));
+                let bbox = transformed_rect_bounds_range(glyph_transform, advance.max(0.0), descent, ascent);
                 glyphs.push(LayoutGlyph {
                     ch: ch.to_string(),
                     glyph_id,
@@ -4892,9 +4908,23 @@ struct FontMetrics {
     code_len: usize,
     width_scale: f32,
     estimate_missing_widths_from_unicode: bool,
+    /// Ascender height above the baseline in normalised text-space units (1.0 = 1 em).
+    /// Derived from the PDF FontDescriptor `Ascent` entry.
+    ascent: f32,
+    /// Descender depth below the baseline (≤ 0) in normalised text-space units.
+    /// Derived from the PDF FontDescriptor `Descent` entry.
+    descent: f32,
 }
 
 impl FontMetrics {
+    /// Returns `(y_min, y_max)` suitable for [`transformed_rect_bounds_range`].
+    ///
+    /// `y_min` is the descender depth (≤ 0) and `y_max` is the ascender height (> 0),
+    /// both in normalised text-space units where 1.0 equals one font-size.
+    fn vertical_extent(&self) -> (f32, f32) {
+        (self.descent, self.ascent)
+    }
+
     fn text_advance(&self, bytes: &[u8], state: &TextParseState) -> f32 {
         let codes = self.codes(bytes);
         let glyph_units = codes
@@ -4953,6 +4983,32 @@ fn font_has_punct_width_squeeze(metrics: &FontMetrics, font_map: &ToUnicodeMap) 
     })
 }
 
+/// Reads `Ascent` and `Descent` from the font's `FontDescriptor` and converts
+/// them to normalised text-space units (1.0 = 1 em) using `width_scale`.
+///
+/// Returns `(descent, ascent)`.  Falls back to `(-0.2, 1.0)` for each value
+/// when the key is absent in the descriptor.  A missing or non-negative
+/// `Descent` entry is preserved as-is (e.g. CJK fonts legitimately set it to
+/// 0 to indicate that no descender space is needed).
+fn parse_font_vertical_metrics(
+    document: &Document,
+    font: &Dictionary,
+    width_scale: f32,
+) -> (f32, f32) {
+    let descriptor = font_descriptor(document, font);
+    let ascent = descriptor
+        .and_then(|d| d.get(b"Ascent").ok())
+        .and_then(object_to_f32)
+        .map(|v| (v * width_scale).clamp(0.5, 1.5))
+        .unwrap_or(1.0);
+    let descent = descriptor
+        .and_then(|d| d.get(b"Descent").ok())
+        .and_then(object_to_f32)
+        .map(|v| (v * width_scale).max(-0.5))
+        .unwrap_or(-0.2);
+    (descent, ascent)
+}
+
 fn parse_font_metrics(
     document: &Document,
     font: &Dictionary,
@@ -4989,12 +5045,16 @@ fn parse_simple_font_metrics(document: &Document, font: &Dictionary) -> Option<F
             widths.extend(standard_latin_widths(&base_font));
         }
     }
+    let width_scale = simple_font_width_scale(font);
+    let (descent, ascent) = parse_font_vertical_metrics(document, font, width_scale);
     (!widths.is_empty()).then_some(FontMetrics {
         widths,
         default_width: 0.0,
         code_len: 1,
-        width_scale: simple_font_width_scale(font),
+        width_scale,
         estimate_missing_widths_from_unicode: false,
+        ascent,
+        descent,
     })
 }
 
@@ -5135,6 +5195,7 @@ fn parse_cid_font_metrics(
     {
         parse_cid_widths(width_entries, &mut widths);
     }
+    let (descent, ascent) = parse_font_vertical_metrics(document, font, 0.001);
     Some(FontMetrics {
         widths,
         default_width,
@@ -5150,6 +5211,8 @@ fn parse_cid_font_metrics(
         width_scale: 0.001,
         estimate_missing_widths_from_unicode: to_unicode
             .is_some_and(ToUnicodeMap::supports_direct_utf16),
+        ascent,
+        descent,
     })
 }
 
