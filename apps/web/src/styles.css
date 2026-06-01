@@ -233,6 +233,14 @@ button:disabled {
   pointer-events: none;
 }
 
+/* Per-glyph visual text: selection and pointer events are handled by the
+   copyable-text-run overlay beneath, so these elements opt out entirely. */
+.page-svg .per-glyph-text {
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 .layout-preview {
   inset: 0;
   z-index: 2;

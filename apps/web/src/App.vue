@@ -4,11 +4,14 @@ import type { LayoutGlyph, StructuredImageObject, StructuredTextObject } from ".
 import {
   commitTextEdit,
   describePdfFontUsage,
+  getPdfBytesByHandle,
+  getPageStructureByHandle,
   previewTextLayout,
   resolvePdfFontFamily,
-  startTextEdit
+  startTextEdit,
+  updateTextByHandle
 } from "./pdfEditor";
-import { pdfRectToViewportRect, pdfToViewport, viewportToPdf, type Matrix2D, type ViewportRect } from "./viewport";
+import { pdfRectToViewportRect, pdfToViewport, viewportToPdf, type Matrix2D } from "./viewport";
 import { usePdfDocument } from "./composables/usePdfDocument";
 import { usePdfEditor } from "./composables/usePdfEditor";
 
@@ -152,6 +155,40 @@ const renderTextObjects = computed(() => {
     glyphs: layoutPreview.value.glyphs
   };
   return pageText.map((text) => (text.id === selectedTextObject.value!.id ? previewObject : text));
+});
+
+// ── Per-render data pre-computed once per text object ────────────────────────
+// Avoids calling glyphsForSvg / svgFontFeatureSettings / svgTextLength multiple
+// times inside the hot template loop.
+interface TextRenderItem {
+  text: StructuredTextObject;
+  glyphs: LayoutGlyph[] | null;
+  hasSvgPaths: boolean;
+  fontFeatureStyle: Record<string, string> | undefined;
+  textLength: number | undefined;
+}
+
+const textRenderItems = computed((): TextRenderItem[] =>
+  renderTextObjects.value.map((text) => {
+    const glyphs = glyphsForSvg(text);
+    const featureStr = svgFontFeatureSettings(text);
+    return {
+      text,
+      glyphs,
+      hasSvgPaths: glyphs?.some((g) => glyphHasSvgPath(g)) ?? false,
+      fontFeatureStyle: featureStr ? { fontFeatureSettings: featureStr } : undefined,
+      textLength: svgTextLength(text)
+    };
+  })
+);
+
+// SVG <g> transform that maps PDF page coordinates to viewport pixels.
+// All glyph/text/image elements live inside this group so their own transforms
+// only encode the PDF-local part and do not change on zoom/pan.
+const svgViewportTransform = computed((): string => {
+  const m = currentViewport.value?.transform;
+  if (!m) return "";
+  return `matrix(${m.map(roundSvg).join(" ")})`;
 });
 
 const selectedViewportRect = computed(() => {
@@ -466,7 +503,7 @@ async function refreshPreview(objectId: number, text: string, selectionToken = g
 }
 
 async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
-  if (!pdfBytes.value || !selectedTextId.value || !canSaveEdit.value) return;
+  if (!selectedTextId.value || !canSaveEdit.value) return;
   clearPreviewTimer();
   isSavingEdit.value = true;
   status.value = `正在保存文本对象 ${selectedTextId.value}...`;
@@ -477,18 +514,49 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
   const closeAfterSave = options.closeAfterSave ?? Boolean(layoutPreview.value?.overflow);
 
   try {
-    const updatedBytes = await commitTextEdit(pdfBytes.value, objectId, savedText, pdfHandle.value);
-    pdfBytes.value = new Uint8Array(updatedBytes);
-    if (closeAfterSave) {
-      await loadPage();
-      clearEditingState();
-    } else {
-      const loaded = await loadPage();
-      const nextObjectId = loaded ? findSavedTextObjectId(loaded.structure.text, objectId, savedText, savedBounds) : null;
-      if (nextObjectId == null) {
+    if (pdfHandle.value != null) {
+      // Fast path: update in-memory document, then refresh only the page structure.
+      // The background PNG and font assets are unchanged and do not need to be re-fetched.
+      // Capture existing image objectUrls before the update so they are preserved:
+      // a text edit never changes page images, but getPageStructureByHandle returns
+      // image objects without objectUrl (that blob data only lives in the initial bundle).
+      const existingImageUrls = new Map(
+        (page.value?.images ?? []).map((img) => [img.id, img.objectUrl])
+      );
+      await updateTextByHandle(pdfHandle.value, objectId, savedText);
+      const structure = await getPageStructureByHandle(pdfHandle.value, pageNumber.value);
+      // Re-attach blob URLs so image SVG overlays remain visible.
+      for (const img of structure.images) {
+        const url = existingImageUrls.get(img.id);
+        if (url) img.objectUrl = url;
+      }
+      page.value = structure;
+      if (closeAfterSave) {
         clearEditingState();
       } else {
-        await beginTextEdit(nextObjectId);
+        const nextObjectId = findSavedTextObjectId(structure.text, objectId, savedText, savedBounds);
+        if (nextObjectId == null) {
+          clearEditingState();
+        } else {
+          await beginTextEdit(nextObjectId);
+        }
+      }
+    } else {
+      // Fallback path (no document handle): serialize + full page reload.
+      if (!pdfBytes.value) return;
+      const updatedBytes = await commitTextEdit(pdfBytes.value, objectId, savedText, null);
+      pdfBytes.value = new Uint8Array(updatedBytes);
+      if (closeAfterSave) {
+        await loadPage();
+        clearEditingState();
+      } else {
+        const loaded = await loadPage();
+        const nextObjectId = loaded ? findSavedTextObjectId(loaded.structure.text, objectId, savedText, savedBounds) : null;
+        if (nextObjectId == null) {
+          clearEditingState();
+        } else {
+          await beginTextEdit(nextObjectId);
+        }
       }
     }
     status.value = `文本对象 ${objectId} 已保存`;
@@ -676,21 +744,24 @@ function backgroundStyle() {
 }
 
 function svgImageTransform(image: StructuredImageObject) {
-  const viewport = currentViewport.value;
-  if (!viewport) return "";
-  const matrix = multiplyMatrices(
-    multiplyMatrices(viewport.transform, image.transform),
-    [1, 0, 0, -1, 0, 1]
-  );
+  // viewport transform is applied by the outer <g svgViewportTransform>
+  const matrix = multiplyMatrices(image.transform, [1, 0, 0, -1, 0, 1]);
   return `matrix(${matrix.map((value) => roundSvg(value)).join(" ")})`;
 }
 
-function exportCurrentPdf() {
-  if (!pdfBytes.value) return;
-  const blob = new Blob([toArrayBuffer(pdfBytes.value)], { type: "application/pdf" });
+async function exportCurrentPdf() {
+  const baseName = pdfFileName.value.replace(/\.pdf$/i, "") || "document";
+  let bytes: Uint8Array;
+  if (pdfHandle.value != null) {
+    bytes = await getPdfBytesByHandle(pdfHandle.value);
+  } else if (pdfBytes.value) {
+    bytes = pdfBytes.value;
+  } else {
+    return;
+  }
+  const blob = new Blob([toArrayBuffer(bytes)], { type: "application/pdf" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
-  const baseName = pdfFileName.value.replace(/\.pdf$/i, "") || "document";
   anchor.href = url;
   anchor.download = `${baseName}-edited.pdf`;
   anchor.click();
@@ -698,9 +769,8 @@ function exportCurrentPdf() {
 }
 
 function svgTextTransform(text: StructuredTextObject) {
-  const viewport = currentViewport.value;
-  if (!viewport) return "";
-  const matrix = multiplyMatrices(multiplyMatrices(viewport.transform, text.transform), [1, 0, 0, -1, 0, 0]);
+  // viewport transform is applied by the outer <g svgViewportTransform>
+  const matrix = multiplyMatrices(text.transform, [1, 0, 0, -1, 0, 0]);
   return `matrix(${matrix.map((value) => roundSvg(value)).join(" ")})`;
 }
 
@@ -851,8 +921,7 @@ function glyphsForSvg(text: StructuredTextObject): LayoutGlyph[] | null {
  * containing StructuredTextObject was assembled (merged scatter group or otherwise).
  */
 function svgGlyphTransform(glyph: LayoutGlyph, text: StructuredTextObject): string {
-  const viewport = currentViewport.value;
-  if (!viewport) return "";
+  // viewport transform is applied by the outer <g svgViewportTransform>
   const glyphMatrix: Matrix2D = [
     text.transform[0],
     text.transform[1],
@@ -861,10 +930,7 @@ function svgGlyphTransform(glyph: LayoutGlyph, text: StructuredTextObject): stri
     glyph.x,
     glyph.y
   ];
-  const matrix = multiplyMatrices(
-    multiplyMatrices(viewport.transform, glyphMatrix),
-    [1, 0, 0, -1, 0, 0]
-  );
+  const matrix = multiplyMatrices(glyphMatrix, [1, 0, 0, -1, 0, 0]);
   return `matrix(${matrix.map((v) => roundSvg(v)).join(" ")})`;
 }
 
@@ -872,17 +938,11 @@ function glyphHasSvgPath(glyph: LayoutGlyph) {
   return Boolean(glyph.svg_fill_path || glyph.svg_stroke_path);
 }
 
-function textHasSvgPaths(text: StructuredTextObject) {
-  return Boolean(glyphsForSvg(text)?.some((glyph) => glyphHasSvgPath(glyph)));
-}
 
 function svgGlyphPathTransform(glyph: LayoutGlyph): string {
-  const viewport = currentViewport.value;
-  if (!viewport) return "";
-  const matrix = glyph.svg_transform
-    ? multiplyMatrices(viewport.transform, glyph.svg_transform)
-    : viewport.transform;
-  return `matrix(${matrix.map((v) => roundSvg(v)).join(" ")})`;
+  // viewport transform is applied by the outer <g svgViewportTransform>;
+  // svg_transform maps from font/glyph space to PDF page space.
+  return glyph.svg_transform ? `matrix(${glyph.svg_transform.map(roundSvg).join(" ")})` : "";
 }
 
 function svgGlyphPathStrokeWidth(glyph: LayoutGlyph) {
@@ -890,21 +950,22 @@ function svgGlyphPathStrokeWidth(glyph: LayoutGlyph) {
 }
 
 /**
- * Returns the viewport-space rect to use as the SVG clip boundary for a text
- * object.  Priority:
- *  1. Session bbox during editing — always the true original bounds.
- *  2. clip_bounds from the PDF content stream — set when a prior overflow save
- *     wrapped the text in `q re W n … Q`.
- *  3. text.bounds as fallback (unedited text with no explicit clip).
+ * Returns the PDF-space rect to use as the SVG clip boundary for a text object,
+ * or null if no clip should be applied.  Priority:
+ *  1. Session bbox during active editing — gives the inline editor its boundary.
+ *  2. clip_bounds from the PDF content stream — set when the PDF has a
+ *     `q re W n … Q` sequence (or when a prior save added one for overflow).
+ *  3. null — unedited text with no explicit PDF clip is NOT clipped in the SVG.
+ *     Previously the fallback was text.bounds, but that caused glyph-ink to be
+ *     clipped when the last character's ink extended past its advance width.
  */
-function textClipRect(text: StructuredTextObject): ViewportRect {
-  const viewport = currentViewport.value;
-  if (!viewport) return { left: 0, top: 0, width: 0, height: 0 };
-  const bounds =
+function textClipAttrs(text: StructuredTextObject): { x: number; y: number; width: number; height: number } | null {
+  const b =
     text.id === selectedTextId.value && editSession.value
       ? editSession.value.bbox
-      : text.clip_bounds ?? text.bounds;
-  return pdfRectToViewportRect(viewport, bounds);
+      : text.clip_bounds ?? null;
+  if (!b) return null;
+  return { x: b.origin.x, y: b.origin.y, width: b.size.width, height: b.size.height };
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -995,140 +1056,150 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
             aria-label="PDF svg text render"
           >
             <defs>
+              <!--
+                Clip path rects are in PDF page coordinates.  The outer <g> applies
+                the viewport transform, so clipPathUnits="userSpaceOnUse" coordinates
+                are resolved in PDF space — matching the elements they clip.
+                Only rendered when textClipAttrs returns a non-null rect; text without
+                an explicit PDF clip sequence (or active edit bbox) is not clipped.
+              -->
               <clipPath
-                v-for="text in renderTextObjects"
-                :key="`clip-${text.id}`"
-                :id="`clip-text-${text.id}`"
+                v-for="item in textRenderItems.filter(i => textClipAttrs(i.text) != null)"
+                :key="`clip-${item.text.id}`"
+                :id="`clip-text-${item.text.id}`"
               >
-                <rect
-                  :x="textClipRect(text).left"
-                  :y="textClipRect(text).top"
-                  :width="textClipRect(text).width"
-                  :height="textClipRect(text).height"
-                />
+                <rect v-bind="textClipAttrs(item.text)!" />
               </clipPath>
             </defs>
-            <image
-              v-for="image in renderImageObjects"
-              :key="`image-${image.id}`"
-              :href="image.objectUrl"
-              width="1"
-              height="1"
-              preserveAspectRatio="none"
-              :transform="svgImageTransform(image)"
-            />
-            <template v-for="text in renderTextObjects" :key="`text-${text.id}`">
-              <!--
-                Per-glyph absolute rendering (scatter-format merged groups and any object
-                where glyph positions are available).  Each character is placed at its exact
-                PDF-space (x, y) coordinate so it aligns with the background bitmap regardless
-                of inter-character spacing variations in the original PDF.
-                Clicking any glyph triggers editing for the whole logical group via text.id,
-                which maps to the primary member of the group — the backend distributes the
-                new text across all group members via repartition_group_text.
-              -->
-              <g
-                v-if="glyphsForSvg(text)"
-                :data-object-id="text.id"
-                :clip-path="`url(#clip-text-${text.id})`"
-              >
-                <text
-                  v-if="textHasSvgPaths(text)"
-                  class="copyable-text-run"
-                  :transform="svgTextTransform(text)"
-                  :font-family="svgFontFamily(text.font_name)"
-                  :font-weight="fontWeightFor(text.font_name)"
-                  font-size="1"
-                  dominant-baseline="alphabetic"
-                  xml:space="preserve"
-                  :textLength="svgTextLength(text)"
-                  :lengthAdjust="svgTextLength(text) != null ? 'spacingAndGlyphs' : undefined"
-                >{{ text.content }}</text>
-                <template
-                  v-for="(glyph, glyphIndex) in (glyphsForSvg(text) ?? [])"
-                  :key="`glyph-${text.id}-${glyphIndex}`"
+            <!--
+              Single <g> carrying the viewport→PDF transform.  All child elements
+              use only their PDF-local transforms, so changing zoom/pan updates
+              only this one attribute instead of thousands of per-glyph matrices.
+            -->
+            <g :transform="svgViewportTransform">
+              <image
+                v-for="image in renderImageObjects"
+                :key="`image-${image.id}`"
+                :href="image.objectUrl"
+                width="1"
+                height="1"
+                preserveAspectRatio="none"
+                :transform="svgImageTransform(image)"
+              />
+              <!-- v-memo="[item.text]": stable items skip VNode creation; only the edited item re-renders. -->
+              <g v-for="item in textRenderItems" :key="`text-${item.text.id}`" v-memo="[item.text]">
+                <!--
+                  Per-glyph absolute rendering: each character placed at its exact
+                  PDF-space position for precise alignment with the background.
+                  A nearly-invisible copyable-text-run overlay (rendered first)
+                  is the target for browser text selection, giving a single
+                  contiguous selection box that matches the PDF advance widths.
+                  Individual glyph <text> elements follow with pointer-events and
+                  user-select disabled so selection falls through to the overlay.
+                -->
+                <g
+                  v-if="item.glyphs"
+                  :data-object-id="item.text.id"
+                  :clip-path="textClipAttrs(item.text) != null ? `url(#clip-text-${item.text.id})` : undefined"
                 >
-                  <g
-                    v-if="glyphHasSvgPath(glyph)"
-                    class="type3-glyph-path"
-                    :transform="svgGlyphPathTransform(glyph)"
-                  >
-                    <path
-                      v-if="glyph.svg_fill_path"
-                      :d="glyph.svg_fill_path"
-                      :fill="svgFill(text)"
-                      stroke="none"
-                      fill-rule="nonzero"
-                    />
-                    <path
-                      v-if="glyph.svg_stroke_path"
-                      :d="glyph.svg_stroke_path"
-                      fill="none"
-                      :stroke="svgStroke(text) === 'none' ? svgFill(text) : svgStroke(text)"
-                      :stroke-width="svgGlyphPathStrokeWidth(glyph)"
-                    />
-                  </g>
                   <text
-                    v-else
-                    :transform="svgGlyphTransform(glyph, text)"
-                    :font-family="svgFontFamily(glyph.font_name ?? text.font_name)"
-                    :font-weight="fontWeightFor(glyph.font_name ?? text.font_name)"
-                    :fill="svgFill(text)"
-                    :stroke="svgStroke(text)"
-                    :stroke-width="svgStrokeWidth(text)"
-                    :paint-order="svgPaintOrder(text)"
-                    :style="svgFontFeatureSettings(text) ? { fontFeatureSettings: svgFontFeatureSettings(text) } : undefined"
+                    class="copyable-text-run"
+                    :transform="svgTextTransform(item.text)"
+                    :font-family="svgFontFamily(item.text.font_name)"
+                    :font-weight="fontWeightFor(item.text.font_name)"
                     font-size="1"
                     dominant-baseline="alphabetic"
-                  >{{ glyph.ch }}</text>
-                </template>
+                    xml:space="preserve"
+                    :textLength="item.textLength"
+                    :lengthAdjust="item.textLength != null ? 'spacingAndGlyphs' : undefined"
+                  >{{ item.text.content }}</text>
+                  <template
+                    v-for="(glyph, glyphIndex) in item.glyphs"
+                    :key="`glyph-${item.text.id}-${glyphIndex}`"
+                  >
+                    <g
+                      v-if="glyphHasSvgPath(glyph)"
+                      class="type3-glyph-path"
+                      :transform="svgGlyphPathTransform(glyph)"
+                    >
+                      <path
+                        v-if="glyph.svg_fill_path"
+                        :d="glyph.svg_fill_path"
+                        :fill="svgFill(item.text)"
+                        stroke="none"
+                        fill-rule="nonzero"
+                      />
+                      <path
+                        v-if="glyph.svg_stroke_path"
+                        :d="glyph.svg_stroke_path"
+                        fill="none"
+                        :stroke="svgStroke(item.text) === 'none' ? svgFill(item.text) : svgStroke(item.text)"
+                        :stroke-width="svgGlyphPathStrokeWidth(glyph)"
+                      />
+                    </g>
+                    <text
+                      v-else
+                      class="per-glyph-text"
+                      :transform="svgGlyphTransform(glyph, item.text)"
+                      :font-family="svgFontFamily(glyph.font_name ?? item.text.font_name)"
+                      :font-weight="fontWeightFor(glyph.font_name ?? item.text.font_name)"
+                      :fill="svgFill(item.text)"
+                      :stroke="svgStroke(item.text)"
+                      :stroke-width="svgStrokeWidth(item.text)"
+                      :paint-order="svgPaintOrder(item.text)"
+                      :style="item.fontFeatureStyle"
+                      font-size="1"
+                      dominant-baseline="alphabetic"
+                    >{{ glyph.ch }}</text>
+                  </template>
+                </g>
+                <!--
+                  Legacy textLength rendering for text objects without per-glyph
+                  position data.  A single <text> distributes characters via
+                  lengthAdjust across the object's PDF-measured width.
+                -->
+                <text
+                  v-else
+                  :transform="svgTextTransform(item.text)"
+                  :font-family="svgFontFamily(item.text.font_name)"
+                  :font-weight="fontWeightFor(item.text.font_name)"
+                  :fill="svgFill(item.text)"
+                  :stroke="svgStroke(item.text)"
+                  :stroke-width="svgStrokeWidth(item.text)"
+                  :paint-order="svgPaintOrder(item.text)"
+                  :style="item.fontFeatureStyle"
+                  font-size="1"
+                  xml:space="preserve"
+                  dominant-baseline="alphabetic"
+                  :textLength="item.textLength"
+                  :lengthAdjust="item.textLength != null ? 'spacingAndGlyphs' : undefined"
+                  :clip-path="textClipAttrs(item.text) != null ? `url(#clip-text-${item.text.id})` : undefined"
+                >
+                  <template v-if="svgTextRuns(item.text)">
+                    <tspan
+                      v-for="(run, runIndex) in svgTextRuns(item.text) ?? []"
+                      :key="`run-${item.text.id}-${runIndex}`"
+                      :font-family="svgFontFamily(run.font_name)"
+                      :font-weight="fontWeightFor(run.font_name)"
+                      :fill="colorToCss(run.color)"
+                    >
+                      {{ run.content }}
+                    </tspan>
+                  </template>
+                  <template v-else-if="svgTextLines(item.text).length > 1">
+                    <tspan
+                      v-for="(line, lineIndex) in svgTextLines(item.text)"
+                      :key="`line-${item.text.id}-${lineIndex}`"
+                      x="0"
+                      :y="lineIndex === 0 ? 0 : lineIndex * 1.2"
+                    >
+                      {{ line }}
+                    </tspan>
+                  </template>
+                  <template v-else>{{ item.text.content }}</template>
+                </text>
               </g>
-              <!--
-                Legacy textLength rendering for text objects without glyph position data.
-                Uses the group transform + lengthAdjust to distribute characters across the
-                object's width.
-              -->
-              <text
-                v-else
-                :transform="svgTextTransform(text)"
-                :font-family="svgFontFamily(text.font_name)"
-                :font-weight="fontWeightFor(text.font_name)"
-                :fill="svgFill(text)"
-                :stroke="svgStroke(text)"
-                :stroke-width="svgStrokeWidth(text)"
-                :paint-order="svgPaintOrder(text)"
-                :style="svgFontFeatureSettings(text) ? { fontFeatureSettings: svgFontFeatureSettings(text) } : undefined"
-                font-size="1"
-                xml:space="preserve"
-                dominant-baseline="alphabetic"
-                :textLength="svgTextLength(text)"
-                :lengthAdjust="svgTextLength(text) != null ? 'spacingAndGlyphs' : undefined"
-                :clip-path="`url(#clip-text-${text.id})`"
-              >
-                <template v-if="svgTextRuns(text)">
-                  <tspan
-                    v-for="(run, runIndex) in svgTextRuns(text) ?? []"
-                    :key="`run-${text.id}-${runIndex}`"
-                    :font-family="svgFontFamily(run.font_name)"
-                    :font-weight="fontWeightFor(run.font_name)"
-                    :fill="colorToCss(run.color)"
-                  >
-                    {{ run.content }}
-                  </tspan>
-                </template>
-                <template v-else-if="svgTextLines(text).length > 1">
-                  <tspan
-                    v-for="(line, lineIndex) in svgTextLines(text)"
-                    :key="`line-${text.id}-${lineIndex}`"
-                    x="0"
-                    :y="lineIndex === 0 ? 0 : lineIndex * 1.2"
-                  >
-                    {{ line }}
-                  </tspan>
-                </template>
-                <template v-else>{{ text.content }}</template>
-              </text>
-            </template>
+            </g>
           </svg>
 
           <svg

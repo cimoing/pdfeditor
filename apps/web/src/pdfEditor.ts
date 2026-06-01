@@ -4,15 +4,18 @@ import init, {
   pdf_close_document,
   pdf_commit_text_edit,
   pdf_commit_text_edit_by_handle,
+  pdf_get_bytes_by_handle,
   pdf_hit_test,
   pdf_hit_test_by_handle,
   pdf_open_document,
   pdf_page_bundle,
   pdf_page_bundle_by_handle,
+  pdf_page_structure_by_handle,
   pdf_preview_text_layout,
   pdf_preview_text_layout_by_handle,
   pdf_start_text_edit,
-  pdf_start_text_edit_by_handle
+  pdf_start_text_edit_by_handle,
+  pdf_update_text_by_handle
 } from "./wasm/pdfeditor_core";
 
 export interface Point {
@@ -349,6 +352,22 @@ export async function commitTextEdit(
   return handle == null
     ? pdf_commit_text_edit(requirePdfBytes(pdfBytes), BigInt(objectId), text)
     : pdf_commit_text_edit_by_handle(handle, BigInt(objectId), text);
+}
+
+export async function updateTextByHandle(handle: number, objectId: number, text: string): Promise<void> {
+  await ensureWasm();
+  pdf_update_text_by_handle(handle, BigInt(objectId), text);
+}
+
+export async function getPageStructureByHandle(handle: number, pageNumber: number): Promise<PageStructure> {
+  await ensureWasm();
+  const json = pdf_page_structure_by_handle(handle, pageNumber);
+  return normalizePageStructure(JSON.parse(json) as PageStructure);
+}
+
+export async function getPdfBytesByHandle(handle: number): Promise<Uint8Array> {
+  await ensureWasm();
+  return pdf_get_bytes_by_handle(handle);
 }
 
 export function asBlobPart(bytes: Uint8Array): ArrayBuffer {

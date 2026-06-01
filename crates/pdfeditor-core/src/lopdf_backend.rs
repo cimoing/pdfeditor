@@ -559,7 +559,7 @@ impl EngineDocument for LopdfDocument {
         let text_drawing_ops: HashSet<&str> = ["Tj", "TJ", "'", "\""].iter().copied().collect();
         let (clip_open_before_bt, clip_close_after_et) =
             match (clip_open_before_bt, clip_close_after_et) {
-                (Some(bt), Some(et)) if bt < et => {
+                (Some(bt), Some(et)) if bt < et && layout_context.object.clip_bounds.is_some() => {
                     // Check: are there any Tj/TJ/etc. operations between bt..=et
                     // that are NOT in the targeted set?
                     let has_non_targeted_text =
@@ -885,7 +885,14 @@ impl EngineDocument for LopdfDocument {
             .change_page_content(page_id, encoded)
             .map_err(|err| CoreError::Engine(format!("failed to write page content: {err}")))?;
 
-        self.extract_text_objects()?;
+        // Re-index only the edited page instead of re-scanning the entire document.
+        // For large PDFs (e.g. the 500-page Rust book) this drops the post-edit
+        // index rebuild from O(total_pages) to O(1).
+        let edited_page = edit_group.page;
+        self.text_objects.remove(&edited_page);
+        self.text_refs.retain(|_, v| v.page != edited_page);
+        self.text_edit_groups.retain(|_, v| v.page != edited_page);
+        self.extract_text_objects_for_page(edited_page)?;
         self.group_text_object(updated_member_ids.get(&id).copied().unwrap_or(id))
     }
 

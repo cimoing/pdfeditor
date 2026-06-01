@@ -237,6 +237,65 @@ pub fn pdf_commit_text_edit_by_handle(
     })
 }
 
+/// Apply a text edit to the in-memory document without serializing the PDF bytes.
+/// Use `pdf_get_bytes_by_handle` to retrieve bytes when needed (e.g. for download).
+#[wasm_bindgen]
+pub fn pdf_update_text_by_handle(
+    handle: u32,
+    object_id: u64,
+    text: &str,
+) -> Result<(), JsValue> {
+    DOCUMENT_STORE.with(|store| {
+        let mut store = store.borrow_mut();
+        let document = store
+            .documents
+            .get_mut(&handle)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        document
+            .ensure_text_index_for_page(page_from_text_object_id(object_id))
+            .map_err(core_error_to_js)?;
+        document
+            .update_text_object(TextObjectId(PdfObjectId(object_id)), text.to_string(), None)
+            .map(|_| ())
+            .map_err(core_error_to_js)
+    })
+}
+
+/// Return the page structure (text objects, images, fonts) as JSON without
+/// rendering the background PNG. Much faster than `pdf_page_bundle_by_handle`
+/// for post-edit refreshes where the background image hasn't changed.
+#[wasm_bindgen]
+pub fn pdf_page_structure_by_handle(handle: u32, page_number: u32) -> Result<String, JsValue> {
+    let page = wasm_page_index(page_number)?;
+    DOCUMENT_STORE.with(|store| {
+        let mut store = store.borrow_mut();
+        let document = store
+            .documents
+            .get_mut(&handle)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        document
+            .ensure_text_index_for_page(page)
+            .map_err(core_error_to_js)?;
+        let structure = document.page_structure(page).map_err(core_error_to_js)?;
+        serde_json::to_string(&structure).map_err(|error| {
+            JsValue::from_str(&format!("failed to serialize page structure JSON: {error}"))
+        })
+    })
+}
+
+/// Serialize the in-memory document to PDF bytes (for download / export).
+#[wasm_bindgen]
+pub fn pdf_get_bytes_by_handle(handle: u32) -> Result<Vec<u8>, JsValue> {
+    DOCUMENT_STORE.with(|store| {
+        let store = store.borrow();
+        let document = store
+            .documents
+            .get(&handle)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        save_pdf_document_to_bytes(document).map_err(core_error_to_js)
+    })
+}
+
 fn encode_page_bundle(bundle: crate::PageLoadBundle) -> Result<Vec<u8>, JsValue> {
     let mut payload = Vec::new();
     let background_png = BinaryAssetInfo::append(
