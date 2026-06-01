@@ -478,13 +478,21 @@ impl EngineDocument for LopdfDocument {
             .collect::<String>();
         let segments = repartition_group_text(&original_group_text, &replacement, &member_plans)
             .unwrap_or_else(|_| proportional_split(&replacement, &member_plans));
+        // If members have different font resources (e.g. FontA–FontB–FontA on one line),
+        // a group-wide fallback would collapse all font boundaries.  In that case, keep each
+        // member on its own font and rely on per-character fallback for individual chars.
+        let has_mixed_fonts = member_plans.windows(2).any(|w| {
+            w[0].font_name.as_deref() != w[1].font_name.as_deref()
+        });
         // Once a text edit group needs CJK fallback, keep the whole edited line on the
         // fallback font. Mixing fallback and the original font in one line makes PDF viewers
         // use different glyph metrics than the SVG preview.
-        let use_group_fallback = member_plans
-            .iter()
-            .zip(segments.iter())
-            .any(|(member, segment)| needs_cjk_fallback_font(member, segment));
+        // Exception: do not apply group-wide fallback when the group already mixes fonts.
+        let use_group_fallback = !has_mixed_fonts
+            && member_plans
+                .iter()
+                .zip(segments.iter())
+                .any(|(member, segment)| needs_cjk_fallback_font(member, segment));
         let needs_char_fallback = !use_group_fallback
             && member_plans
                 .iter()
@@ -5088,15 +5096,6 @@ fn can_join_text_edit_group(
     }
     if round_pdf_value(previous.font_size) != round_pdf_value(next.font_size) {
         return false;
-    }
-    // Never merge objects that use different PDF font resources.  A change in font
-    // means the PDF intentionally uses a distinct typeface (e.g. a name in a different
-    // script) and those runs must stay as separate PDF objects so that font-specific
-    // encoding is applied correctly to each piece independently.
-    if let (Some(a), Some(b)) = (&previous.font_name, &next.font_name) {
-        if a != b {
-            return false;
-        }
     }
     let gap = text_group_gap(previous, next);
     let max_overlap = previous.font_size.max(next.font_size) * 0.35 + 1.0;
