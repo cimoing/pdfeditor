@@ -642,6 +642,10 @@ const hasRunStyleChanges = computed(() => {
   return draftRuns.value.some((r) => r.font_name !== null || r.font_size !== null || r.color !== null);
 });
 
+const draftUsesBuiltInFont = computed(() =>
+  draftRuns.value.some((r) => r.font_name?.startsWith("__builtin__:"))
+);
+
 /** Overflow only matters when the user actually changed the text from the original. */
 const hasEffectiveOverflow = computed(() =>
   Boolean(layoutPreview.value?.overflow) && draftText.value !== editSession.value?.original_text
@@ -716,7 +720,10 @@ async function onFileChange(event: Event) {
   await openFile(file);
   // Pre-embed NotoSans SC — await so the font is ready before the first edit/save.
   if (pdfHandle.value != null) {
-    await setCjkFontByHandle(pdfHandle.value);
+    const embedded = await setCjkFontByHandle(pdfHandle.value);
+    if (!embedded) {
+      status.value = "已打开 PDF，但用于保存内置字体的嵌入字体加载失败";
+    }
   }
   await loadPage();
 }
@@ -925,7 +932,10 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
       // CJK characters that cannot be encoded by the original font are stored
       // with the properly-embedded Noto font rather than the bare STSong-Light
       // standard font (which many PDF viewers cannot render).
-      await setCjkFontByHandle(pdfHandle.value);
+      const cjkFontEmbedded = await setCjkFontByHandle(pdfHandle.value);
+      if (draftUsesBuiltInFont.value && !cjkFontEmbedded) {
+        throw new Error("保存失败：用于写入 PDF 的内置字体没有成功嵌入，请检查字体资源是否可加载后重试。");
+      }
 
       // Fast path: update in-memory document, then refresh only the page structure.
       const existingImageUrls = new Map(

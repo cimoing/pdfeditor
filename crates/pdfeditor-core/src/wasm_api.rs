@@ -476,10 +476,13 @@ pub fn pdf_apply_text_edits_by_handle(handle: u32, edits_json: &str) -> Result<V
 /// (Identity-H encoding) instead of the unembedded STSong-Light standard font.
 /// This prevents "box" rendering in PDF viewers that lack STSong-Light.
 ///
-/// `woff_bytes` must be a valid WOFF1 file (magic 0x774F4646).  Silently ignores
-/// the call if the bytes cannot be decoded or the font cannot be parsed.
+/// `woff_bytes` must be a valid WOFF1 file (magic 0x774F4646).
+///
+/// Returns `true` when the font was decoded, parsed, and stored for later PDF
+/// embedding; `false` means later fallback text would still use the unembedded
+/// STSong-Light path.
 #[wasm_bindgen]
-pub fn pdf_set_cjk_font_by_handle(handle: u32, woff_bytes: &[u8]) -> Result<(), JsValue> {
+pub fn pdf_set_cjk_font_by_handle(handle: u32, woff_bytes: &[u8]) -> Result<bool, JsValue> {
     DOCUMENT_STORE.with(|store| {
         let mut store = store.borrow_mut();
         let document = store
@@ -491,9 +494,10 @@ pub fn pdf_set_cjk_font_by_handle(handle: u32, woff_bytes: &[u8]) -> Result<(), 
         if let Some(sfnt) = crate::font_embed::woff1_to_sfnt(woff_bytes) {
             if let Some(data) = crate::font_embed::parse_cjk_font(sfnt) {
                 document.set_cjk_font(data);
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     })
 }
 

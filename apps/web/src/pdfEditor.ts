@@ -386,20 +386,22 @@ let _notoWoffCache: Uint8Array | null = null;
  * instead of the unembedded STSong-Light standard font, which many modern PDF viewers
  * (especially browser-based) cannot render, producing boxes.
  *
- * This is a no-op if the font has already been embedded for this handle.
+ * Returns true if the backend accepted the font.  A false return means edits that
+ * need CJK/built-in fallback would be written with the legacy unembedded PDF
+ * fallback font, which can render as boxes in many viewers.
  */
-export async function setCjkFontByHandle(handle: number): Promise<void> {
+export async function setCjkFontByHandle(handle: number): Promise<boolean> {
   await ensureWasm();
   if (!_notoWoffCache) {
     try {
       const response = await fetch(notoSansScWoffUrl);
-      if (!response.ok) return;
+      if (!response.ok) return false;
       _notoWoffCache = new Uint8Array(await response.arrayBuffer());
     } catch {
-      return; // font unavailable — fall back to STSong-Light silently
+      return false;
     }
   }
-  pdf_set_cjk_font_by_handle(handle, _notoWoffCache);
+  return pdf_set_cjk_font_by_handle(handle, _notoWoffCache);
 }
 
 export async function updateTextRunsByHandle(

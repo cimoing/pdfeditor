@@ -8913,7 +8913,9 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
                 let mut map = parse_to_unicode_cmap(&content);
                 map.identity_utf16 = identity_utf16;
                 add_type3_encoding_fallbacks(font, &mut map);
-                return Some(map);
+                if !map.forward.is_empty() || map.identity_utf16 {
+                    return Some(map);
+                }
             }
         }
     }
@@ -8939,6 +8941,10 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
                 return Some(map);
             }
         }
+    }
+
+    if let Some(map) = identity_cid_to_unicode_map_from_embedded_font(document, font) {
+        return Some(map);
     }
 
     // Fallback: Check Encoding entry
@@ -8978,6 +8984,69 @@ fn parse_font_to_unicode(document: &Document, font: &Dictionary) -> Option<ToUni
     }
 
     None
+}
+
+fn identity_cid_to_unicode_map_from_embedded_font(
+    document: &Document,
+    font: &Dictionary,
+) -> Option<ToUnicodeMap> {
+    if !font_uses_identity_cid_to_gid(document, font) {
+        return None;
+    }
+    let descriptor = font_descriptor(document, font)?;
+    let sfnt = font_raw_sfnt_bytes(document, descriptor)?;
+    let face = ttf_parser::Face::parse(&sfnt, 0).ok()?;
+    let mut map = ToUnicodeMap::default();
+    let cmap = face.tables().cmap?;
+
+    for subtable in cmap.subtables {
+        if !subtable.is_unicode() {
+            continue;
+        }
+        subtable.codepoints(|codepoint| {
+            let Some(character) = char::from_u32(codepoint) else {
+                return;
+            };
+            let Some(glyph_id) = face.glyph_index(character) else {
+                return;
+            };
+            if glyph_id.0 == 0 {
+                return;
+            }
+            map.insert(glyph_id.0.to_be_bytes().to_vec(), character.to_string());
+        });
+        break;
+    }
+
+    (!map.forward.is_empty()).then_some(map)
+}
+
+fn font_uses_identity_cid_to_gid(document: &Document, font: &Dictionary) -> bool {
+    font_cid_to_gid_map_name(document, font)
+        .as_deref()
+        .is_some_and(|name| name == "Identity")
+}
+
+fn font_cid_to_gid_map_name(document: &Document, font: &Dictionary) -> Option<String> {
+    if let Some(name) = font
+        .get(b"CIDToGIDMap")
+        .ok()
+        .and_then(object_name_bytes)
+    {
+        return Some(name);
+    }
+
+    let descendants = font
+        .get(b"DescendantFonts")
+        .ok()
+        .and_then(|object| array_from_object(document, object))?;
+    let descendant = descendants
+        .first()
+        .and_then(|object| dictionary_from_object(document, object))?;
+    descendant
+        .get(b"CIDToGIDMap")
+        .ok()
+        .and_then(object_name_bytes)
 }
 
 fn add_type3_encoding_fallbacks(font: &Dictionary, map: &mut ToUnicodeMap) {
