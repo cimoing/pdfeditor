@@ -1,11 +1,12 @@
 import { ref } from "vue";
 import { startTextEdit, previewTextLayout, commitTextEdit } from "../pdfEditor";
-import type { TextEditSessionInfo, TextLayoutPreview } from "../pdfEditor";
+import type { TextEditSessionInfo, TextLayoutPreview, RichTextRun } from "../pdfEditor";
 
 export function usePdfEditor() {
   const selectedTextId = ref<number | null>(null);
   const editSession = ref<TextEditSessionInfo | null>(null);
   const draftText = ref("");
+  const draftRuns = ref<RichTextRun[]>([]);
   const layoutPreview = ref<TextLayoutPreview | null>(null);
   const isPreparingEdit = ref(false);
   const isSavingEdit = ref(false);
@@ -28,6 +29,7 @@ export function usePdfEditor() {
     selectedTextId.value = null;
     editSession.value = null;
     draftText.value = "";
+    draftRuns.value = [];
     layoutPreview.value = null;
     isPreparingEdit.value = false;
     isSavingEdit.value = false;
@@ -58,6 +60,7 @@ export function usePdfEditor() {
     selectedTextId,
     editSession,
     draftText,
+    draftRuns,
     layoutPreview,
     isPreparingEdit,
     isSavingEdit,

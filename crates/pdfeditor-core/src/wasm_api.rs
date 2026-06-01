@@ -1,4 +1,5 @@
 use crate::lopdf_backend::{open_lopdf_document_from_bytes_unindexed, LopdfDocument};
+use crate::types::{Color, TextRun};
 use crate::{
     open_lopdf_document_from_bytes, page_background_png_from_pdf_bytes,
     page_font_assets_from_pdf_bytes, page_image_png_from_pdf_bytes,
@@ -413,21 +414,7 @@ pub fn pdf_apply_text_edits(pdf_bytes: &[u8], edits_json: &str) -> Result<Vec<u8
     let mut document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
 
     for edit in request.edits {
-        match edit.kind.as_str() {
-            "replace_text" | "update_text" => {
-                document
-                    .ensure_text_index_for_page(page_from_text_object_id(edit.id))
-                    .map_err(core_error_to_js)?;
-                document
-                    .update_text_object(TextObjectId(PdfObjectId(edit.id)), edit.content, None)
-                    .map_err(core_error_to_js)?;
-            }
-            kind => {
-                return Err(JsValue::from_str(&format!(
-                    "unsupported edit operation: {kind}"
-                )));
-            }
-        }
+        apply_text_edit(&mut document, edit).map_err(core_error_to_js)?;
     }
 
     save_pdf_document_to_bytes(&document).map_err(core_error_to_js)
@@ -435,6 +422,33 @@ pub fn pdf_apply_text_edits(pdf_bytes: &[u8], edits_json: &str) -> Result<Vec<u8
 
 fn page_from_text_object_id(object_id: u64) -> PageIndex {
     PageIndex((object_id >> 32) as u32)
+}
+
+fn apply_text_edit(document: &mut LopdfDocument, edit: TextEdit) -> crate::CoreResult<()> {
+    let id = TextObjectId(PdfObjectId(edit.id));
+    document.ensure_text_index_for_page(page_from_text_object_id(edit.id))?;
+    match edit.kind.as_str() {
+        "replace_text" | "update_text" => {
+            document.update_text_object(id, edit.content, None)?;
+        }
+        "replace_runs" => {
+            let runs = text_runs_from_input(edit.runs);
+            document.update_text_object_runs(id, runs)?;
+        }
+        kind => {
+            return Err(crate::CoreError::InvalidOperation(format!(
+                "unsupported edit operation: {kind}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn text_runs_from_input(inputs: Vec<TextRunInput>) -> Vec<TextRun> {
+    inputs
+        .into_iter()
+        .map(|r| TextRun::new(r.content, r.font_name, r.font_size, Color { r: r.color[0], g: r.color[1], b: r.color[2], a: r.color[3] }))
+        .collect()
 }
 
 #[wasm_bindgen]
@@ -449,24 +463,39 @@ pub fn pdf_apply_text_edits_by_handle(handle: u32, edits_json: &str) -> Result<V
             .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
 
         for edit in request.edits {
-            match edit.kind.as_str() {
-                "replace_text" | "update_text" => {
-                    document
-                        .ensure_text_index_for_page(page_from_text_object_id(edit.id))
-                        .map_err(core_error_to_js)?;
-                    document
-                        .update_text_object(TextObjectId(PdfObjectId(edit.id)), edit.content, None)
-                        .map_err(core_error_to_js)?;
-                }
-                kind => {
-                    return Err(JsValue::from_str(&format!(
-                        "unsupported edit operation: {kind}"
-                    )));
-                }
-            }
+            apply_text_edit(document, edit).map_err(core_error_to_js)?;
         }
 
         save_pdf_document_to_bytes(document).map_err(core_error_to_js)
+    })
+}
+
+/// Update a text object with multiple styled runs without serializing PDF bytes.
+/// `runs_json` is a JSON array of `{ content, font_name, font_size, color }` objects,
+/// where `color` is `[r, g, b, a]` (0–255 each).
+#[wasm_bindgen]
+pub fn pdf_update_text_runs_by_handle(
+    handle: u32,
+    object_id: u64,
+    runs_json: &str,
+) -> Result<(), JsValue> {
+    let runs_input: Vec<TextRunInput> = serde_json::from_str(runs_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid runs JSON: {e}")))?;
+    let runs = text_runs_from_input(runs_input);
+    DOCUMENT_STORE.with(|store| {
+        let mut store = store.borrow_mut();
+        let document = store
+            .documents
+            .get_mut(&handle)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        let id = TextObjectId(PdfObjectId(object_id));
+        document
+            .ensure_text_index_for_page(page_from_text_object_id(object_id))
+            .map_err(core_error_to_js)?;
+        document
+            .replace_text_object_with_runs(id, runs)
+            .map(|_| ())
+            .map_err(core_error_to_js)
     })
 }
 
@@ -480,7 +509,18 @@ struct TextEdit {
     #[serde(rename = "type")]
     kind: String,
     id: u64,
+    #[serde(default)]
     content: String,
+    #[serde(default)]
+    runs: Vec<TextRunInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TextRunInput {
+    content: String,
+    font_name: Option<String>,
+    font_size: f32,
+    color: [u8; 4],
 }
 
 #[derive(Debug, Serialize)]

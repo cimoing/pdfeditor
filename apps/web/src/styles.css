@@ -300,10 +300,48 @@ button:disabled {
   right: -5px;
 }
 
+.inline-run-toolbar {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid #b9c3cd;
+  border-bottom: none;
+  box-shadow: 0 -2px 6px rgba(31, 41, 55, 0.1);
+  white-space: nowrap;
+  z-index: 1;
+}
+
+.inline-run-toolbar select {
+  border: 1px solid #b9c3cd;
+  padding: 1px 3px;
+  font-size: 11px;
+  max-width: 130px;
+  background: #fff;
+}
+
+.toolbar-size-input {
+  border: 1px solid #b9c3cd;
+  padding: 1px 3px;
+  font-size: 11px;
+  width: 52px;
+  background: #fff;
+}
+
+.toolbar-run-label {
+  font-size: 10px;
+  color: #667085;
+  padding: 0 2px;
+}
+
 .inline-text-editor {
   display: block;
   width: 100%;
-  overflow: hidden;
+  overflow: visible;
   padding: 0 2px;
   border: 1px solid rgba(31, 111, 235, 0.72);
   outline: 2px solid rgba(31, 111, 235, 0.16);
@@ -311,11 +349,29 @@ button:disabled {
   box-shadow: 0 2px 8px rgba(31, 41, 55, 0.12);
   transform-origin: left top;
   box-sizing: border-box;
+  white-space: nowrap;
+  cursor: text;
 }
 
 .inline-text-editor.overflow {
   border-color: rgba(217, 45, 32, 0.82);
   outline-color: rgba(217, 45, 32, 0.16);
+}
+
+.inline-text-editor.disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.inline-text-editor [data-run-id] {
+  display: inline;
+  white-space: pre;
+  position: relative;
+}
+
+/* Faint underline to visually separate adjacent runs */
+.inline-text-editor [data-run-id]:not(:only-child) {
+  border-bottom: 1px dashed rgba(31, 111, 235, 0.35);
 }
 
 .empty-state {

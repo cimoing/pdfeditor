@@ -15,7 +15,8 @@ import init, {
   pdf_preview_text_layout_by_handle,
   pdf_start_text_edit,
   pdf_start_text_edit_by_handle,
-  pdf_update_text_by_handle
+  pdf_update_text_by_handle,
+  pdf_update_text_runs_by_handle
 } from "./wasm/pdfeditor_core";
 
 export interface Point {
@@ -76,6 +77,15 @@ export interface TextRunInfo {
   font_name: string | null;
   font_size: number;
   color: { r: number; g: number; b: number; a: number };
+}
+
+/** A rich text run used in the editor.  `null` fields inherit from the base text object. */
+export interface RichTextRun {
+  id: string;
+  content: string;
+  font_name: string | null;
+  font_size: number | null;
+  color: { r: number; g: number; b: number; a: number } | null;
 }
 
 export interface StructuredVisualTextObject {
@@ -357,6 +367,27 @@ export async function commitTextEdit(
 export async function updateTextByHandle(handle: number, objectId: number, text: string): Promise<void> {
   await ensureWasm();
   pdf_update_text_by_handle(handle, BigInt(objectId), text);
+}
+
+export async function updateTextRunsByHandle(
+  handle: number,
+  objectId: number,
+  runs: RichTextRun[],
+  baseColor: { r: number; g: number; b: number; a: number },
+  baseFontName: string | null,
+  baseFontSize: number
+): Promise<void> {
+  await ensureWasm();
+  const payload = runs.map((run) => ({
+    content: run.content,
+    font_name: run.font_name ?? baseFontName,
+    font_size: run.font_size ?? baseFontSize,
+    color: (() => {
+      const c = run.color ?? baseColor;
+      return [c.r, c.g, c.b, c.a];
+    })()
+  }));
+  pdf_update_text_runs_by_handle(handle, BigInt(objectId), JSON.stringify(payload));
 }
 
 export async function getPageStructureByHandle(handle: number, pageNumber: number): Promise<PageStructure> {

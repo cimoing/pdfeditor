@@ -641,6 +641,10 @@ impl EngineDocument for LopdfDocument {
         // chars placed by later members continue seamlessly after earlier members' chars.
         let mut global_scatter_pts = 0.0f32;
 
+        // Index in `rebuilt_operations` after the last operation emitted for any targeted member.
+        // After the loop, operations from this index onward are pass-through (subsequent content).
+        let mut post_edit_rebuild_idx: usize = 0;
+
         for (operation_index, operation) in content.operations.into_iter().enumerate() {
             if let Some(member_id) = targeted_operation_indexes.get(&operation_index) {
                 let member_plan = member_map.get(member_id).ok_or_else(|| {
@@ -657,6 +661,7 @@ impl EngineDocument for LopdfDocument {
                                 tj_index as u32,
                             ))),
                         );
+                        post_edit_rebuild_idx = rebuilt_operations.len();
                         continue;
                     }
                 }
@@ -720,6 +725,7 @@ impl EngineDocument for LopdfDocument {
                             updated_member_ids.insert(*group_member_id, updated_id);
                         }
                     }
+                    post_edit_rebuild_idx = rebuilt_operations.len();
                     continue;
                 }
 
@@ -853,6 +859,7 @@ impl EngineDocument for LopdfDocument {
                         id_index as u32,
                     ))),
                 );
+                post_edit_rebuild_idx = rebuilt_operations.len();
             } else {
                 // Emit `q re W n` immediately before the BT that opens the targeted block.
                 if Some(operation_index) == clip_open_before_bt {
@@ -876,6 +883,90 @@ impl EngineDocument for LopdfDocument {
                 }
             }
         }
+        // ── Post-edit: shift subsequent same-baseline Tm operators ──────────────────────────
+        //
+        // When the replacement is wider or narrower than the original text, every text object
+        // on the same line that starts at or after the original group's right edge must have
+        // its absolute Tm x-coordinate adjusted by `delta_x` so that characters don't overlap
+        // or leave unwanted gaps.
+        //
+        // `global_scatter_pts` is the accumulated advance of the scatter path in "pre-matrix
+        // units" (before the anchor matrix applies its scale).  For the simple-Tj path
+        // (whole_operation_replacements was used), `global_scatter_pts` stays 0 and we
+        // estimate the new width from the member's metrics instead.
+        if post_edit_rebuild_idx > 0 {
+            let anchor_x = anchor_text_matrix[4];
+            let anchor_y = anchor_text_matrix[5];
+            // x-axis scale of the text matrix — handles the "font size embedded in Tm" pattern.
+            let anchor_scale_x =
+                f32::hypot(anchor_text_matrix[0], anchor_text_matrix[1]).max(0.001);
+
+            let original_end_x =
+                layout_context.object.bounds.origin.x + layout_context.object.bounds.size.width;
+
+            let new_end_x = if global_scatter_pts > 0.0 {
+                // Scatter path: convert pre-matrix units → user space.
+                anchor_x + anchor_scale_x * global_scatter_pts
+            } else {
+                // Simple-Tj path: estimate new advance from the first member's metrics.
+                let new_user_width = member_plans.first().map(|member| {
+                    let text_state = operation_states
+                        .values()
+                        .next()
+                        .map(|(_, state)| state.clone())
+                        .unwrap_or_default();
+                    let seg = segment_map
+                        .get(&member.id)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    seg.chars()
+                        .map(|ch| {
+                            let enc = member
+                                .font_map
+                                .as_ref()
+                                .and_then(|m| m.encode(&ch.to_string()));
+                            let advance = enc
+                                .as_deref()
+                                .and_then(|bytes| {
+                                    member
+                                        .metrics
+                                        .as_ref()
+                                        .map(|m| m.text_advance(bytes, &text_state))
+                                })
+                                .unwrap_or_else(|| {
+                                    estimate_text_width(&ch.to_string(), member.font_size)
+                                        / member.font_size.max(1.0)
+                                });
+                            advance * member.font_size * anchor_scale_x
+                        })
+                        .sum::<f32>()
+                });
+                anchor_x + new_user_width.unwrap_or(0.0)
+            };
+
+            let delta_x = new_end_x - original_end_x;
+
+            // Only bother shifting if the change is more than half a point.
+            if delta_x.abs() > 0.5 {
+                // Tolerance for "same baseline": half a point plus a fraction of the scale.
+                let y_tolerance = 1.0f32 + anchor_scale_x * 0.1;
+
+                // Only look at operations that come after the last edited operation,
+                // i.e. pass-through content from the original stream.
+                for op in &mut rebuilt_operations[post_edit_rebuild_idx..] {
+                    if op.operator == "Tm" && op.operands.len() == 6 {
+                        let op_x = object_to_f32(&op.operands[4]).unwrap_or(0.0);
+                        let op_y = object_to_f32(&op.operands[5]).unwrap_or(0.0);
+                        if (op_y - anchor_y).abs() < y_tolerance
+                            && op_x >= original_end_x - 0.5
+                        {
+                            op.operands[4] = Object::Real(op_x + delta_x);
+                        }
+                    }
+                }
+            }
+        }
+
         content.operations = rebuilt_operations;
 
         let encoded = content
@@ -888,6 +979,239 @@ impl EngineDocument for LopdfDocument {
         // Re-index only the edited page instead of re-scanning the entire document.
         // For large PDFs (e.g. the 500-page Rust book) this drops the post-edit
         // index rebuild from O(total_pages) to O(1).
+        let edited_page = edit_group.page;
+        self.text_objects.remove(&edited_page);
+        self.text_refs.retain(|_, v| v.page != edited_page);
+        self.text_edit_groups.retain(|_, v| v.page != edited_page);
+        self.extract_text_objects_for_page(edited_page)?;
+        self.group_text_object(updated_member_ids.get(&id).copied().unwrap_or(id))
+    }
+
+    /// Completely replaces the original text operations for `id`'s edit group with fresh
+    /// per-character Tm+Tj sequences built from `runs`, each run using its own font / size.
+    /// This ignores the original PDF text-object structure and reconstructs the content
+    /// from scratch, then adjusts subsequent same-baseline text objects by the width delta.
+    fn replace_text_object_with_runs(
+        &mut self,
+        id: TextObjectId,
+        runs: Vec<TextRun>,
+    ) -> CoreResult<TextObject> {
+        let edit_group = self.text_edit_group(id)?;
+        let page_id = self.page_id(edit_group.page)?;
+        let font_maps = self.page_font_maps(page_id);
+        let font_metrics = self.page_font_metrics(page_id);
+        let content_bytes = self.document.get_page_content(page_id).map_err(|err| {
+            CoreError::Engine(format!("failed to read page content stream: {err}"))
+        })?;
+        let mut content = Content::decode(&content_bytes)
+            .map_err(|err| CoreError::Engine(format!("failed to decode content stream: {err}")))?;
+
+        let first_member_id = *edit_group
+            .member_ids
+            .first()
+            .ok_or_else(|| CoreError::NotFound("empty edit group".into()))?;
+
+        let first_text_ref = self
+            .text_refs
+            .get(&first_member_id)
+            .cloned()
+            .ok_or_else(|| {
+                CoreError::NotFound(format!("text ref for {}", (first_member_id.0).0))
+            })?;
+
+        let current_objects = self
+            .text_objects
+            .get(&edit_group.page)
+            .cloned()
+            .unwrap_or_default();
+        let first_obj = current_objects
+            .iter()
+            .find(|o| o.id == first_member_id)
+            .cloned()
+            .ok_or_else(|| {
+                CoreError::NotFound(format!("text object {}", (first_member_id.0).0))
+            })?;
+
+        let orig_font_name = first_text_ref.font_name.clone();
+        let orig_font_size = first_obj.font_size;
+        let original_end_x = first_obj.bounds.origin.x + first_obj.bounds.size.width;
+
+        // Pre-pass: capture text matrix and state just before the first targeted operation.
+        let first_op_index = first_text_ref.operation_index;
+        let mut pre_pass = PageParseState::default();
+        for (op_index, operation) in content.operations.iter().enumerate() {
+            if op_index == first_op_index {
+                break;
+            }
+            update_page_state(&mut pre_pass, operation);
+            let metrics = pre_pass.text.font_name.as_ref().and_then(|n| font_metrics.get(n));
+            advance_page_text_state(&mut pre_pass, operation, metrics);
+        }
+        let anchor_tm = pre_pass.text_matrix;
+        let anchor_state = pre_pass.text.clone();
+        let anchor_x = anchor_tm[4];
+        let anchor_y = anchor_tm[5];
+        let anchor_scale_x = f32::hypot(anchor_tm[0], anchor_tm[1]).max(0.001);
+
+        // Build replacement operations: per-char Tm+Tj, one Tf per font/size change.
+        let mut replacement_ops: Vec<Operation> = Vec::new();
+        let mut cursor_pts = 0.0f32; // accumulated advance in pre-matrix units
+        let mut prev_font_key: Option<(String, u32)> = None; // (name, size*1000)
+        let mut first_tj_in_replacement: Option<usize> = None;
+
+        // Reset char/word spacing so runs flow cleanly.
+        replacement_ops.push(Operation::new("Tc", vec![Object::Integer(0)]));
+        replacement_ops.push(Operation::new("Tw", vec![Object::Integer(0)]));
+
+        for run in &runs {
+            if run.content.is_empty() {
+                continue;
+            }
+            let run_font_name = run
+                .font_name
+                .as_deref()
+                .or(orig_font_name.as_deref())
+                .unwrap_or("F0");
+            let run_font_size = run.font_size;
+            let font_key = (run_font_name.to_string(), (run_font_size * 1000.0) as u32);
+
+            if prev_font_key.as_ref() != Some(&font_key) {
+                replacement_ops.push(font_set_operation(run_font_name, run_font_size));
+                prev_font_key = Some(font_key);
+            }
+
+            let run_font_map = font_maps.get(run_font_name);
+            let run_metrics = font_metrics.get(run_font_name);
+
+            for ch in run.content.chars() {
+                let char_str = ch.to_string();
+
+                // Absolute Tm for this character using the anchor matrix + accumulated offset.
+                let char_tm =
+                    multiply_matrix(anchor_tm, [1.0, 0.0, 0.0, 1.0, cursor_pts, 0.0]);
+                replacement_ops.push(Operation::new(
+                    "Tm",
+                    vec![
+                        Object::Real(char_tm[0]),
+                        Object::Real(char_tm[1]),
+                        Object::Real(char_tm[2]),
+                        Object::Real(char_tm[3]),
+                        Object::Real(char_tm[4]),
+                        Object::Real(char_tm[5]),
+                    ],
+                ));
+
+                // Encode the character for the run's font; fall back to UTF-16BE hex.
+                let char_obj = run_font_map
+                    .and_then(|fm| fm.encode(&char_str))
+                    .map(|bytes| {
+                        let fmt = if bytes.len() == 1 {
+                            StringFormat::Literal
+                        } else {
+                            StringFormat::Hexadecimal
+                        };
+                        Object::String(bytes, fmt)
+                    })
+                    .unwrap_or_else(|| {
+                        Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal)
+                    });
+
+                let tj_idx = replacement_ops.len();
+                if first_tj_in_replacement.is_none() {
+                    first_tj_in_replacement = Some(tj_idx);
+                }
+                replacement_ops.push(Operation::new("Tj", vec![char_obj]));
+
+                // Advance the cursor by this glyph's advance in pre-matrix units.
+                let advance = run_font_map
+                    .and_then(|fm| fm.encode(&char_str))
+                    .as_deref()
+                    .and_then(|bytes| {
+                        run_metrics.map(|m| m.text_advance(bytes, &anchor_state))
+                    })
+                    .unwrap_or_else(|| {
+                        fallback_char_advance(ch) * (anchor_state.horizontal_scaling / 100.0)
+                    });
+                cursor_pts += advance * run_font_size;
+            }
+        }
+
+        // Restore original font and spacing after all runs.
+        if let Some(of) = orig_font_name.as_deref() {
+            replacement_ops.push(font_set_operation(of, orig_font_size));
+        }
+        if anchor_state.char_spacing != 0.0 {
+            replacement_ops
+                .push(Operation::new("Tc", vec![Object::Real(anchor_state.char_spacing)]));
+        }
+        if anchor_state.word_spacing != 0.0 {
+            replacement_ops
+                .push(Operation::new("Tw", vec![Object::Real(anchor_state.word_spacing)]));
+        }
+
+        // All content-stream indexes of the group's original text operations.
+        let targeted_indexes: BTreeMap<usize, TextObjectId> = edit_group
+            .member_ids
+            .iter()
+            .filter_map(|mid| self.text_refs.get(mid).map(|r| (r.operation_index, *mid)))
+            .collect();
+
+        // Rebuild the content stream: inject replacement_ops at the first targeted index,
+        // silently drop all other targeted indexes (delete original objects).
+        let mut rebuilt: Vec<Operation> =
+            Vec::with_capacity(content.operations.len() + replacement_ops.len());
+        let mut post_edit_idx = 0usize;
+        let mut updated_member_ids: HashMap<TextObjectId, TextObjectId> = HashMap::new();
+        let mut replacement_opt = Some(replacement_ops);
+
+        for (op_index, operation) in content.operations.into_iter().enumerate() {
+            if targeted_indexes.contains_key(&op_index) {
+                if let Some(ops) = replacement_opt.take() {
+                    // Insert replacement at position of the FIRST targeted operation.
+                    let insert_at = rebuilt.len();
+                    let new_first_tj = insert_at
+                        + first_tj_in_replacement.unwrap_or(ops.len().saturating_sub(1));
+                    rebuilt.extend(ops);
+                    post_edit_idx = rebuilt.len();
+
+                    let new_id = TextObjectId(PdfObjectId(encode_text_object_id(
+                        edit_group.page.0,
+                        new_first_tj as u32,
+                    )));
+                    for gid in &edit_group.member_ids {
+                        updated_member_ids.insert(*gid, new_id);
+                    }
+                }
+                // All original targeted operations are removed (replaced by the above).
+            } else {
+                rebuilt.push(operation);
+            }
+        }
+
+        // Post-edit: shift subsequent same-baseline Tm operators by the width delta.
+        let new_end_x = anchor_x + anchor_scale_x * cursor_pts;
+        let delta_x = new_end_x - original_end_x;
+        if delta_x.abs() > 0.5 && post_edit_idx > 0 {
+            let y_tolerance = 1.0f32 + anchor_scale_x * 0.1;
+            for op in &mut rebuilt[post_edit_idx..] {
+                if op.operator == "Tm" && op.operands.len() == 6 {
+                    let op_x = object_to_f32(&op.operands[4]).unwrap_or(0.0);
+                    let op_y = object_to_f32(&op.operands[5]).unwrap_or(0.0);
+                    if (op_y - anchor_y).abs() < y_tolerance && op_x >= original_end_x - 0.5 {
+                        op.operands[4] = Object::Real(op_x + delta_x);
+                    }
+                }
+            }
+        }
+
+        content.operations = rebuilt;
+        let encoded = content
+            .encode()
+            .map_err(|err| CoreError::Engine(format!("failed to encode content stream: {err}")))?;
+        self.document
+            .change_page_content(page_id, encoded)
+            .map_err(|err| CoreError::Engine(format!("failed to write page content: {err}")))?;
+
         let edited_page = edit_group.page;
         self.text_objects.remove(&edited_page);
         self.text_refs.retain(|_, v| v.page != edited_page);

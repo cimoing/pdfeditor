@@ -118,6 +118,11 @@ pub trait EngineDocument {
         id: TextObjectId,
         runs: Vec<TextRun>,
     ) -> CoreResult<TextObject>;
+    fn replace_text_object_with_runs(
+        &mut self,
+        id: TextObjectId,
+        runs: Vec<TextRun>,
+    ) -> CoreResult<TextObject>;
     fn update_text_object_bounds(
         &mut self,
         id: TextObjectId,
@@ -316,6 +321,15 @@ impl EngineDocument for MockEngineDocument {
         }
 
         Err(CoreError::NotFound(format!("text object {}", (id.0).0)))
+    }
+
+    fn replace_text_object_with_runs(
+        &mut self,
+        id: TextObjectId,
+        runs: Vec<TextRun>,
+    ) -> CoreResult<TextObject> {
+        // Mock: delegate to update_text_object_runs
+        self.update_text_object_runs(id, runs)
     }
 
     fn update_text_object_bounds(

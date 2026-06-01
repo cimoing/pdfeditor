@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watchEffect } from "vue";
-import type { LayoutGlyph, StructuredImageObject, StructuredTextObject } from "./pdfEditor";
+import { computed, nextTick, onBeforeUnmount, ref, watch, watchEffect } from "vue";
+import type { LayoutGlyph, RichTextRun, StructuredImageObject, StructuredTextObject } from "./pdfEditor";
 import {
   commitTextEdit,
   describePdfFontUsage,
@@ -9,11 +9,13 @@ import {
   previewTextLayout,
   resolvePdfFontFamily,
   startTextEdit,
-  updateTextByHandle
+  updateTextByHandle,
+  updateTextRunsByHandle
 } from "./pdfEditor";
 import { pdfRectToViewportRect, pdfToViewport, viewportToPdf, type Matrix2D } from "./viewport";
 import { usePdfDocument } from "./composables/usePdfDocument";
 import { usePdfEditor } from "./composables/usePdfEditor";
+import RunsEditor from "./components/RunsEditor.vue";
 
 const {
   pdfBytes,
@@ -36,6 +38,7 @@ const {
   selectedTextId,
   editSession,
   draftText,
+  draftRuns,
   layoutPreview,
   isPreparingEdit,
   isSavingEdit,
@@ -49,7 +52,12 @@ const {
 } = usePdfEditor();
 
 const fontAssetMap = computed(() => new Map(fontAssets.value.map((font) => [font.resource_name, font])));
-const inlineEditor = ref<HTMLInputElement | null>(null);
+/** ref to the contenteditable inline rich-text editor div */
+const inlineEditor = ref<HTMLDivElement | null>(null);
+/** True while we are programmatically updating the contenteditable DOM to avoid a feedback loop */
+let skipNextDomSync = false;
+/** ID of the run span currently under the cursor (used to set toolbar values) */
+const activeRunId = ref<string | null>(null);
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 
 // ── Edit-box resize state ──────────────────────────────────────────────────
@@ -111,9 +119,6 @@ watchEffect(() => {
     return;
   }
 
-  // Average advance per character from the PDF font metrics.
-  // editSession.glyphs already incorporates TJ compression (layout_preview_glyphs
-  // in the backend applies the compression factor before returning the session).
   const validGlyphs = session.glyphs.filter((g) => g.advance > 0);
   if (!validGlyphs.length) {
     editorFontScaleX.value = 1.0;
@@ -121,11 +126,9 @@ watchEffect(() => {
   }
   const avgPdfAdvance = validGlyphs.reduce((s, g) => s + g.advance, 0) / validGlyphs.length;
 
-  // Convert PDF advance (in normalised glyph units) to viewport pixels.
   const effFs = effectiveFontSize(text);
   const targetPx = avgPdfAdvance * effFs * viewport.zoom;
 
-  // Measure the fallback font at the exact CSS size we will use in the textarea.
   const cssFontSizePx = Math.max(10, effFs * viewport.zoom);
   const cssFont = `${cssFontSizePx}px ${fontUsage.cssFontFamily}`;
   const measuredPx = measureAverageCharWidth(cssFont, validGlyphs.map((g) => g.ch));
@@ -135,10 +138,107 @@ watchEffect(() => {
     return;
   }
 
-  // Clamp to a reasonable range: very large corrections usually indicate a
-  // measurement anomaly (invisible characters, unmapped glyphs, etc.).
   editorFontScaleX.value = Math.max(0.5, Math.min(2.0, targetPx / measuredPx));
 });
+
+// Keep draftText (used for preview) in sync with draftRuns content.
+watch(draftRuns, (runs) => {
+  draftText.value = runs.map((r) => r.content).join("");
+  // Sync runs → contenteditable DOM (only when the change comes from outside, e.g. beginTextEdit).
+  if (skipNextDomSync) { skipNextDomSync = false; return; }
+  writeRunsToEditor(runs);
+}, { deep: true });
+
+/** Write the current draftRuns into the contenteditable div as styled spans. */
+function writeRunsToEditor(runs: RichTextRun[]) {
+  const el = inlineEditor.value;
+  if (!el) return;
+  const selection = window.getSelection();
+  // Save caret position relative to the focused run (best-effort).
+  const focusedRunId = getActiveRunId();
+  const caretOffset = selection?.focusOffset ?? 0;
+
+  el.innerHTML = "";
+  for (const run of runs) {
+    const span = document.createElement("span");
+    span.setAttribute("data-run-id", run.id);
+    applyRunStyleToSpan(span, run);
+    span.textContent = run.content;
+    el.appendChild(span);
+  }
+
+  // Restore caret into the same run if possible.
+  if (focusedRunId && document.activeElement === el) {
+    const target = el.querySelector<HTMLElement>(`[data-run-id="${focusedRunId}"]`);
+    if (target?.firstChild) {
+      try {
+        const range = document.createRange();
+        range.setStart(target.firstChild, Math.min(caretOffset, target.textContent?.length ?? 0));
+        range.collapse(true);
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+      } catch {
+        // ignore cursor restore errors
+      }
+    }
+  }
+}
+
+/** Apply CSS styling to a span element from a RichTextRun. */
+function applyRunStyleToSpan(span: HTMLElement, run: RichTextRun) {
+  const viewport = currentViewport.value;
+  const text = selectedTextObject.value;
+  const session = editSession.value;
+  if (!viewport || !text) return;
+
+  const fontName = run.font_name ?? session?.font_id ?? text.font_name;
+  const fontSize = run.font_size ?? effectiveFontSize(text);
+  const color = run.color ?? text.color;
+
+  span.style.fontFamily = svgFontFamily(fontName);
+  span.style.fontSize = `${Math.max(8, fontSize * viewport.zoom)}px`;
+  span.style.color = colorToCss(color);
+  span.style.fontWeight = fontWeightFor(fontName) ?? "";
+}
+
+/** Read runs out of the contenteditable DOM. */
+function readRunsFromEditor(): RichTextRun[] {
+  const el = inlineEditor.value;
+  if (!el) return draftRuns.value;
+  const spans = Array.from(el.querySelectorAll<HTMLElement>("[data-run-id]"));
+  if (!spans.length) {
+    // Fallback: plain text with no spans — put it all in the first run.
+    const first = draftRuns.value[0];
+    if (first) return [{ ...first, content: el.textContent ?? "" }];
+    return draftRuns.value;
+  }
+  return spans.map((span) => {
+    const runId = span.getAttribute("data-run-id")!;
+    const existing = draftRuns.value.find((r) => r.id === runId);
+    return {
+      id: runId,
+      content: span.textContent ?? "",
+      font_name: existing?.font_name ?? null,
+      font_size: existing?.font_size ?? null,
+      color: existing?.color ?? null
+    };
+  });
+}
+
+/** Get the data-run-id of the span currently containing the caret. */
+function getActiveRunId(): string | null {
+  const selection = window.getSelection();
+  if (!selection?.rangeCount) return null;
+  let node: Node | null = selection.getRangeAt(0).startContainer;
+  while (node && node !== inlineEditor.value) {
+    if (node instanceof Element) {
+      const id = node.getAttribute("data-run-id");
+      if (id) return id;
+    }
+    node = node.parentNode;
+  }
+  return null;
+}
 
 const renderTextObjects = computed(() => {
   const pageText = page.value?.text ?? [];
@@ -288,54 +388,56 @@ const inlineEditorWrapStyle = computed(() => {
   };
 });
 
-/** Typography + scale styles for the textarea itself. */
+/** Container style for the contenteditable rich-text editor div. */
 const inlineEditorStyle = computed(() => {
   const text = selectedTextObject.value;
   const viewport = currentViewport.value;
   if (!text || !viewport || !editSession.value) return {};
   const fontSize = Math.max(10, effectiveFontSize(text) * viewport.zoom);
-  const scale = editorFontScaleX.value;
-  const needsScale = Math.abs(scale - 1.0) > 0.005;
-
-  // PDF Tc (char_spacing) and Tw (word_spacing) are in user-space units (PDF points).
-  // The horizontal scaling Tz (horizontal_scaling / 100) also applies to these values.
-  // Convert to CSS px: × Tz × viewport.zoom.
-  // Divide by editorFontScaleX so that the scaleX CSS transform (applied for
-  // fallback-font width compensation) does not double-scale the spacing values.
-  const th = text.horizontal_scaling / 100;
-  const charSpacingPx = text.char_spacing * th * viewport.zoom / scale;
-  const wordSpacingPx = text.word_spacing * th * viewport.zoom / scale;
-
   return {
-    fontFamily: svgFontFamily(editSession.value.font_id ?? text.font_name),
-    fontSize: `${fontSize}px`,
-    fontWeight: fontWeightFor(editSession.value.font_id ?? text.font_name),
-    color: colorToCss(text.color),
     lineHeight: "1.2",
-    height: `${fontSize * 1.4}px`,
-    // Reproduce PDF char spacing (Tc) and word spacing (Tw) in the editor so the
-    // visual gap between characters matches the rendered background image.
-    ...(Math.abs(charSpacingPx) > 0.01 ? { letterSpacing: `${charSpacingPx.toFixed(3)}px` } : {}),
-    ...(Math.abs(wordSpacingPx) > 0.01 ? { wordSpacing: `${wordSpacingPx.toFixed(3)}px` } : {}),
-    // When the fallback font's character widths differ from the PDF font, compress
-    // or stretch the textarea content horizontally so character widths match.
-    // The compensating `width` ensures the scaled textarea still fills the wrapper
-    // (scaleX anchors at left, so visual right edge stays at wrapper_width).
-    ...(needsScale
-      ? {
-          transform: `scaleX(${scale.toFixed(5)})`,
-          transformOrigin: "left top",
-          width: `${(100 / scale).toFixed(5)}%`
-        }
-      : {})
+    height: `${fontSize * 1.4}px`
   };
+});
+
+/** Style for the font/size toolbar that floats above the inline editor. */
+const toolbarStyle = computed(() => {
+  const wrapStyle = inlineEditorWrapStyle.value;
+  if (!wrapStyle.transform) return {};
+  return wrapStyle;
+});
+
+/** The active run object for the toolbar controls. */
+const activeRun = computed(() => {
+  if (!activeRunId.value) return draftRuns.value[0] ?? null;
+  return draftRuns.value.find((r) => r.id === activeRunId.value) ?? draftRuns.value[0] ?? null;
 });
 
 const canSaveEdit = computed(() => {
   if (!selectedTextObject.value || !editSession.value || isSavingEdit.value || isPreparingEdit.value) {
     return false;
   }
-  return draftText.value !== editSession.value.original_text;
+  // Allow save if text or any run's style changed.
+  return draftText.value !== editSession.value.original_text || hasRunStyleChanges.value;
+});
+
+const hasRunStyleChanges = computed(() => {
+  // If every run has all-null style fields, the user hasn't changed any styles — use simple path.
+  if (draftRuns.value.every((r) => r.font_name === null && r.font_size === null && r.color === null)) {
+    return false;
+  }
+  const text = selectedTextObject.value;
+  if (!text) return false;
+  const originalRuns = text.runs ?? [];
+  if (draftRuns.value.length !== originalRuns.length) return true;
+  return draftRuns.value.some((run, i) => {
+    const orig = originalRuns[i];
+    return (
+      run.font_name !== (orig?.font_name ?? null) ||
+      (run.font_size !== null && run.font_size !== (orig?.font_size ?? null)) ||
+      run.color !== null
+    );
+  });
 });
 
 /** Overflow only matters when the user actually changed the text from the original. */
@@ -399,6 +501,8 @@ function onEdgeDragMove(event: PointerEvent) {
 
 function onEdgeDragEnd() {
   stopEdgeDrag();
+  // Restore focus to the inline editor after releasing the resize handle.
+  void nextTick(() => inlineEditor.value?.focus());
 }
 
 async function onFileChange(event: Event) {
@@ -444,13 +548,35 @@ async function beginTextEdit(objectId: number) {
     const session = await startTextEdit(pdfBytes.value, objectId, pdfHandle.value);
     if (currentSelection !== getSelectionToken()) return;
     editSession.value = session;
-    draftText.value = session.original_text;
-    await refreshPreview(objectId, session.original_text, currentSelection);
+
+    // Initialize draftRuns from the text object's existing runs (or a single default run).
+    const textObj = page.value?.text.find((t) => t.id === objectId);
+    const existingRuns = textObj?.runs?.filter((r) => r.content) ?? [];
+    if (existingRuns.length > 0) {
+      draftRuns.value = existingRuns.map((r) => ({
+        id: Math.random().toString(36).slice(2),
+        content: r.content,
+        font_name: r.font_name,
+        font_size: r.font_size !== session.font_size ? r.font_size : null,
+        color: null
+      }));
+    } else {
+      draftRuns.value = [{
+        id: Math.random().toString(36).slice(2),
+        content: session.original_text,
+        font_name: null,
+        font_size: null,
+        color: null
+      }];
+    }
+    draftText.value = draftRuns.value.map((r) => r.content).join("");
+
+    await refreshPreview(objectId, draftText.value, currentSelection);
     if (currentSelection !== getSelectionToken()) return;
     status.value = `已选中文本对象 ${objectId}，可直接修改并保存`;
     await nextTick();
+    writeRunsToEditor(draftRuns.value);
     inlineEditor.value?.focus();
-    inlineEditor.value?.select();
   } catch (error) {
     console.error(error);
     if (currentSelection !== getSelectionToken()) return;
@@ -472,6 +598,22 @@ function onDraftInput() {
   }, 120);
 }
 
+function onInlineEditorInput() {
+  if (!selectedTextId.value) return;
+  skipNextDomSync = true;
+  draftRuns.value = readRunsFromEditor();
+  // draftText is updated by the draftRuns watcher.
+  activeRunId.value = getActiveRunId();
+  setPreviewTimer(() => {
+    void refreshPreview(selectedTextId.value!, draftText.value, getSelectionToken());
+  }, 120);
+}
+
+function onInlineEditorSelectionChange() {
+  if (document.activeElement !== inlineEditor.value) return;
+  activeRunId.value = getActiveRunId();
+}
+
 function onInlineEditorKeydown(event: KeyboardEvent) {
   if (event.key === "Escape") {
     event.preventDefault();
@@ -482,6 +624,47 @@ function onInlineEditorKeydown(event: KeyboardEvent) {
     event.preventDefault();
     void saveTextEdit({ closeAfterSave: true });
   }
+}
+
+function onInlineEditorFocus() {
+  activeRunId.value = getActiveRunId();
+  document.addEventListener("selectionchange", onInlineEditorSelectionChange);
+}
+
+function onInlineEditorBlur() {
+  // If the user is dragging a resize handle, don't treat this as a real blur.
+  if (edgeDragState) return;
+  document.removeEventListener("selectionchange", onInlineEditorSelectionChange);
+  void saveTextEditOnBlur();
+}
+
+/** Apply a new font to the active run from the toolbar. */
+function setActiveRunFont(fontName: string | null) {
+  const run = activeRun.value;
+  if (!run) return;
+  skipNextDomSync = true;
+  draftRuns.value = draftRuns.value.map((r) =>
+    r.id === run.id ? { ...r, font_name: fontName } : r
+  );
+  nextTick(() => {
+    // Re-apply styles to the span without rebuilding (avoids cursor jump).
+    const el = inlineEditor.value?.querySelector<HTMLElement>(`[data-run-id="${run.id}"]`);
+    if (el) applyRunStyleToSpan(el, draftRuns.value.find((r) => r.id === run.id)!);
+  });
+}
+
+/** Apply a new font size to the active run from the toolbar. */
+function setActiveRunSize(size: number | null) {
+  const run = activeRun.value;
+  if (!run) return;
+  skipNextDomSync = true;
+  draftRuns.value = draftRuns.value.map((r) =>
+    r.id === run.id ? { ...r, font_size: size } : r
+  );
+  nextTick(() => {
+    const el = inlineEditor.value?.querySelector<HTMLElement>(`[data-run-id="${run.id}"]`);
+    if (el) applyRunStyleToSpan(el, draftRuns.value.find((r) => r.id === run.id)!);
+  });
 }
 
 async function refreshPreview(objectId: number, text: string, selectionToken = getSelectionToken()) {
@@ -516,14 +699,20 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
   try {
     if (pdfHandle.value != null) {
       // Fast path: update in-memory document, then refresh only the page structure.
-      // The background PNG and font assets are unchanged and do not need to be re-fetched.
-      // Capture existing image objectUrls before the update so they are preserved:
-      // a text edit never changes page images, but getPageStructureByHandle returns
-      // image objects without objectUrl (that blob data only lives in the initial bundle).
       const existingImageUrls = new Map(
         (page.value?.images ?? []).map((img) => [img.id, img.objectUrl])
       );
-      await updateTextByHandle(pdfHandle.value, objectId, savedText);
+      const textObj = page.value?.text.find((t) => t.id === objectId);
+      if (draftRuns.value.length > 1 || hasRunStyleChanges.value) {
+        await updateTextRunsByHandle(
+          pdfHandle.value, objectId, draftRuns.value,
+          textObj?.color ?? { r: 0, g: 0, b: 0, a: 255 },
+          editSession.value?.font_id ?? textObj?.font_name ?? null,
+          editSession.value?.font_size ?? textObj?.font_size ?? 12
+        );
+      } else {
+        await updateTextByHandle(pdfHandle.value, objectId, savedText);
+      }
       const structure = await getPageStructureByHandle(pdfHandle.value, pageNumber.value);
       // Re-attach blob URLs so image SVG overlays remain visible.
       for (const img of structure.images) {
@@ -604,7 +793,7 @@ function rectCenterDistanceSquared(left: StructuredTextObject["bounds"], right: 
 async function saveTextEditOnBlur() {
   if (isPreparingEdit.value || isSavingEdit.value) return;
   if (!selectedTextObject.value || !editSession.value) return;
-  if (draftText.value === editSession.value.original_text) {
+  if (!canSaveEdit.value) {
     clearSelection();
     return;
   }
@@ -1021,15 +1210,15 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
             {{ selectedFontUsage.fellBack ? selectedFontUsage.fallbackReason : "已命中嵌入字体" }}
           </div>
         </div>
-        <label class="field">
-          <span>文本内容</span>
-          <textarea
-            v-model="draftText"
-            :disabled="isPreparingEdit || isSavingEdit"
-            spellcheck="false"
-            @input="onDraftInput"
-          />
-        </label>
+        <RunsEditor
+          :runs="draftRuns"
+          :font-assets="fontAssets"
+          :base-font-name="editSession?.font_id ?? selectedTextObject.font_name ?? null"
+          :base-font-size="editSession?.font_size ?? selectedTextObject.font_size"
+          :base-color="selectedTextObject.color"
+          :disabled="isPreparingEdit || isSavingEdit"
+          @update:runs="(newRuns) => { draftRuns = newRuns; onDraftInput(); }"
+        />
         <p class="helper-text" :class="{ danger: hasEffectiveOverflow }">
           {{ previewStatus }}
         </p>
@@ -1231,23 +1420,53 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
             class="inline-editor-wrap"
             :style="inlineEditorWrapStyle"
           >
+            <!-- Font/size toolbar for the active run -->
+            <div class="inline-run-toolbar" @pointerdown.stop @click.stop>
+              <select
+                :value="activeRun?.font_name ?? ''"
+                :disabled="isPreparingEdit || isSavingEdit"
+                title="当前段字体"
+                @change="setActiveRunFont(($event.target as HTMLSelectElement).value || null)"
+              >
+                <option value="">（继承）</option>
+                <option
+                  v-for="font in fontAssets"
+                  :key="font.resource_name"
+                  :value="font.resource_name"
+                >{{ font.family_name }}</option>
+              </select>
+              <input
+                type="number"
+                :value="activeRun?.font_size ?? (editSession?.font_size ?? selectedTextObject.font_size)"
+                :disabled="isPreparingEdit || isSavingEdit"
+                min="1"
+                max="500"
+                step="0.5"
+                title="当前段字号"
+                class="toolbar-size-input"
+                @change="setActiveRunSize(parseFloat(($event.target as HTMLInputElement).value) || null)"
+              />
+              <span class="toolbar-run-label" v-if="draftRuns.length > 1">
+                段 {{ (draftRuns.findIndex(r => r.id === (activeRunId ?? draftRuns[0]?.id)) + 1) }} / {{ draftRuns.length }}
+              </span>
+            </div>
+
             <div
               class="editor-edge editor-edge-left"
               title="拖拽调整编辑框宽度"
               @pointerdown.prevent.stop="onEdgeDragStart($event, 'left')"
             />
-            <input
+            <div
               ref="inlineEditor"
-              v-model="draftText"
-              type="text"
               class="inline-text-editor"
-              :class="{ overflow: hasEffectiveOverflow }"
+              :class="{ overflow: hasEffectiveOverflow, disabled: isPreparingEdit || isSavingEdit }"
               :style="inlineEditorStyle"
-              :disabled="isPreparingEdit || isSavingEdit"
+              :contenteditable="(!isPreparingEdit && !isSavingEdit) ? 'true' : 'false'"
               spellcheck="false"
-              @input="onDraftInput"
+              @input.stop="onInlineEditorInput"
               @keydown="onInlineEditorKeydown"
-              @blur="saveTextEditOnBlur"
+              @focus="onInlineEditorFocus"
+              @blur="onInlineEditorBlur"
               @pointerdown.stop
               @click.stop
             />
