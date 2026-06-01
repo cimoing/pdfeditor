@@ -1053,11 +1053,27 @@ impl EngineDocument for LopdfDocument {
         let anchor_y = anchor_tm[5];
         let anchor_scale_x = f32::hypot(anchor_tm[0], anchor_tm[1]).max(0.001);
 
+        // Pre-check: do any characters in any run need CJK fallback encoding?
+        // We must call ensure_page_cjk_fallback_font (which mutably borrows self) BEFORE the
+        // main building loop, since font_maps and font_metrics are immutable borrows of self.
+        let needs_cjk_fallback = runs.iter().any(|run| {
+            let fname = run.font_name.as_deref().or(orig_font_name.as_deref()).unwrap_or("F0");
+            let fmap = font_maps.get(fname);
+            run.content.chars().any(|ch| fmap.and_then(|m| m.encode(&ch.to_string())).is_none())
+        });
+        let fallback_font_name: Option<String> = if needs_cjk_fallback {
+            Some(self.ensure_page_cjk_fallback_font(page_id)?)
+        } else {
+            None
+        };
+
         // Build replacement operations: per-char Tm+Tj, one Tf per font/size change.
         let mut replacement_ops: Vec<Operation> = Vec::new();
         let mut cursor_pts = 0.0f32; // accumulated advance in pre-matrix units
         let mut prev_font_key: Option<(String, u32)> = None; // (name, size*1000)
         let mut first_tj_in_replacement: Option<usize> = None;
+        // Track whether the last emitted Tf pointed at the CJK fallback font.
+        let mut current_on_fallback = false;
 
         // Reset char/word spacing so runs flow cleanly.
         replacement_ops.push(Operation::new("Tc", vec![Object::Integer(0)]));
@@ -1075,9 +1091,11 @@ impl EngineDocument for LopdfDocument {
             let run_font_size = run.font_size;
             let font_key = (run_font_name.to_string(), (run_font_size * 1000.0) as u32);
 
-            if prev_font_key.as_ref() != Some(&font_key) {
+            // Emit Tf at run boundary only when not currently on the fallback font
+            // (the per-char loop will emit its own Tf when switching to/from fallback).
+            if !current_on_fallback && prev_font_key.as_ref() != Some(&font_key) {
                 replacement_ops.push(font_set_operation(run_font_name, run_font_size));
-                prev_font_key = Some(font_key);
+                prev_font_key = Some(font_key.clone());
             }
 
             let run_font_map = font_maps.get(run_font_name);
@@ -1085,6 +1103,21 @@ impl EngineDocument for LopdfDocument {
 
             for ch in run.content.chars() {
                 let char_str = ch.to_string();
+
+                // Try to encode with the run's font; fall back to the CJK fallback font.
+                let encoded = run_font_map.and_then(|fm| fm.encode(&char_str));
+                let char_needs_fallback = encoded.is_none();
+
+                // Switch fonts at the PDF level if the fallback requirement changed.
+                if char_needs_fallback && !current_on_fallback {
+                    let fb = fallback_font_name.as_deref().unwrap_or("F0");
+                    replacement_ops.push(font_set_operation(fb, run_font_size));
+                    current_on_fallback = true;
+                } else if !char_needs_fallback && current_on_fallback {
+                    replacement_ops.push(font_set_operation(run_font_name, run_font_size));
+                    prev_font_key = Some(font_key.clone());
+                    current_on_fallback = false;
+                }
 
                 // Absolute Tm for this character using the anchor matrix + accumulated offset.
                 let char_tm =
@@ -1101,20 +1134,13 @@ impl EngineDocument for LopdfDocument {
                     ],
                 ));
 
-                // Encode the character for the run's font; fall back to UTF-16BE hex.
-                let char_obj = run_font_map
-                    .and_then(|fm| fm.encode(&char_str))
-                    .map(|bytes| {
-                        let fmt = if bytes.len() == 1 {
-                            StringFormat::Literal
-                        } else {
-                            StringFormat::Hexadecimal
-                        };
-                        Object::String(bytes, fmt)
-                    })
-                    .unwrap_or_else(|| {
-                        Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal)
-                    });
+                // Always use Hexadecimal format — Literal strings require careful escaping of
+                // bytes like 0x28 '(' and 0x29 ')' which would corrupt the content stream.
+                let char_obj = if char_needs_fallback {
+                    Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal)
+                } else {
+                    Object::String(encoded.unwrap(), StringFormat::Hexadecimal)
+                };
 
                 let tj_idx = replacement_ops.len();
                 if first_tj_in_replacement.is_none() {
@@ -1123,16 +1149,24 @@ impl EngineDocument for LopdfDocument {
                 replacement_ops.push(Operation::new("Tj", vec![char_obj]));
 
                 // Advance the cursor by this glyph's advance in pre-matrix units.
-                let advance = run_font_map
-                    .and_then(|fm| fm.encode(&char_str))
-                    .as_deref()
-                    .and_then(|bytes| {
-                        run_metrics.map(|m| m.text_advance(bytes, &anchor_state))
-                    })
-                    .unwrap_or_else(|| {
-                        fallback_char_advance(ch) * (anchor_state.horizontal_scaling / 100.0)
-                    });
+                let advance = if char_needs_fallback {
+                    fallback_char_advance(ch) * (anchor_state.horizontal_scaling / 100.0)
+                } else {
+                    let enc = run_font_map.and_then(|fm| fm.encode(&char_str));
+                    enc.as_deref()
+                        .and_then(|bytes| run_metrics.map(|m| m.text_advance(bytes, &anchor_state)))
+                        .unwrap_or_else(|| {
+                            fallback_char_advance(ch) * (anchor_state.horizontal_scaling / 100.0)
+                        })
+                };
                 cursor_pts += advance * run_font_size;
+            }
+
+            // If the run ended on the fallback font, restore the run's own font for the next run.
+            if current_on_fallback {
+                replacement_ops.push(font_set_operation(run_font_name, run_font_size));
+                prev_font_key = Some(font_key);
+                current_on_fallback = false;
             }
         }
 

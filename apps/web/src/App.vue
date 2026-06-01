@@ -52,12 +52,43 @@ const {
 } = usePdfEditor();
 
 const fontAssetMap = computed(() => new Map(fontAssets.value.map((font) => [font.resource_name, font])));
+
+// ── Built-in / system fonts available in the browser ──────────────────────
+// These are loaded via @fontsource packages or known browser fonts.
+// resource_name uses a "__builtin__:" prefix to distinguish them from PDF-embedded fonts.
+// On save they map to null (backend uses the inherited/fallback PDF font).
+const BUILTIN_FONTS = [
+  { resource_name: "__builtin__:Noto Sans SC", family_name: "Noto Sans SC", css_family: '"Noto Sans SC","Noto Sans CJK SC",sans-serif' },
+  { resource_name: "__builtin__:serif",        family_name: "衬线体 (Serif)",  css_family: 'Georgia,"Times New Roman",serif' },
+  { resource_name: "__builtin__:sans-serif",   family_name: "无衬线 (Sans)",   css_family: 'Arial,"Helvetica Neue",sans-serif' },
+  { resource_name: "__builtin__:monospace",    family_name: "等宽 (Mono)",     css_family: '"Courier New",Courier,monospace' },
+];
+
+/** CSS font-family string for a given resource_name (PDF-embedded or built-in). */
+function fontFamilyForResource(resourceName: string | null): string {
+  if (!resourceName) return svgFontFamily(null);
+  const builtin = BUILTIN_FONTS.find((f) => f.resource_name === resourceName);
+  if (builtin) return builtin.css_family;
+  return svgFontFamily(resourceName);
+}
+
+/** All font options shown in pickers: built-in first, then PDF-embedded. */
+const allFontOptions = computed(() => [
+  ...BUILTIN_FONTS,
+  ...fontAssets.value
+]);
+
 /** ref to the contenteditable inline rich-text editor div */
 const inlineEditor = ref<HTMLDivElement | null>(null);
 /** True while we are programmatically updating the contenteditable DOM to avoid a feedback loop */
 let skipNextDomSync = false;
 /** ID of the run span currently under the cursor (used to set toolbar values) */
 const activeRunId = ref<string | null>(null);
+/**
+ * True while a toolbar control (font select / size input) is receiving interaction.
+ * Prevents onInlineEditorBlur from treating the transient focus-loss as a real blur.
+ */
+const isToolbarInteracting = ref(false);
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 
 // ── Edit-box resize state ──────────────────────────────────────────────────
@@ -195,7 +226,7 @@ function applyRunStyleToSpan(span: HTMLElement, run: RichTextRun) {
   const fontSize = run.font_size ?? effectiveFontSize(text);
   const color = run.color ?? text.color;
 
-  span.style.fontFamily = svgFontFamily(fontName);
+  span.style.fontFamily = fontFamilyForResource(fontName);
   span.style.fontSize = `${Math.max(8, fontSize * viewport.zoom)}px`;
   span.style.color = colorToCss(color);
   span.style.fontWeight = fontWeightFor(fontName) ?? "";
@@ -238,6 +269,160 @@ function getActiveRunId(): string | null {
     node = node.parentNode;
   }
   return null;
+}
+
+// ── Selection-aware style application ────────────────────────────────────────
+
+/** Saved selection range; captured before toolbar interactions steal focus. */
+let savedRange: Range | null = null;
+
+/** Save the current editor selection so toolbar changes can use it. */
+function saveEditorSelection() {
+  const sel = window.getSelection();
+  const el = inlineEditor.value;
+  if (!el || !sel?.rangeCount) { savedRange = null; return; }
+  const r = sel.getRangeAt(0);
+  savedRange = el.contains(r.commonAncestorContainer) ? r.cloneRange() : null;
+}
+
+/**
+ * Find which run and character offset within that run a Range endpoint maps to.
+ * `spans` must be the ordered list of [data-run-id] elements from the editor.
+ */
+function getRangeEndpoint(
+  spans: HTMLElement[],
+  container: Node,
+  offset: number
+): { runIndex: number; charOffset: number } | null {
+  for (let i = 0; i < spans.length; i++) {
+    const span = spans[i];
+    if (span === container) {
+      // container is the span element itself; offset = child index
+      return { runIndex: i, charOffset: offset === 0 ? 0 : (span.textContent?.length ?? 0) };
+    }
+    if (span.contains(container)) {
+      // container is a text node inside this span
+      return { runIndex: i, charOffset: offset };
+    }
+  }
+  // container is the editor root; offset = span child index
+  if (container === inlineEditor.value) {
+    const clampedIdx = Math.min(offset, spans.length - 1);
+    return { runIndex: Math.max(0, clampedIdx), charOffset: 0 };
+  }
+  return null;
+}
+
+/** Merge adjacent runs that have identical styling (font_name, font_size, color). */
+function mergeAdjacentRuns(runs: RichTextRun[]): RichTextRun[] {
+  const result: RichTextRun[] = [];
+  for (const run of runs) {
+    const last = result[result.length - 1];
+    if (
+      last &&
+      last.font_name === run.font_name &&
+      last.font_size === run.font_size &&
+      JSON.stringify(last.color) === JSON.stringify(run.color)
+    ) {
+      last.content += run.content;
+    } else {
+      result.push({ ...run });
+    }
+  }
+  return result;
+}
+
+/**
+ * Apply a style patch to the text covered by `range` in `runs`.
+ * Runs are split at the selection boundaries; only the selected portion receives the new style.
+ * Adjacent runs with identical style are merged.
+ */
+function applyStyleToRangeInRuns(
+  runs: RichTextRun[],
+  spans: HTMLElement[],
+  range: Range,
+  style: { font_name?: string | null; font_size?: number | null }
+): RichTextRun[] {
+  const sp = getRangeEndpoint(spans, range.startContainer, range.startOffset);
+  const ep = getRangeEndpoint(spans, range.endContainer, range.endOffset);
+  if (!sp || !ep) return runs;
+
+  // Normalise so start ≤ end
+  let [sRun, sChar, eRun, eChar] =
+    sp.runIndex < ep.runIndex || (sp.runIndex === ep.runIndex && sp.charOffset <= ep.charOffset)
+      ? [sp.runIndex, sp.charOffset, ep.runIndex, ep.charOffset]
+      : [ep.runIndex, ep.charOffset, sp.runIndex, sp.charOffset];
+
+  const newId = () => Math.random().toString(36).slice(2);
+  const patched = (run: RichTextRun): RichTextRun => ({
+    ...run,
+    id: newId(),
+    font_name: ("font_name" in style ? style.font_name : run.font_name) as string | null,
+    font_size: ("font_size" in style ? style.font_size : run.font_size) as number | null
+  });
+
+  const newRuns: RichTextRun[] = [];
+  for (let i = 0; i < runs.length; i++) {
+    const run = runs[i];
+    const chars = Array.from(run.content);
+
+    if (i < sRun || i > eRun) {
+      newRuns.push(run);
+      continue;
+    }
+
+    const selStart = i === sRun ? sChar : 0;
+    const selEnd   = i === eRun ? eChar : chars.length;
+
+    const before   = chars.slice(0, selStart).join("");
+    const selected = chars.slice(selStart, selEnd).join("");
+    const after    = chars.slice(selEnd).join("");
+
+    if (before)   newRuns.push({ ...run, id: newId(), content: before });
+    if (selected) newRuns.push({ ...patched(run), content: selected });
+    if (after)    newRuns.push({ ...run, id: newId(), content: after });
+  }
+
+  return mergeAdjacentRuns(newRuns);
+}
+
+/**
+ * Apply a style change to the current text selection (or to the active run if
+ * nothing is selected).  Called by font-picker and size-input toolbar events.
+ */
+function applyStyleToSelection(style: { font_name?: string | null; font_size?: number | null }) {
+  const el = inlineEditor.value;
+  if (!el) return;
+
+  const range = savedRange;
+
+  if (!range || range.collapsed) {
+    // No text selected → apply to the run under the cursor
+    const run = activeRun.value;
+    if (!run) return;
+    skipNextDomSync = true;
+    draftRuns.value = draftRuns.value.map((r) =>
+      r.id === run.id
+        ? {
+            ...r,
+            font_name: ("font_name" in style ? style.font_name : r.font_name) as string | null,
+            font_size: ("font_size" in style ? style.font_size : r.font_size) as number | null
+          }
+        : r
+    );
+    void nextTick(() => {
+      const spanEl = el.querySelector<HTMLElement>(`[data-run-id="${run.id}"]`);
+      if (spanEl) applyRunStyleToSpan(spanEl, draftRuns.value.find((r) => r.id === run.id)!);
+    });
+    return;
+  }
+
+  // Text is selected → split and re-style the selected portion
+  const spans = Array.from(el.querySelectorAll<HTMLElement>("[data-run-id]"));
+  const newRuns = applyStyleToRangeInRuns(draftRuns.value, spans, range, style);
+  skipNextDomSync = false;
+  draftRuns.value = newRuns;
+  void nextTick(() => writeRunsToEditor(newRuns));
 }
 
 const renderTextObjects = computed(() => {
@@ -422,22 +607,10 @@ const canSaveEdit = computed(() => {
 });
 
 const hasRunStyleChanges = computed(() => {
-  // If every run has all-null style fields, the user hasn't changed any styles — use simple path.
-  if (draftRuns.value.every((r) => r.font_name === null && r.font_size === null && r.color === null)) {
-    return false;
-  }
-  const text = selectedTextObject.value;
-  if (!text) return false;
-  const originalRuns = text.runs ?? [];
-  if (draftRuns.value.length !== originalRuns.length) return true;
-  return draftRuns.value.some((run, i) => {
-    const orig = originalRuns[i];
-    return (
-      run.font_name !== (orig?.font_name ?? null) ||
-      (run.font_size !== null && run.font_size !== (orig?.font_size ?? null)) ||
-      run.color !== null
-    );
-  });
+  // Any run with an explicit (non-null) font_name, font_size, or color means a style was applied.
+  // Using this simple check avoids false positives from comparing against text.runs which is
+  // often empty for basic PDF text objects.
+  return draftRuns.value.some((r) => r.font_name !== null || r.font_size !== null || r.color !== null);
 });
 
 /** Overflow only matters when the user actually changed the text from the original. */
@@ -612,6 +785,7 @@ function onInlineEditorInput() {
 function onInlineEditorSelectionChange() {
   if (document.activeElement !== inlineEditor.value) return;
   activeRunId.value = getActiveRunId();
+  saveEditorSelection();
 }
 
 function onInlineEditorKeydown(event: KeyboardEvent) {
@@ -632,28 +806,44 @@ function onInlineEditorFocus() {
 }
 
 function onInlineEditorBlur() {
-  // If the user is dragging a resize handle, don't treat this as a real blur.
-  if (edgeDragState) return;
+  // Ignore transient blur caused by edge-drag handles or toolbar controls.
+  if (edgeDragState || isToolbarInteracting.value) return;
   document.removeEventListener("selectionchange", onInlineEditorSelectionChange);
   void saveTextEditOnBlur();
 }
 
-/** Apply a new font to the active run from the toolbar. */
-function setActiveRunFont(fontName: string | null) {
-  const run = activeRun.value;
-  if (!run) return;
-  skipNextDomSync = true;
-  draftRuns.value = draftRuns.value.map((r) =>
-    r.id === run.id ? { ...r, font_name: fontName } : r
-  );
-  nextTick(() => {
-    // Re-apply styles to the span without rebuilding (avoids cursor jump).
-    const el = inlineEditor.value?.querySelector<HTMLElement>(`[data-run-id="${run.id}"]`);
-    if (el) applyRunStyleToSpan(el, draftRuns.value.find((r) => r.id === run.id)!);
-  });
+/** Call on mousedown of any toolbar control to block the blur-save path. */
+function onToolbarMousedown() {
+  // Capture selection BEFORE the toolbar steals focus (mousedown fires before blur).
+  saveEditorSelection();
+  isToolbarInteracting.value = true;
 }
 
-/** Apply a new font size to the active run from the toolbar. */
+/** Call on blur of a toolbar control; restores focus to the editor. */
+function onToolbarControlBlur(event: FocusEvent) {
+  // If focus moved to another element inside the same toolbar, stay in toolbar mode.
+  const toolbar = (event.currentTarget as Element)?.closest?.(".inline-run-toolbar");
+  const next = event.relatedTarget as Element | null;
+  if (toolbar && next && toolbar.contains(next)) return;
+  isToolbarInteracting.value = false;
+  void nextTick(() => inlineEditor.value?.focus());
+}
+
+function onToolbarFontChangeEvent(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  applyStyleToSelection({ font_name: value || null });
+  isToolbarInteracting.value = false;
+  void nextTick(() => inlineEditor.value?.focus());
+}
+
+function onToolbarSizeChangeEvent(event: Event) {
+  const raw = parseFloat((event.target as HTMLInputElement).value);
+  applyStyleToSelection({ font_size: isNaN(raw) || raw <= 0 ? null : raw });
+  isToolbarInteracting.value = false;
+  void nextTick(() => inlineEditor.value?.focus());
+}
+
+/** @deprecated Use applyStyleToSelection instead. Kept for direct run-level access if needed. */
 function setActiveRunSize(size: number | null) {
   const run = activeRun.value;
   if (!run) return;
@@ -1212,7 +1402,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
         </div>
         <RunsEditor
           :runs="draftRuns"
-          :font-assets="fontAssets"
+          :font-assets="allFontOptions"
           :base-font-name="editSession?.font_id ?? selectedTextObject.font_name ?? null"
           :base-font-size="editSession?.font_size ?? selectedTextObject.font_size"
           :base-color="selectedTextObject.color"
@@ -1426,14 +1616,25 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                 :value="activeRun?.font_name ?? ''"
                 :disabled="isPreparingEdit || isSavingEdit"
                 title="当前段字体"
-                @change="setActiveRunFont(($event.target as HTMLSelectElement).value || null)"
+                @mousedown="onToolbarMousedown"
+                @change="onToolbarFontChangeEvent($event)"
+                @blur="onToolbarControlBlur($event)"
               >
                 <option value="">（继承）</option>
-                <option
-                  v-for="font in fontAssets"
-                  :key="font.resource_name"
-                  :value="font.resource_name"
-                >{{ font.family_name }}</option>
+                <optgroup label="内置字体">
+                  <option
+                    v-for="font in BUILTIN_FONTS"
+                    :key="font.resource_name"
+                    :value="font.resource_name"
+                  >{{ font.family_name }}</option>
+                </optgroup>
+                <optgroup v-if="fontAssets.length" label="嵌入字体">
+                  <option
+                    v-for="font in fontAssets"
+                    :key="font.resource_name"
+                    :value="font.resource_name"
+                  >{{ font.family_name }}</option>
+                </optgroup>
               </select>
               <input
                 type="number"
@@ -1444,7 +1645,9 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                 step="0.5"
                 title="当前段字号"
                 class="toolbar-size-input"
-                @change="setActiveRunSize(parseFloat(($event.target as HTMLInputElement).value) || null)"
+                @mousedown="onToolbarMousedown"
+                @change="onToolbarSizeChangeEvent($event)"
+                @blur="onToolbarControlBlur($event)"
               />
               <span class="toolbar-run-label" v-if="draftRuns.length > 1">
                 段 {{ (draftRuns.findIndex(r => r.id === (activeRunId ?? draftRuns[0]?.id)) + 1) }} / {{ draftRuns.length }}
@@ -1454,6 +1657,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
             <div
               class="editor-edge editor-edge-left"
               title="拖拽调整编辑框宽度"
+              @mousedown.prevent
               @pointerdown.prevent.stop="onEdgeDragStart($event, 'left')"
             />
             <div
@@ -1473,6 +1677,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
             <div
               class="editor-edge editor-edge-right"
               title="拖拽调整编辑框宽度"
+              @mousedown.prevent
               @pointerdown.prevent.stop="onEdgeDragStart($event, 'right')"
             />
           </div>

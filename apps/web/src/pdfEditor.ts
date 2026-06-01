@@ -380,7 +380,9 @@ export async function updateTextRunsByHandle(
   await ensureWasm();
   const payload = runs.map((run) => ({
     content: run.content,
-    font_name: run.font_name ?? baseFontName,
+    // Built-in browser fonts (resource_name starts with "__builtin__:") are not PDF resources;
+    // pass null so the backend uses the inherited/fallback PDF font for encoding.
+    font_name: (run.font_name?.startsWith("__builtin__:") ? null : run.font_name) ?? baseFontName,
     font_size: run.font_size ?? baseFontSize,
     color: (() => {
       const c = run.color ?? baseColor;

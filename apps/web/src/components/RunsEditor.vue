@@ -1,11 +1,15 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { RichTextRun } from "../pdfEditor";
-import type { LoadedFontAsset } from "../pdfEditor";
+
+export interface FontOption {
+  resource_name: string;
+  family_name: string;
+}
 
 const props = defineProps<{
   runs: RichTextRun[];
-  fontAssets: LoadedFontAsset[];
+  fontAssets: FontOption[];
   baseFontName: string | null;
   baseFontSize: number;
   baseColor: { r: number; g: number; b: number; a: number };
