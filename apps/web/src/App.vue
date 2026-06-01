@@ -431,14 +431,42 @@ const renderTextObjects = computed(() => {
   if (!layoutPreview.value || !selectedTextObject.value || !editSession.value) {
     return pageText;
   }
+
+  // Compute the effective font name for preview rendering.
+  // If the user has changed fonts on any run, reflect that change immediately
+  // so characters that were boxes with the original font become visible with the
+  // new font.  Falls back to the original session font_id when no override exists.
+  const effectiveFontForRun = (runFontName: string | null) =>
+    runFontName ?? editSession.value!.font_id;
+  const primaryPreviewFont =
+    effectiveFontForRun(draftRuns.value[0]?.font_name ?? null);
+
+  // Patch glyph font names so the per-glyph SVG path uses the user-selected font.
+  const previewGlyphs = (layoutPreview.value.glyphs ?? []).map((g) => {
+    // Find which run this glyph belongs to by matching character content.
+    // In practice most edits are single-run so all glyphs get the same override.
+    const matchingRun = draftRuns.value.find((r) => r.content.includes(g.ch));
+    const overrideFont = effectiveFontForRun(matchingRun?.font_name ?? null);
+    return g.font_name !== overrideFont ? { ...g, font_name: overrideFont } : g;
+  });
+
+  // Build per-run data for the runs-based SVG rendering path.
+  const previewRuns = draftRuns.value.map((r) => ({
+    content: r.content,
+    font_name: effectiveFontForRun(r.font_name ?? null),
+    font_size: r.font_size ?? editSession.value!.font_size,
+    color: r.color ?? selectedTextObject.value!.color,
+  }));
+
   const previewObject: StructuredTextObject = {
     ...selectedTextObject.value,
     bounds: layoutPreview.value.bbox,
     content: layoutPreview.value.text,
-    font_name: editSession.value.font_id,
+    font_name: primaryPreviewFont,
     font_size: editSession.value.font_size,
     transform: editSession.value.matrix,
-    glyphs: layoutPreview.value.glyphs
+    glyphs: previewGlyphs,
+    runs: previewRuns,
   };
   return pageText.map((text) => (text.id === selectedTextObject.value!.id ? previewObject : text));
 });
