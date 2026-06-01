@@ -5,6 +5,7 @@ use crate::{
     StructuredVisualTextObject, StructuredWatermark, TextEditSessionInfo, TextLayoutPreview,
     TextObject, TextObjectId, TextRun, TextStyle,
 };
+use crate::font_embed::{build_to_unicode_cmap, build_w_array, CjkFontData};
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, StringFormat};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -162,6 +163,8 @@ pub fn open_lopdf_document_from_bytes(bytes: &[u8]) -> CoreResult<LopdfDocument>
         text_objects: HashMap::new(),
         text_refs: HashMap::new(),
         text_edit_groups: HashMap::new(),
+        cjk_font: None,
+        cjk_font_pages: HashMap::new(),
     };
     result.extract_text_objects()?;
     Ok(result)
@@ -178,16 +181,30 @@ pub fn open_lopdf_document_from_bytes_unindexed(bytes: &[u8]) -> CoreResult<Lopd
         text_objects: HashMap::new(),
         text_refs: HashMap::new(),
         text_edit_groups: HashMap::new(),
+        cjk_font: None,
+        cjk_font_pages: HashMap::new(),
     })
 }
 
-#[derive(Debug, Clone)]
 pub struct LopdfDocument {
     document: Document,
     pages: Vec<ObjectId>,
     text_objects: HashMap<PageIndex, Vec<TextObject>>,
     text_refs: HashMap<TextObjectId, TextObjectRef>,
     text_edit_groups: HashMap<TextObjectId, TextEditGroup>,
+    /// Embedded CJK fallback font data (loaded from a WOFF/TTF by the caller).
+    cjk_font: Option<CjkFontData>,
+    /// Tracks which page object IDs already have the embedded CJK font in their resources.
+    cjk_font_pages: HashMap<ObjectId, String>,
+}
+
+impl std::fmt::Debug for LopdfDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LopdfDocument")
+            .field("pages", &self.pages.len())
+            .field("has_cjk_font", &self.cjk_font.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +250,8 @@ impl PdfEngine for LopdfEngine {
             text_objects: HashMap::new(),
             text_refs: HashMap::new(),
             text_edit_groups: HashMap::new(),
+            cjk_font: None,
+            cjk_font_pages: HashMap::new(),
         };
         result.extract_text_objects()?;
         Ok(result)
@@ -482,9 +501,16 @@ impl EngineDocument for LopdfDocument {
                 });
         let fallback_font_name = if use_group_fallback || needs_char_fallback {
             Some(self.ensure_page_cjk_fallback_font(page_id)?)
+            // Note: self.cjk_font is read below (after this mutable borrow ends).
         } else {
             None
         };
+        // After the mutable borrow (ensure_page_cjk_fallback_font) ends, capture a reference
+        // to the unicode→GID map (if an embedded font was loaded).  This is used to encode
+        // fallback characters as 2-byte GIDs (Identity-H) rather than UTF-16 BE.
+        let cjk_u2g: Option<&std::collections::HashMap<char, u16>> =
+            self.cjk_font.as_ref().map(|f| &f.unicode_to_gid);
+
         let whole_operation_replacements = if !use_group_fallback && !needs_char_fallback {
             member_plans
                 .iter()
@@ -697,7 +723,7 @@ impl EngineDocument for LopdfDocument {
                         rebuilt_operations.push(Operation::new(
                             "Tj",
                             vec![Object::String(
-                                utf16be_bytes(&replacement),
+                                encode_fallback_str(&replacement, cjk_u2g),
                                 StringFormat::Hexadecimal,
                             )],
                         ));
@@ -752,7 +778,7 @@ impl EngineDocument for LopdfDocument {
                     // Determine encoding before emitting Tm so we can insert Tf first.
                     let (char_obj, char_needs_fallback) = if use_group_fallback {
                         (
-                            Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal),
+                            Object::String(encode_fallback_char(ch, cjk_u2g), StringFormat::Hexadecimal),
                             true,
                         )
                     } else {
@@ -763,7 +789,7 @@ impl EngineDocument for LopdfDocument {
                         ) {
                             Ok(obj) => (obj, false),
                             Err(_) => (
-                                Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal),
+                                Object::String(encode_fallback_char(ch, cjk_u2g), StringFormat::Hexadecimal),
                                 true,
                             ),
                         }
@@ -1066,6 +1092,9 @@ impl EngineDocument for LopdfDocument {
         } else {
             None
         };
+        // After the mutable borrow ends, capture the unicode→GID map for GID encoding.
+        let cjk_u2g: Option<&std::collections::HashMap<char, u16>> =
+            self.cjk_font.as_ref().map(|f| &f.unicode_to_gid);
 
         // Build replacement operations: per-char Tm+Tj, one Tf per font/size change.
         let mut replacement_ops: Vec<Operation> = Vec::new();
@@ -1137,7 +1166,7 @@ impl EngineDocument for LopdfDocument {
                 // Always use Hexadecimal format — Literal strings require careful escaping of
                 // bytes like 0x28 '(' and 0x29 ')' which would corrupt the content stream.
                 let char_obj = if char_needs_fallback {
-                    Object::String(utf16be_bytes(&char_str), StringFormat::Hexadecimal)
+                    Object::String(encode_fallback_char(ch, cjk_u2g), StringFormat::Hexadecimal)
                 } else {
                     Object::String(encoded.unwrap(), StringFormat::Hexadecimal)
                 };
@@ -1290,27 +1319,140 @@ impl LopdfDocument {
         Ok(output)
     }
 
+    /// Store parsed CJK font data so subsequent edits can embed it instead of using
+    /// the unembedded STSong-Light standard font.
+    pub fn set_cjk_font(&mut self, data: CjkFontData) {
+        self.cjk_font = Some(data);
+        self.cjk_font_pages.clear(); // invalidate per-page caches
+    }
+
+    /// Returns `true` if an embedded CJK font is available (set via [`set_cjk_font`]).
+    pub fn has_embedded_cjk_font(&self) -> bool {
+        self.cjk_font.is_some()
+    }
+
+    /// Ensure a CJK fallback font is registered in the given page's resources.
+    ///
+    /// If [`set_cjk_font`] has been called, embeds the loaded TrueType font (NotoSansSC etc.)
+    /// as a CIDFontType2 with Identity-H encoding.  Otherwise falls back to the standard
+    /// (non-embedded) STSong-Light + UniGB-UCS2-H combination.
+    ///
+    /// Returns the PDF resource name added to the page.
     fn ensure_page_cjk_fallback_font(&mut self, page_id: ObjectId) -> CoreResult<String> {
-        const FALLBACK_FONT_NAME: &str = "PdfEditorFallbackCjk";
-        let cid_font_id = self.document.add_object(dictionary! {
-            "Type" => "Font",
-            "Subtype" => "CIDFontType0",
-            "BaseFont" => "STSong-Light",
-            "DW" => 1000,
-            "W" => fallback_cjk_widths(),
-            "CIDSystemInfo" => dictionary! {
-                "Registry" => Object::string_literal("Adobe"),
-                "Ordering" => Object::string_literal("GB1"),
-                "Supplement" => 2,
-            },
-        });
-        let cjk_font_id = self.document.add_object(dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type0",
-            "BaseFont" => "STSong-Light",
-            "Encoding" => "UniGB-UCS2-H",
-            "DescendantFonts" => vec![Object::Reference(cid_font_id)],
-        });
+        // Fast-path: already registered for this page.
+        if let Some(name) = self.cjk_font_pages.get(&page_id) {
+            return Ok(name.clone());
+        }
+
+        let font_resource_id: ObjectId = if self.cjk_font.is_some() {
+            // ── Embedded TrueType path (Identity-H) ─────────────────────────────────────
+            const NOTO_FONT_NAME: &str = "PdfEditorNotoSC";
+
+            let data = self.cjk_font.as_ref().unwrap(); // is_some checked above
+
+            // 1. Embed the raw sfnt bytes as a FontFile2 stream.
+            let sfnt_len = data.sfnt_bytes.len() as i64;
+            let font_file_id = self.document.add_object(lopdf::Stream::new(
+                dictionary! { "Length1" => sfnt_len },
+                data.sfnt_bytes.clone(),
+            ));
+
+            // 2. FontDescriptor
+            let upm = data.units_per_em as f64;
+            let descriptor_id = self.document.add_object(dictionary! {
+                "Type" => "FontDescriptor",
+                "FontName" => Object::Name(NOTO_FONT_NAME.as_bytes().to_vec()),
+                "Flags" => 4i64,
+                "FontBBox" => vec![
+                    Object::Real((data.x_min as f64 / upm * 1000.0) as f32),
+                    Object::Real((data.y_min as f64 / upm * 1000.0) as f32),
+                    Object::Real((data.x_max as f64 / upm * 1000.0) as f32),
+                    Object::Real((data.y_max as f64 / upm * 1000.0) as f32),
+                ],
+                "ItalicAngle" => 0i64,
+                "Ascent" => (data.ascender as f64 / upm * 1000.0) as i64,
+                "Descent" => (data.descender as f64 / upm * 1000.0) as i64,
+                "CapHeight" => (data.ascender as f64 / upm * 1000.0) as i64,
+                "StemV" => 80i64,
+                "FontFile2" => Object::Reference(font_file_id),
+            });
+
+            // 3. Width array (/W)
+            let w_array = build_w_array(data);
+
+            // 4. CIDFontType2
+            let cid_font_id = self.document.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "CIDFontType2",
+                "BaseFont" => Object::Name(NOTO_FONT_NAME.as_bytes().to_vec()),
+                "CIDSystemInfo" => dictionary! {
+                    "Registry" => Object::string_literal("Adobe"),
+                    "Ordering" => Object::string_literal("Identity"),
+                    "Supplement" => 0i64,
+                },
+                "DW" => 1000i64,
+                "W" => Object::Array(w_array),
+                "CIDToGIDMap" => Object::Name(b"Identity".to_vec()),
+                "FontDescriptor" => Object::Reference(descriptor_id),
+            });
+
+            // 5. Build a compact ToUnicode CMap for all mapped characters.
+            //    (Enables copy-paste from the edited text.)
+            let gid_to_unicode: Vec<(u16, char)> = {
+                let mut v: Vec<(u16, char)> = data
+                    .unicode_to_gid
+                    .iter()
+                    .map(|(&ch, &gid)| (gid, ch))
+                    .collect();
+                v.sort_unstable_by_key(|&(gid, _)| gid);
+                v
+            };
+            let cmap_str = build_to_unicode_cmap(&gid_to_unicode);
+            let to_unicode_id = self.document.add_object(lopdf::Stream::new(
+                dictionary! {},
+                cmap_str.into_bytes(),
+            ));
+
+            // 6. Type0 (composite) font
+            let type0_id = self.document.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type0",
+                "BaseFont" => Object::Name(NOTO_FONT_NAME.as_bytes().to_vec()),
+                "Encoding" => Object::Name(b"Identity-H".to_vec()),
+                "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+                "ToUnicode" => Object::Reference(to_unicode_id),
+            });
+
+            self.cjk_font_pages.insert(page_id, NOTO_FONT_NAME.to_string());
+            type0_id
+        } else {
+            // ── Standard (non-embedded) STSong-Light path ────────────────────────────────
+            const FALLBACK_FONT_NAME: &str = "PdfEditorFallbackCjk";
+            let cid_font_id = self.document.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "CIDFontType0",
+                "BaseFont" => "STSong-Light",
+                "DW" => 1000,
+                "W" => fallback_cjk_widths(),
+                "CIDSystemInfo" => dictionary! {
+                    "Registry" => Object::string_literal("Adobe"),
+                    "Ordering" => Object::string_literal("GB1"),
+                    "Supplement" => 2,
+                },
+            });
+            let font_id = self.document.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type0",
+                "BaseFont" => "STSong-Light",
+                "Encoding" => "UniGB-UCS2-H",
+                "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+            });
+            self.cjk_font_pages.insert(page_id, FALLBACK_FONT_NAME.to_string());
+            font_id
+        };
+
+        // Add the font to the page's Resources/Font dictionary.
+        let resource_name = self.cjk_font_pages[&page_id].clone();
         let page_dict = self
             .document
             .get_dictionary(page_id)
@@ -1325,7 +1467,7 @@ impl LopdfDocument {
             .ok()
             .and_then(|object| cloned_dictionary_from_object(&self.document, object))
             .unwrap_or_default();
-        fonts.set(FALLBACK_FONT_NAME, Object::Reference(cjk_font_id));
+        fonts.set(resource_name.as_bytes(), Object::Reference(font_resource_id));
         resources.set("Font", Object::Dictionary(fonts));
 
         let page = self
@@ -1337,7 +1479,7 @@ impl LopdfDocument {
         })?;
         page_dict.set("Resources", Object::Dictionary(resources));
 
-        Ok(FALLBACK_FONT_NAME.to_string())
+        Ok(resource_name)
     }
 
     pub fn page_load_bundle(
@@ -4947,6 +5089,15 @@ fn can_join_text_edit_group(
     if round_pdf_value(previous.font_size) != round_pdf_value(next.font_size) {
         return false;
     }
+    // Never merge objects that use different PDF font resources.  A change in font
+    // means the PDF intentionally uses a distinct typeface (e.g. a name in a different
+    // script) and those runs must stay as separate PDF objects so that font-specific
+    // encoding is applied correctly to each piece independently.
+    if let (Some(a), Some(b)) = (&previous.font_name, &next.font_name) {
+        if a != b {
+            return false;
+        }
+    }
     let gap = text_group_gap(previous, next);
     let max_overlap = previous.font_size.max(next.font_size) * 0.35 + 1.0;
     if gap < -max_overlap {
@@ -5435,6 +5586,35 @@ fn utf16be_bytes(content: &str) -> Vec<u8> {
         .encode_utf16()
         .flat_map(|unit| unit.to_be_bytes())
         .collect()
+}
+
+/// Encode a single character for the CJK fallback font.
+///
+/// * When an embedded TrueType font is available (`unicode_to_gid` is `Some`),
+///   returns the 2-byte big-endian GID (Identity-H encoding).
+/// * Otherwise returns UTF-16 BE bytes (UniGB-UCS2-H encoding).
+///
+/// If the character has no GID in the embedded font, falls through to UTF-16 as well.
+fn encode_fallback_char(ch: char, unicode_to_gid: Option<&std::collections::HashMap<char, u16>>) -> Vec<u8> {
+    if let Some(map) = unicode_to_gid {
+        if let Some(&gid) = map.get(&ch) {
+            return gid.to_be_bytes().to_vec();
+        }
+    }
+    utf16be_bytes(&ch.to_string())
+}
+
+/// Encode a whole string for the CJK fallback font (see [`encode_fallback_char`]).
+fn encode_fallback_str(text: &str, unicode_to_gid: Option<&std::collections::HashMap<char, u16>>) -> Vec<u8> {
+    if let Some(map) = unicode_to_gid {
+        return text.chars()
+            .flat_map(|ch| {
+                let gid = map.get(&ch).copied().unwrap_or(0);
+                gid.to_be_bytes()
+            })
+            .collect();
+    }
+    utf16be_bytes(text)
 }
 
 fn prepare_document_for_full_save(document: &mut Document) {

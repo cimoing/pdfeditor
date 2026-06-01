@@ -8,6 +8,7 @@ import {
   getPageStructureByHandle,
   previewTextLayout,
   resolvePdfFontFamily,
+  setCjkFontByHandle,
   startTextEdit,
   updateTextByHandle,
   updateTextRunsByHandle
@@ -685,6 +686,10 @@ async function onFileChange(event: Event) {
 
   clearEditingState();
   await openFile(file);
+  // Pre-embed NotoSans SC so CJK fallback characters render correctly in saved PDFs.
+  if (pdfHandle.value != null) {
+    void setCjkFontByHandle(pdfHandle.value);
+  }
   await loadPage();
 }
 

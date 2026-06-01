@@ -13,11 +13,13 @@ import init, {
   pdf_page_structure_by_handle,
   pdf_preview_text_layout,
   pdf_preview_text_layout_by_handle,
+  pdf_set_cjk_font_by_handle,
   pdf_start_text_edit,
   pdf_start_text_edit_by_handle,
   pdf_update_text_by_handle,
   pdf_update_text_runs_by_handle
 } from "./wasm/pdfeditor_core";
+import notoSansScWoffUrl from "@fontsource/noto-sans-sc/files/noto-sans-sc-chinese-simplified-400-normal.woff?url";
 
 export interface Point {
   x: number;
@@ -369,6 +371,33 @@ export async function updateTextByHandle(handle: number, objectId: number, text:
   pdf_update_text_by_handle(handle, BigInt(objectId), text);
 }
 
+/** Cached Noto Sans SC woff bytes — fetched once, reused for every document. */
+let _notoWoffCache: Uint8Array | null = null;
+
+/**
+ * Pre-load and embed the Noto Sans SC WOFF1 font into the in-memory PDF document.
+ *
+ * After this call, any CJK characters that cannot be encoded by the page's original
+ * fonts will be stored using the embedded NotoSansSC TrueType font (Identity-H)
+ * instead of the unembedded STSong-Light standard font, which many modern PDF viewers
+ * (especially browser-based) cannot render, producing boxes.
+ *
+ * This is a no-op if the font has already been embedded for this handle.
+ */
+export async function setCjkFontByHandle(handle: number): Promise<void> {
+  await ensureWasm();
+  if (!_notoWoffCache) {
+    try {
+      const response = await fetch(notoSansScWoffUrl);
+      if (!response.ok) return;
+      _notoWoffCache = new Uint8Array(await response.arrayBuffer());
+    } catch {
+      return; // font unavailable — fall back to STSong-Light silently
+    }
+  }
+  pdf_set_cjk_font_by_handle(handle, _notoWoffCache);
+}
+
 export async function updateTextRunsByHandle(
   handle: number,
   objectId: number,
@@ -378,11 +407,17 @@ export async function updateTextRunsByHandle(
   baseFontSize: number
 ): Promise<void> {
   await ensureWasm();
+  // For runs that use a built-in browser font (resource_name starts with "__builtin__:"),
+  // pass the "__cjk_fallback__" sentinel so the backend routes every character through the
+  // embedded Noto font (set via setCjkFontByHandle).  Any resource name the backend doesn't
+  // find in the page's font maps triggers the fallback path, which now uses the embedded
+  // TrueType font instead of unembedded STSong-Light.
+  const CJK_FALLBACK_SENTINEL = "__cjk_fallback__";
   const payload = runs.map((run) => ({
     content: run.content,
-    // Built-in browser fonts (resource_name starts with "__builtin__:") are not PDF resources;
-    // pass null so the backend uses the inherited/fallback PDF font for encoding.
-    font_name: (run.font_name?.startsWith("__builtin__:") ? null : run.font_name) ?? baseFontName,
+    font_name: run.font_name?.startsWith("__builtin__:")
+      ? CJK_FALLBACK_SENTINEL
+      : (run.font_name ?? baseFontName),
     font_size: run.font_size ?? baseFontSize,
     color: (() => {
       const c = run.color ?? baseColor;

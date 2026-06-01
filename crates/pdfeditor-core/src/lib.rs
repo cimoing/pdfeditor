@@ -8,6 +8,7 @@ mod document;
 mod edit;
 mod engine;
 mod error;
+mod font_embed;
 mod lopdf_backend;
 mod page_writer;
 mod resource;
