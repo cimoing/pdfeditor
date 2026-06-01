@@ -3,7 +3,8 @@ use flate2::read::ZlibDecoder;
 use std::collections::HashMap;
 use std::io::Read;
 
-/// Parsed data from an embedded TrueType CJK font.
+/// Parsed data from an embedded TrueType font used through Identity-H.
+#[derive(Clone)]
 pub struct CjkFontData {
     pub sfnt_bytes: Vec<u8>,
     /// Unicode char → glyph ID (from the font's cmap).
@@ -17,6 +18,130 @@ pub struct CjkFontData {
     pub y_min: i16,
     pub x_max: i16,
     pub y_max: i16,
+}
+
+pub fn sfnt_is_truetype(sfnt: &[u8]) -> bool {
+    matches!(sfnt.get(0..4), Some([0x00, 0x01, 0x00, 0x00]) | Some(b"true"))
+}
+
+pub fn font_bytes_to_truetype_sfnt(bytes: &[u8]) -> Option<Vec<u8>> {
+    let sfnt = woff1_to_sfnt(bytes).unwrap_or_else(|| bytes.to_vec());
+    if sfnt_is_truetype(&sfnt) {
+        return Some(sfnt);
+    }
+    if sfnt.get(0..4) == Some(b"ttcf") {
+        return ttc_first_truetype_face_to_sfnt(&sfnt);
+    }
+    None
+}
+
+fn ttc_first_truetype_face_to_sfnt(ttc: &[u8]) -> Option<Vec<u8>> {
+    if ttc.len() < 12 || ttc.get(0..4)? != b"ttcf" {
+        return None;
+    }
+    let num_fonts = read_u32(ttc, 8)? as usize;
+    if num_fonts == 0 || 12 + num_fonts * 4 > ttc.len() {
+        return None;
+    }
+
+    for index in 0..num_fonts {
+        let offset = read_u32(ttc, 12 + index * 4)? as usize;
+        if let Some(sfnt) = extract_sfnt_at(ttc, offset) {
+            if sfnt_is_truetype(&sfnt) {
+                return Some(sfnt);
+            }
+        }
+    }
+    None
+}
+
+fn extract_sfnt_at(data: &[u8], font_offset: usize) -> Option<Vec<u8>> {
+    if font_offset + 12 > data.len() {
+        return None;
+    }
+    let flavor = data.get(font_offset..font_offset + 4)?;
+    if !matches!(flavor, [0x00, 0x01, 0x00, 0x00] | b"true") {
+        return None;
+    }
+    let num_tables = read_u16(data, font_offset + 4)? as usize;
+    let dir_end = font_offset + 12 + num_tables * 16;
+    if dir_end > data.len() {
+        return None;
+    }
+
+    struct TableEntry {
+        tag: [u8; 4],
+        checksum: u32,
+        offset: usize,
+        length: usize,
+    }
+
+    let mut entries = Vec::with_capacity(num_tables);
+    for i in 0..num_tables {
+        let base = font_offset + 12 + i * 16;
+        let tag = data.get(base..base + 4)?.try_into().ok()?;
+        let checksum = read_u32(data, base + 4)?;
+        let offset = read_u32(data, base + 8)? as usize;
+        let length = read_u32(data, base + 12)? as usize;
+        if offset.checked_add(length)? > data.len() {
+            return None;
+        }
+        entries.push(TableEntry {
+            tag,
+            checksum,
+            offset,
+            length,
+        });
+    }
+
+    let header_size = 12 + num_tables * 16;
+    let first_table_start = align4(header_size);
+    let mut table_offsets = Vec::with_capacity(num_tables);
+    let mut cursor = first_table_start;
+    for entry in &entries {
+        table_offsets.push(cursor);
+        cursor = cursor.checked_add(align4(entry.length))?;
+    }
+
+    let mut sfnt = vec![0u8; cursor];
+    sfnt[0..4].copy_from_slice(flavor);
+    let n = num_tables as u16;
+    sfnt[4..6].copy_from_slice(&n.to_be_bytes());
+    let max_pow2 = if n == 0 {
+        0u16
+    } else {
+        1u16 << (15 - n.leading_zeros())
+    };
+    let search_range = max_pow2 * 16;
+    let entry_selector = max_pow2.trailing_zeros() as u16;
+    let range_shift = n * 16 - search_range;
+    sfnt[6..8].copy_from_slice(&search_range.to_be_bytes());
+    sfnt[8..10].copy_from_slice(&entry_selector.to_be_bytes());
+    sfnt[10..12].copy_from_slice(&range_shift.to_be_bytes());
+
+    for (i, entry) in entries.iter().enumerate() {
+        let base = 12 + i * 16;
+        sfnt[base..base + 4].copy_from_slice(&entry.tag);
+        sfnt[base + 4..base + 8].copy_from_slice(&entry.checksum.to_be_bytes());
+        sfnt[base + 8..base + 12].copy_from_slice(&(table_offsets[i] as u32).to_be_bytes());
+        sfnt[base + 12..base + 16].copy_from_slice(&(entry.length as u32).to_be_bytes());
+        sfnt[table_offsets[i]..table_offsets[i] + entry.length]
+            .copy_from_slice(&data[entry.offset..entry.offset + entry.length]);
+    }
+
+    Some(sfnt)
+}
+
+fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(data.get(offset..offset + 2)?.try_into().ok()?))
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(data.get(offset..offset + 4)?.try_into().ok()?))
+}
+
+fn align4(value: usize) -> usize {
+    (value + 3) & !3
 }
 
 impl CjkFontData {

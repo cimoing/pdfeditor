@@ -14,6 +14,7 @@ import init, {
   pdf_preview_text_layout,
   pdf_preview_text_layout_by_handle,
   pdf_set_cjk_font_by_handle,
+  pdf_set_local_font_by_handle,
   pdf_start_text_edit,
   pdf_start_text_edit_by_handle,
   pdf_update_text_by_handle,
@@ -181,6 +182,14 @@ export interface EmbeddedFontInfo {
 
 export interface LoadedFontAsset extends EmbeddedFontInfo {
   data: ArrayBuffer;
+}
+
+export interface LocalSystemFontOption {
+  resource_name: string;
+  family_name: string;
+  css_family: string;
+  full_name: string;
+  postscript_name: string;
 }
 
 export interface LoadedPage {
@@ -402,6 +411,23 @@ export async function setCjkFontByHandle(handle: number): Promise<boolean> {
     }
   }
   return pdf_set_cjk_font_by_handle(handle, _notoWoffCache);
+}
+
+export async function setLocalFontByHandle(
+  handle: number,
+  resourceName: string,
+  fontBytes: Uint8Array
+): Promise<boolean> {
+  await ensureWasm();
+  const key = localFontKey(resourceName);
+  if (!key) return false;
+  return pdf_set_local_font_by_handle(handle, key, fontBytes);
+}
+
+function localFontKey(resourceName: string): string | null {
+  return resourceName.startsWith("__localfont__:")
+    ? resourceName.slice("__localfont__:".length)
+    : null;
 }
 
 export async function updateTextRunsByHandle(

@@ -501,6 +501,35 @@ pub fn pdf_set_cjk_font_by_handle(handle: u32, woff_bytes: &[u8]) -> Result<bool
     })
 }
 
+/// Register a local TrueType/SFNT font for later embedding.
+///
+/// `font_key` is the frontend resource key after the `__localfont__:` prefix.
+/// Only TrueType-flavoured SFNT/WOFF1/TTC fonts are accepted for now; CFF/OpenType
+/// fonts are rejected so the writer does not create invalid PDF font objects.
+#[wasm_bindgen]
+pub fn pdf_set_local_font_by_handle(
+    handle: u32,
+    font_key: &str,
+    font_bytes: &[u8],
+) -> Result<bool, JsValue> {
+    let Some(sfnt) = crate::font_embed::font_bytes_to_truetype_sfnt(font_bytes) else {
+        return Ok(false);
+    };
+    let Some(data) = crate::font_embed::parse_cjk_font(sfnt) else {
+        return Ok(false);
+    };
+
+    DOCUMENT_STORE.with(|store| {
+        let mut store = store.borrow_mut();
+        let document = store
+            .documents
+            .get_mut(&handle)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+        document.set_local_font(font_key.to_string(), data);
+        Ok(true)
+    })
+}
+
 /// Update a text object with multiple styled runs without serializing PDF bytes.
 /// `runs_json` is a JSON array of `{ content, font_name, font_size, color }` objects,
 /// where `color` is `[r, g, b, a]` (0–255 each).

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch, watchEffect } from "vue";
-import type { LayoutGlyph, RichTextRun, StructuredImageObject, StructuredTextObject } from "./pdfEditor";
+import type { LayoutGlyph, LocalSystemFontOption, RichTextRun, StructuredImageObject, StructuredTextObject } from "./pdfEditor";
 import {
   commitTextEdit,
   describePdfFontUsage,
@@ -9,6 +9,7 @@ import {
   previewTextLayout,
   resolvePdfFontFamily,
   setCjkFontByHandle,
+  setLocalFontByHandle,
   startTextEdit,
   updateTextByHandle,
   updateTextRunsByHandle
@@ -54,6 +55,20 @@ const {
 
 const fontAssetMap = computed(() => new Map(fontAssets.value.map((font) => [font.resource_name, font])));
 
+interface LocalFontData {
+  family: string;
+  fullName: string;
+  postscriptName: string;
+  style: string;
+  blob(): Promise<Blob>;
+}
+
+type QueryLocalFonts = (options?: { postscriptNames?: string[] }) => Promise<LocalFontData[]>;
+
+const systemFontOptions = ref<LocalSystemFontOption[]>([]);
+const systemFontData = new Map<string, LocalFontData>();
+const systemFontBytes = new Map<string, Uint8Array>();
+
 // ── Built-in / system fonts available in the browser ──────────────────────
 // These are loaded via @fontsource packages or known browser fonts.
 // resource_name uses a "__builtin__:" prefix to distinguish them from PDF-embedded fonts.
@@ -70,12 +85,15 @@ function fontFamilyForResource(resourceName: string | null): string {
   if (!resourceName) return svgFontFamily(null);
   const builtin = BUILTIN_FONTS.find((f) => f.resource_name === resourceName);
   if (builtin) return builtin.css_family;
+  const system = systemFontOptions.value.find((f) => f.resource_name === resourceName);
+  if (system) return system.css_family;
   return svgFontFamily(resourceName);
 }
 
 /** All font options shown in pickers: built-in first, then PDF-embedded. */
 const allFontOptions = computed(() => [
   ...BUILTIN_FONTS,
+  ...systemFontOptions.value,
   ...fontAssets.value
 ]);
 
@@ -747,6 +765,77 @@ function onLoadPageClick() {
   void loadPage();
 }
 
+async function loadSystemFonts() {
+  const queryLocalFonts = (window as Window & { queryLocalFonts?: QueryLocalFonts }).queryLocalFonts;
+  if (!queryLocalFonts) {
+    status.value = "当前浏览器不支持读取系统字体；请使用桌面版 Chrome 或 Edge。";
+    return;
+  }
+
+  try {
+    status.value = "正在请求系统字体权限...";
+    const fonts = await queryLocalFonts();
+    systemFontData.clear();
+    systemFontBytes.clear();
+    const seen = new Set<string>();
+    const options: LocalSystemFontOption[] = [];
+    for (const font of fonts) {
+      const key = sanitizeLocalFontKey(font.postscriptName || font.fullName || font.family);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const resourceName = `__localfont__:${key}`;
+      systemFontData.set(resourceName, font);
+      options.push({
+        resource_name: resourceName,
+        family_name: `${font.family}${font.style && font.style !== "Regular" ? ` ${font.style}` : ""}`,
+        css_family: `"${cssEscapeFontFamily(font.fullName)}", "${cssEscapeFontFamily(font.family)}", sans-serif`,
+        full_name: font.fullName,
+        postscript_name: font.postscriptName
+      });
+    }
+    options.sort((left, right) => left.family_name.localeCompare(right.family_name));
+    systemFontOptions.value = options;
+    status.value = `已加载 ${options.length} 个系统字体，可在字体下拉框中选择。`;
+  } catch (error) {
+    console.error(error);
+    status.value = error instanceof Error ? `读取系统字体失败：${error.message}` : "读取系统字体失败";
+  }
+}
+
+function sanitizeLocalFontKey(value: string) {
+  return value.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+}
+
+function cssEscapeFontFamily(value: string) {
+  return value.replace(/["\\]/g, "\\$&");
+}
+
+async function ensureSystemFontsForRuns(handle: number, runs: RichTextRun[]) {
+  const names = Array.from(new Set(
+    runs
+      .map((run) => run.font_name)
+      .filter((name): name is string => Boolean(name?.startsWith("__localfont__:")))
+  ));
+  for (const name of names) {
+    let bytes = systemFontBytes.get(name);
+    if (!bytes) {
+      const font = systemFontData.get(name);
+      if (!font) {
+        throw new Error("保存失败：所选系统字体未加载，请重新点击“加载系统字体”。");
+      }
+      const blob = await font.blob();
+      const buffer = await blob.arrayBuffer();
+      bytes = new Uint8Array(buffer);
+      systemFontBytes.set(name, bytes);
+    }
+    const accepted = await setLocalFontByHandle(handle, name, bytes);
+    if (!accepted) {
+      const label = systemFontOptions.value.find((font) => font.resource_name === name)?.family_name ?? name;
+      throw new Error(`保存失败：系统字体“${label}”不是当前版本可嵌入的 TrueType/TTC 字体。`);
+    }
+  }
+}
+
 async function beginTextEdit(objectId: number) {
   if (!pdfBytes.value) return;
   resetEditBoxOverrides();
@@ -942,6 +1031,7 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
       if (draftUsesBuiltInFont.value && !cjkFontEmbedded) {
         throw new Error("保存失败：用于写入 PDF 的内置字体没有成功嵌入，请检查字体资源是否可加载后重试。");
       }
+      await ensureSystemFontsForRuns(pdfHandle.value, draftRuns.value);
 
       // Fast path: update in-memory document, then refresh only the page structure.
       const existingImageUrls = new Map(
@@ -1434,6 +1524,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
       <div class="action-row">
         <button :disabled="!pdfBytes" @click="exportCurrentPdf">导出当前 PDF</button>
         <button :disabled="!selectedTextId" @click="clearSelection">取消选择</button>
+        <button @click="loadSystemFonts">加载系统字体</button>
       </div>
 
       <p class="status">{{ status }}</p>
@@ -1679,6 +1770,13 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                 <optgroup label="内置字体">
                   <option
                     v-for="font in BUILTIN_FONTS"
+                    :key="font.resource_name"
+                    :value="font.resource_name"
+                  >{{ font.family_name }}</option>
+                </optgroup>
+                <optgroup v-if="systemFontOptions.length" label="系统字体">
+                  <option
+                    v-for="font in systemFontOptions"
                     :key="font.resource_name"
                     :value="font.resource_name"
                   >{{ font.family_name }}</option>

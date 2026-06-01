@@ -169,6 +169,8 @@ pub fn open_lopdf_document_from_bytes(bytes: &[u8]) -> CoreResult<LopdfDocument>
         text_edit_groups: HashMap::new(),
         cjk_font: None,
         cjk_font_pages: HashMap::new(),
+        local_fonts: HashMap::new(),
+        local_font_pages: HashMap::new(),
     };
     result.extract_text_objects()?;
     Ok(result)
@@ -187,6 +189,8 @@ pub fn open_lopdf_document_from_bytes_unindexed(bytes: &[u8]) -> CoreResult<Lopd
         text_edit_groups: HashMap::new(),
         cjk_font: None,
         cjk_font_pages: HashMap::new(),
+        local_fonts: HashMap::new(),
+        local_font_pages: HashMap::new(),
     })
 }
 
@@ -200,6 +204,8 @@ pub struct LopdfDocument {
     cjk_font: Option<CjkFontData>,
     /// Tracks which page object IDs already have the embedded CJK font in their resources.
     cjk_font_pages: HashMap<ObjectId, String>,
+    local_fonts: HashMap<String, CjkFontData>,
+    local_font_pages: HashMap<(ObjectId, String), String>,
 }
 
 impl std::fmt::Debug for LopdfDocument {
@@ -274,6 +280,10 @@ impl BuiltinPdfFont {
     }
 }
 
+fn local_font_key_from_resource(value: &str) -> Option<&str> {
+    value.strip_prefix("__localfont__:")
+}
+
 impl PdfEngine for LopdfEngine {
     type Document = LopdfDocument;
 
@@ -290,6 +300,8 @@ impl PdfEngine for LopdfEngine {
             text_edit_groups: HashMap::new(),
             cjk_font: None,
             cjk_font_pages: HashMap::new(),
+            local_fonts: HashMap::new(),
+            local_font_pages: HashMap::new(),
         };
         result.extract_text_objects()?;
         Ok(result)
@@ -1389,6 +1401,8 @@ impl LopdfDocument {
                 if let Some(font_name) = run.font_name.as_deref() {
                     if let Some(font) = BuiltinPdfFont::from_sentinel(font_name) {
                         run.font_name = Some(self.ensure_page_builtin_font(page_id, font)?);
+                    } else if let Some(key) = local_font_key_from_resource(font_name) {
+                        run.font_name = Some(self.ensure_page_local_font(page_id, key)?);
                     }
                 }
                 Ok(run)
@@ -1440,6 +1454,122 @@ impl LopdfDocument {
         page_dict.set("Resources", Object::Dictionary(resources));
 
         Ok(resource_name)
+    }
+
+    pub fn set_local_font(&mut self, key: String, data: CjkFontData) {
+        self.local_fonts.insert(key, data);
+        self.local_font_pages.clear();
+    }
+
+    fn ensure_page_local_font(&mut self, page_id: ObjectId, key: &str) -> CoreResult<String> {
+        if let Some(name) = self.local_font_pages.get(&(page_id, key.to_string())) {
+            return Ok(name.clone());
+        }
+        let data = self
+            .local_fonts
+            .get(key)
+            .cloned()
+            .ok_or_else(|| CoreError::InvalidOperation(format!("local font is not registered: {key}")))?;
+        let resource_name = format!("PdfEditorLocal_{}", sanitize_pdf_resource_name(key));
+        self.add_identity_truetype_font_to_page(page_id, &resource_name, &data)?;
+        self.local_font_pages
+            .insert((page_id, key.to_string()), resource_name.clone());
+        Ok(resource_name)
+    }
+
+    fn add_identity_truetype_font_to_page(
+        &mut self,
+        page_id: ObjectId,
+        resource_name: &str,
+        data: &CjkFontData,
+    ) -> CoreResult<()> {
+        let sfnt_len = data.sfnt_bytes.len() as i64;
+        let font_file_id = self.document.add_object(lopdf::Stream::new(
+            dictionary! { "Length1" => sfnt_len },
+            data.sfnt_bytes.clone(),
+        ));
+
+        let font_name = resource_name;
+        let upm = data.units_per_em as f64;
+        let descriptor_id = self.document.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => Object::Name(font_name.as_bytes().to_vec()),
+            "Flags" => 4i64,
+            "FontBBox" => vec![
+                Object::Real((data.x_min as f64 / upm * 1000.0) as f32),
+                Object::Real((data.y_min as f64 / upm * 1000.0) as f32),
+                Object::Real((data.x_max as f64 / upm * 1000.0) as f32),
+                Object::Real((data.y_max as f64 / upm * 1000.0) as f32),
+            ],
+            "ItalicAngle" => 0i64,
+            "Ascent" => (data.ascender as f64 / upm * 1000.0) as i64,
+            "Descent" => (data.descender as f64 / upm * 1000.0) as i64,
+            "CapHeight" => (data.ascender as f64 / upm * 1000.0) as i64,
+            "StemV" => 80i64,
+            "FontFile2" => Object::Reference(font_file_id),
+        });
+
+        let cid_font_id = self.document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => Object::Name(font_name.as_bytes().to_vec()),
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal("Identity"),
+                "Supplement" => 0i64,
+            },
+            "DW" => 1000i64,
+            "W" => Object::Array(build_w_array(data)),
+            "CIDToGIDMap" => Object::Name(b"Identity".to_vec()),
+            "FontDescriptor" => Object::Reference(descriptor_id),
+        });
+
+        let mut gid_to_unicode: Vec<(u16, char)> = data
+            .unicode_to_gid
+            .iter()
+            .map(|(&ch, &gid)| (gid, ch))
+            .collect();
+        gid_to_unicode.sort_unstable_by_key(|&(gid, _)| gid);
+        let to_unicode_id = self.document.add_object(lopdf::Stream::new(
+            dictionary! {},
+            build_to_unicode_cmap(&gid_to_unicode).into_bytes(),
+        ));
+
+        let type0_id = self.document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => Object::Name(font_name.as_bytes().to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+            "ToUnicode" => Object::Reference(to_unicode_id),
+        });
+
+        let page_dict = self
+            .document
+            .get_dictionary(page_id)
+            .map_err(|err| CoreError::Engine(format!("failed to access page dictionary: {err}")))?;
+        let mut resources = page_dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|object| cloned_dictionary_from_object(&self.document, object))
+            .unwrap_or_default();
+        let mut fonts = resources
+            .get(b"Font")
+            .ok()
+            .and_then(|object| cloned_dictionary_from_object(&self.document, object))
+            .unwrap_or_default();
+        fonts.set(resource_name.as_bytes(), Object::Reference(type0_id));
+        resources.set("Font", Object::Dictionary(fonts));
+
+        let page = self
+            .document
+            .get_object_mut(page_id)
+            .map_err(|err| CoreError::Engine(format!("failed to access page object: {err}")))?;
+        let page_dict = page.as_dict_mut().map_err(|err| {
+            CoreError::InvalidPdf(format!("page object is not a dictionary: {err}"))
+        })?;
+        page_dict.set("Resources", Object::Dictionary(resources));
+        Ok(())
     }
 
     /// Ensure a CJK fallback font is registered in the given page's resources.
@@ -8924,6 +9054,13 @@ fn sanitize_file_stem(value: &str) -> String {
     } else {
         output
     }
+}
+
+fn sanitize_pdf_resource_name(value: &str) -> String {
+    sanitize_file_stem(value)
+        .chars()
+        .take(64)
+        .collect::<String>()
 }
 
 fn looks_like_watermark(value: &str) -> bool {
