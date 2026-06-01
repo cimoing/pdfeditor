@@ -714,9 +714,9 @@ async function onFileChange(event: Event) {
 
   clearEditingState();
   await openFile(file);
-  // Pre-embed NotoSans SC so CJK fallback characters render correctly in saved PDFs.
+  // Pre-embed NotoSans SC — await so the font is ready before the first edit/save.
   if (pdfHandle.value != null) {
-    void setCjkFontByHandle(pdfHandle.value);
+    await setCjkFontByHandle(pdfHandle.value);
   }
   await loadPage();
 }
@@ -921,6 +921,12 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
 
   try {
     if (pdfHandle.value != null) {
+      // Ensure the embedded Noto SC font is loaded before writing so that any
+      // CJK characters that cannot be encoded by the original font are stored
+      // with the properly-embedded Noto font rather than the bare STSong-Light
+      // standard font (which many PDF viewers cannot render).
+      await setCjkFontByHandle(pdfHandle.value);
+
       // Fast path: update in-memory document, then refresh only the page structure.
       const existingImageUrls = new Map(
         (page.value?.images ?? []).map((img) => [img.id, img.objectUrl])

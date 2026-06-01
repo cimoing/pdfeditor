@@ -221,8 +221,12 @@ let fontLoadSequence = 0;
 let loadedFontFaces: FontFace[] = [];
 let loadedFontUrls: string[] = [];
 
+// "Noto Sans SC" is loaded via @fontsource (web font, always available in this app).
+// It covers the full Simplified Chinese Unicode range and serves as the primary
+// fallback for any embedded PDF font whose subset is missing certain glyphs.
+const CJK_CSS_FALLBACK = '"Noto Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", SimSun';
 const fallbackFontFamily =
-  '"Helvetica Neue", Arial, "Segoe UI", "Noto Sans", "Noto Sans CJK SC", "Microsoft YaHei", SimSun, sans-serif';
+  `${CJK_CSS_FALLBACK}, "Helvetica Neue", Arial, "Segoe UI", "Noto Sans", sans-serif`;
 
 const fontNameFallbacks: Array<[RegExp, string]> = [
   [/simsun|song|stsong|宋体/i, '"Noto Serif CJK SC", SimSun, "Songti SC"'],
