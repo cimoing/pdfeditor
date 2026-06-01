@@ -16,6 +16,10 @@ use tiny_skia::{
     Transform,
 };
 
+const BUILTIN_MONOSPACE_SENTINEL: &str = "__pdfeditor_builtin_monospace__";
+const BUILTIN_SERIF_SENTINEL: &str = "__pdfeditor_builtin_serif__";
+const BUILTIN_SANS_SENTINEL: &str = "__pdfeditor_builtin_sans__";
+
 #[derive(Debug, Clone, Default)]
 pub struct LopdfEngine;
 
@@ -236,6 +240,40 @@ struct GroupMemberPlan {
     template: Object,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum BuiltinPdfFont {
+    Monospace,
+    Serif,
+    Sans,
+}
+
+impl BuiltinPdfFont {
+    fn from_sentinel(value: &str) -> Option<Self> {
+        match value {
+            BUILTIN_MONOSPACE_SENTINEL => Some(Self::Monospace),
+            BUILTIN_SERIF_SENTINEL => Some(Self::Serif),
+            BUILTIN_SANS_SENTINEL => Some(Self::Sans),
+            _ => None,
+        }
+    }
+
+    fn resource_name(self) -> &'static str {
+        match self {
+            Self::Monospace => "PdfEditorCourier",
+            Self::Serif => "PdfEditorTimes",
+            Self::Sans => "PdfEditorHelvetica",
+        }
+    }
+
+    fn base_font(self) -> &'static str {
+        match self {
+            Self::Monospace => "Courier",
+            Self::Serif => "Times-Roman",
+            Self::Sans => "Helvetica",
+        }
+    }
+}
+
 impl PdfEngine for LopdfEngine {
     type Document = LopdfDocument;
 
@@ -416,6 +454,7 @@ impl EngineDocument for LopdfDocument {
     ) -> CoreResult<TextObject> {
         let edit_group = self.text_edit_group(id)?;
         let page_id = self.page_id(edit_group.page)?;
+        let runs = self.resolve_builtin_run_fonts(page_id, runs)?;
         let font_maps = self.page_font_maps(page_id);
         let font_metrics = self.page_font_metrics(page_id);
         let content_bytes = self.document.get_page_content(page_id).map_err(|err| {
@@ -1032,6 +1071,7 @@ impl EngineDocument for LopdfDocument {
     ) -> CoreResult<TextObject> {
         let edit_group = self.text_edit_group(id)?;
         let page_id = self.page_id(edit_group.page)?;
+        let runs = self.resolve_builtin_run_fonts(page_id, runs)?;
         let font_maps = self.page_font_maps(page_id);
         let font_metrics = self.page_font_metrics(page_id);
         let content_bytes = self.document.get_page_content(page_id).map_err(|err| {
@@ -1337,6 +1377,69 @@ impl LopdfDocument {
     /// Returns `true` if an embedded CJK font is available (set via [`set_cjk_font`]).
     pub fn has_embedded_cjk_font(&self) -> bool {
         self.cjk_font.is_some()
+    }
+
+    fn resolve_builtin_run_fonts(
+        &mut self,
+        page_id: ObjectId,
+        runs: Vec<TextRun>,
+    ) -> CoreResult<Vec<TextRun>> {
+        runs.into_iter()
+            .map(|mut run| {
+                if let Some(font_name) = run.font_name.as_deref() {
+                    if let Some(font) = BuiltinPdfFont::from_sentinel(font_name) {
+                        run.font_name = Some(self.ensure_page_builtin_font(page_id, font)?);
+                    }
+                }
+                Ok(run)
+            })
+            .collect()
+    }
+
+    fn ensure_page_builtin_font(
+        &mut self,
+        page_id: ObjectId,
+        font: BuiltinPdfFont,
+    ) -> CoreResult<String> {
+        let resource_name = font.resource_name().to_string();
+        let page_dict = self
+            .document
+            .get_dictionary(page_id)
+            .map_err(|err| CoreError::Engine(format!("failed to access page dictionary: {err}")))?;
+        let mut resources = page_dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|object| cloned_dictionary_from_object(&self.document, object))
+            .unwrap_or_default();
+        let mut fonts = resources
+            .get(b"Font")
+            .ok()
+            .and_then(|object| cloned_dictionary_from_object(&self.document, object))
+            .unwrap_or_default();
+
+        if fonts.has(resource_name.as_bytes()) {
+            return Ok(resource_name);
+        }
+
+        let font_resource_id = self.document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => Object::Name(font.base_font().as_bytes().to_vec()),
+            "Encoding" => Object::Name(b"WinAnsiEncoding".to_vec()),
+        });
+        fonts.set(resource_name.as_bytes(), Object::Reference(font_resource_id));
+        resources.set("Font", Object::Dictionary(fonts));
+
+        let page = self
+            .document
+            .get_object_mut(page_id)
+            .map_err(|err| CoreError::Engine(format!("failed to access page object: {err}")))?;
+        let page_dict = page.as_dict_mut().map_err(|err| {
+            CoreError::InvalidPdf(format!("page object is not a dictionary: {err}"))
+        })?;
+        page_dict.set("Resources", Object::Dictionary(resources));
+
+        Ok(resource_name)
     }
 
     /// Ensure a CJK fallback font is registered in the given page's resources.
@@ -6221,7 +6324,7 @@ fn parse_simple_font_metrics(document: &Document, font: &Dictionary) -> Option<F
 }
 
 fn should_use_standard_latin_widths(base_font: &str, widths: &HashMap<u32, f32>) -> bool {
-    if !is_standard_proportional_latin_font(base_font) {
+    if !is_standard_latin_font(base_font) {
         return false;
     }
     if widths.is_empty() {
@@ -6234,7 +6337,7 @@ fn should_use_standard_latin_widths(base_font: &str, widths: &HashMap<u32, f32>)
     printable_widths.all(|width| (width - first).abs() < 0.01)
 }
 
-fn is_standard_proportional_latin_font(base_font: &str) -> bool {
+fn is_standard_latin_font(base_font: &str) -> bool {
     let normalized = normalize_base_font_name(base_font);
     matches!(
         normalized.as_str(),
@@ -6250,6 +6353,10 @@ fn is_standard_proportional_latin_font(base_font: &str) -> bool {
             | "Times-Bold"
             | "Times-Italic"
             | "Times-BoldItalic"
+            | "Courier"
+            | "Courier-Bold"
+            | "Courier-Oblique"
+            | "Courier-BoldOblique"
     )
 }
 
@@ -6273,7 +6380,9 @@ fn standard_latin_widths(base_font: &str) -> HashMap<u32, f32> {
 }
 
 fn standard_latin_width_units(base_font: &str, ch: char) -> f32 {
-    if base_font.starts_with("Times") {
+    if base_font.starts_with("Courier") {
+        600.0
+    } else if base_font.starts_with("Times") {
         times_latin_width_units(ch)
     } else {
         helvetica_latin_width_units(ch)

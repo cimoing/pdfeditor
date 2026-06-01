@@ -413,17 +413,25 @@ export async function updateTextRunsByHandle(
   baseFontSize: number
 ): Promise<void> {
   await ensureWasm();
-  // For runs that use a built-in browser font (resource_name starts with "__builtin__:"),
-  // pass the "__cjk_fallback__" sentinel so the backend routes every character through the
-  // embedded Noto font (set via setCjkFontByHandle).  Any resource name the backend doesn't
-  // find in the page's font maps triggers the fallback path, which now uses the embedded
-  // TrueType font instead of unembedded STSong-Light.
-  const CJK_FALLBACK_SENTINEL = "__cjk_fallback__";
+  // Built-in browser fonts need PDF-side resource names.  Noto Sans SC keeps using
+  // the embedded CJK fallback; Latin generic families map to standard PDF fonts.
+  const builtinPdfFontName = (fontName: string | null | undefined) => {
+    switch (fontName) {
+      case "__builtin__:monospace":
+        return "__pdfeditor_builtin_monospace__";
+      case "__builtin__:serif":
+        return "__pdfeditor_builtin_serif__";
+      case "__builtin__:sans-serif":
+        return "__pdfeditor_builtin_sans__";
+      case "__builtin__:Noto Sans SC":
+        return "__cjk_fallback__";
+      default:
+        return fontName ?? baseFontName;
+    }
+  };
   const payload = runs.map((run) => ({
     content: run.content,
-    font_name: run.font_name?.startsWith("__builtin__:")
-      ? CJK_FALLBACK_SENTINEL
-      : (run.font_name ?? baseFontName),
+    font_name: builtinPdfFontName(run.font_name),
     font_size: run.font_size ?? baseFontSize,
     color: (() => {
       const c = run.color ?? baseColor;

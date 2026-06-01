@@ -784,8 +784,14 @@ async function beginTextEdit(objectId: number) {
     }
     draftText.value = draftRuns.value.map((r) => r.content).join("");
 
-    await refreshPreview(objectId, draftText.value, currentSelection);
-    if (currentSelection !== getSelectionToken()) return;
+    layoutPreview.value = {
+      object_id: objectId,
+      text: draftText.value,
+      group_object_ids: session.group_object_ids,
+      glyphs: session.glyphs,
+      bbox: session.bbox,
+      overflow: false
+    };
     status.value = `已选中文本对象 ${objectId}，可直接修改并保存`;
     await nextTick();
     writeRunsToEditor(draftRuns.value);
