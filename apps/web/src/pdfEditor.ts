@@ -437,7 +437,8 @@ export async function updateTextRunsByHandle(
   baseColor: { r: number; g: number; b: number; a: number },
   baseFontName: string | null,
   baseFontSize: number,
-  originDelta: { x: number; y: number } = { x: 0, y: 0 }
+  originDelta: { x: number; y: number } = { x: 0, y: 0 },
+  clipBounds: Rect | null = null
 ): Promise<void> {
   await ensureWasm();
   // Built-in browser fonts need PDF-side resource names.  Noto Sans SC keeps using
@@ -470,7 +471,8 @@ export async function updateTextRunsByHandle(
     BigInt(objectId),
     JSON.stringify(payload),
     originDelta.x,
-    originDelta.y
+    originDelta.y,
+    clipBounds ? JSON.stringify(clipBounds) : ""
   );
 }
 

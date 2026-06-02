@@ -1101,6 +1101,7 @@ impl EngineDocument for LopdfDocument {
         id: TextObjectId,
         runs: Vec<TextRun>,
         origin_delta: Point,
+        clip_bounds: Option<Rect>,
     ) -> CoreResult<TextObject> {
         let edit_group = self.text_edit_group(id)?;
         let page_id = self.page_id(edit_group.page)?;
@@ -1308,6 +1309,17 @@ impl EngineDocument for LopdfDocument {
                 vec![Object::Real(anchor_state.word_spacing)],
             ));
         }
+        let (replacement_ops, replacement_prefix_len) = if let Some(clip_bounds) = clip_bounds {
+            wrap_text_replacement_ops_with_clip(
+                replacement_ops,
+                clip_bounds,
+                &anchor_state,
+                orig_font_name.as_deref(),
+                orig_font_size,
+            )
+        } else {
+            (replacement_ops, 0)
+        };
 
         // All content-stream indexes of the group's original text operations.
         let targeted_indexes: BTreeMap<usize, TextObjectId> = edit_group
@@ -1329,8 +1341,9 @@ impl EngineDocument for LopdfDocument {
                 if let Some(ops) = replacement_opt.take() {
                     // Insert replacement at position of the FIRST targeted operation.
                     let insert_at = rebuilt.len();
-                    let new_first_tj =
-                        insert_at + first_tj_in_replacement.unwrap_or(ops.len().saturating_sub(1));
+                    let new_first_tj = insert_at
+                        + replacement_prefix_len
+                        + first_tj_in_replacement.unwrap_or(ops.len().saturating_sub(1));
                     rebuilt.extend(ops);
                     post_edit_idx = rebuilt.len();
 
@@ -5970,6 +5983,80 @@ fn encode_fallback_str(
             .collect();
     }
     utf16be_bytes(text)
+}
+
+fn wrap_text_replacement_ops_with_clip(
+    replacement_ops: Vec<Operation>,
+    clip_bounds: Rect,
+    anchor_state: &TextParseState,
+    original_font_name: Option<&str>,
+    original_font_size: f32,
+) -> (Vec<Operation>, usize) {
+    let mut wrapped = Vec::with_capacity(replacement_ops.len() + 16);
+    wrapped.push(Operation::new("ET", vec![]));
+    wrapped.push(Operation::new("q", vec![]));
+    wrapped.push(Operation::new(
+        "re",
+        vec![
+            Object::Real(clip_bounds.origin.x),
+            Object::Real(clip_bounds.origin.y),
+            Object::Real(clip_bounds.size.width),
+            Object::Real(clip_bounds.size.height),
+        ],
+    ));
+    wrapped.push(Operation::new("W", vec![]));
+    wrapped.push(Operation::new("n", vec![]));
+    wrapped.push(Operation::new("BT", vec![]));
+    restore_text_state_ops(
+        &mut wrapped,
+        anchor_state,
+        original_font_name,
+        original_font_size,
+    );
+    let prefix_len = wrapped.len();
+    wrapped.extend(replacement_ops);
+    wrapped.push(Operation::new("ET", vec![]));
+    wrapped.push(Operation::new("Q", vec![]));
+    wrapped.push(Operation::new("BT", vec![]));
+    restore_text_state_ops(
+        &mut wrapped,
+        anchor_state,
+        original_font_name,
+        original_font_size,
+    );
+    (wrapped, prefix_len)
+}
+
+fn restore_text_state_ops(
+    out: &mut Vec<Operation>,
+    state: &TextParseState,
+    font_name: Option<&str>,
+    font_size: f32,
+) {
+    if let Some(font_name) = font_name {
+        out.push(font_set_operation(font_name, font_size));
+    }
+    if (state.horizontal_scaling - 100.0).abs() > 0.0001 {
+        out.push(Operation::new(
+            "Tz",
+            vec![Object::Real(state.horizontal_scaling)],
+        ));
+    }
+    if state.char_spacing != 0.0 {
+        out.push(Operation::new("Tc", vec![Object::Real(state.char_spacing)]));
+    }
+    if state.word_spacing != 0.0 {
+        out.push(Operation::new("Tw", vec![Object::Real(state.word_spacing)]));
+    }
+    if state.text_leading != 0.0 {
+        out.push(Operation::new("TL", vec![Object::Real(state.text_leading)]));
+    }
+    if state.rendering_mode != 0 {
+        out.push(Operation::new(
+            "Tr",
+            vec![Object::Integer(state.rendering_mode as i64)],
+        ));
+    }
 }
 
 fn width_array_for_chars(data: &CjkFontData, chars: Option<&BTreeSet<char>>) -> Vec<Object> {

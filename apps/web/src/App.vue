@@ -497,6 +497,7 @@ const renderTextObjects = computed(() => {
   const previewTransform = [...editSession.value.matrix] as Matrix2D;
   previewTransform[4] += originDelta.x;
   previewTransform[5] += originDelta.y;
+  const previewClipBounds = editorClipBoundsPdf();
   const previewObject: StructuredTextObject = {
     ...selectedTextObject.value,
     bounds: translatedByOriginDelta(layoutPreview.value.bbox, originDelta)!,
@@ -505,6 +506,7 @@ const renderTextObjects = computed(() => {
     font_size: editSession.value.font_size,
     transform: previewTransform,
     glyphs: previewGlyphs,
+    clip_bounds: previewClipBounds ?? undefined,
     runs: previewRuns,
   };
   return pageText.map((text) => (text.id === selectedTextObject.value!.id ? previewObject : text));
@@ -546,10 +548,7 @@ const svgViewportTransform = computed((): string => {
 
 const selectedViewportRect = computed(() => {
   const viewport = currentViewport.value;
-  const targetBounds = translatedByOriginDelta(
-    layoutPreview.value?.bbox ?? selectedTextObject.value?.bounds ?? null,
-    editorOriginDeltaPdf()
-  );
+  const targetBounds = editSession.value ? editorClipBoundsPdf() : selectedTextObject.value?.clip_bounds ?? selectedTextObject.value?.bounds;
   if (!viewport || !targetBounds) return null;
   return pdfRectToViewportRect(viewport, targetBounds);
 });
@@ -559,10 +558,16 @@ const previewGlyphRects = computed(() => {
   const glyphs = layoutPreview.value?.glyphs ?? [];
   if (!viewport) return [];
   const originDelta = editorOriginDeltaPdf();
-  return glyphs.map((glyph, index) => ({
-    id: `${index}-${glyph.ch}-${glyph.x}-${glyph.y}`,
-    rect: pdfRectToViewportRect(viewport, translatedByOriginDelta(glyph.bbox, originDelta)!)
-  }));
+  const clipBounds = editorClipBoundsPdf();
+  return glyphs.flatMap((glyph, index) => {
+    const bbox = translatedByOriginDelta(glyph.bbox, originDelta)!;
+    const clipped = clipBounds ? intersectRects(bbox, clipBounds) : bbox;
+    if (!clipped) return [];
+    return [{
+      id: `${index}-${glyph.ch}-${glyph.x}-${glyph.y}`,
+      rect: pdfRectToViewportRect(viewport, clipped)
+    }];
+  });
 });
 
 interface InlineEditorGeometry {
@@ -683,12 +688,24 @@ const hasRunStyleChanges = computed(() => {
 
 const hasEditorPositionChange = computed(() => Math.abs(editorStartOffsetPx()) > 0.5);
 
+const hasEditorClipChange = computed(() => {
+  const text = selectedTextObject.value;
+  if (!text) return false;
+  const geometry = inlineEditorGeometry(text);
+  if (!geometry) return false;
+  const width = editBoxWidthOverride.value ?? geometry.naturalWidth;
+  return Math.abs(width - geometry.naturalWidth) > 0.5;
+});
+
 const canSaveEdit = computed(() => {
   if (!selectedTextObject.value || !editSession.value || isSavingEdit.value || isPreparingEdit.value) {
     return false;
   }
   // Allow save if text, style, or the edit-box start position changed.
-  return draftText.value !== editSession.value.original_text || hasRunStyleChanges.value || hasEditorPositionChange.value;
+  return draftText.value !== editSession.value.original_text
+    || hasRunStyleChanges.value
+    || hasEditorPositionChange.value
+    || hasEditorClipChange.value;
 });
 
 const draftUsesBuiltInFont = computed(() =>
@@ -1104,6 +1121,7 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
   const objectId = selectedTextId.value;
   const savedText = draftText.value;
   const originDelta = editorOriginDeltaPdf();
+  const savedClipBounds = editorClipBoundsPdf();
   const savedBounds = translatedByOriginDelta(
     layoutPreview.value?.bbox ?? editSession.value?.bbox ?? selectedTextObject.value?.bounds ?? null,
     originDelta
@@ -1128,13 +1146,20 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
         (page.value?.images ?? []).map((img) => [img.id, img.objectUrl])
       );
       const textObj = page.value?.text.find((t) => t.id === objectId);
-      if (draftRuns.value.length > 1 || hasRunStyleChanges.value || hasEditorPositionChange.value) {
+      if (
+        draftRuns.value.length > 1
+        || hasRunStyleChanges.value
+        || hasEditorPositionChange.value
+        || hasEditorClipChange.value
+        || Boolean(layoutPreview.value?.overflow)
+      ) {
         await updateTextRunsByHandle(
           pdfHandle.value, objectId, draftRuns.value,
           textObj?.color ?? { r: 0, g: 0, b: 0, a: 255 },
           editSession.value?.font_id ?? textObj?.font_name ?? null,
           editSession.value?.font_size ?? textObj?.font_size ?? 12,
-          originDelta
+          originDelta,
+          savedClipBounds
         );
       } else {
         await updateTextByHandle(pdfHandle.value, objectId, savedText);
@@ -1145,11 +1170,15 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
         const url = existingImageUrls.get(img.id);
         if (url) img.objectUrl = url;
       }
+      const nextObjectId = findSavedTextObjectId(structure.text, objectId, savedText, savedBounds);
+      if (nextObjectId != null && savedClipBounds) {
+        const savedObject = structure.text.find((item) => item.id === nextObjectId);
+        if (savedObject) savedObject.clip_bounds = savedClipBounds;
+      }
       page.value = structure;
       if (closeAfterSave) {
         clearEditingState();
       } else {
-        const nextObjectId = findSavedTextObjectId(structure.text, objectId, savedText, savedBounds);
         if (nextObjectId == null) {
           clearEditingState();
         } else {
@@ -1163,10 +1192,19 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
       pdfBytes.value = new Uint8Array(updatedBytes);
       if (closeAfterSave) {
         await loadPage();
+        if (savedClipBounds && page.value) {
+          const nextObjectId = findSavedTextObjectId(page.value.text, objectId, savedText, savedBounds);
+          const savedObject = nextObjectId == null ? null : page.value.text.find((item) => item.id === nextObjectId);
+          if (savedObject) savedObject.clip_bounds = savedClipBounds;
+        }
         clearEditingState();
       } else {
         const loaded = await loadPage();
         const nextObjectId = loaded ? findSavedTextObjectId(loaded.structure.text, objectId, savedText, savedBounds) : null;
+        if (nextObjectId != null && savedClipBounds && loaded) {
+          const savedObject = loaded.structure.text.find((item) => item.id === nextObjectId);
+          if (savedObject) savedObject.clip_bounds = savedClipBounds;
+        }
         if (nextObjectId == null) {
           clearEditingState();
         } else {
@@ -1231,6 +1269,44 @@ function editorOriginDeltaPdf() {
     geometry.origin.y + geometry.axisX.y * offset
   );
   return { x: to.x - from.x, y: to.y - from.y };
+}
+
+function editorClipBoundsPdf(): StructuredTextObject["bounds"] | null {
+  const text = selectedTextObject.value;
+  const viewport = currentViewport.value;
+  if (!text || !viewport) return null;
+  const geometry = inlineEditorGeometry(text);
+  if (!geometry) return null;
+  const startOffset = editorStartOffsetPx();
+  const width = editBoxWidthOverride.value ?? geometry.naturalWidth;
+  const height = geometry.fontSize * 1.4;
+  const origin = {
+    x: geometry.origin.x + geometry.axisX.x * startOffset,
+    y: geometry.origin.y + geometry.axisX.y * startOffset
+  };
+  const corners = [
+    origin,
+    {
+      x: origin.x + geometry.axisX.x * width,
+      y: origin.y + geometry.axisX.y * width
+    },
+    {
+      x: origin.x + geometry.axisX.x * width + geometry.axisY.x * height,
+      y: origin.y + geometry.axisX.y * width + geometry.axisY.y * height
+    },
+    {
+      x: origin.x + geometry.axisY.x * height,
+      y: origin.y + geometry.axisY.y * height
+    }
+  ].map((point) => viewportToPdf(viewport, point.x, point.y));
+  const minX = Math.min(...corners.map((point) => point.x));
+  const maxX = Math.max(...corners.map((point) => point.x));
+  const minY = Math.min(...corners.map((point) => point.y));
+  const maxY = Math.max(...corners.map((point) => point.y));
+  return {
+    origin: { x: minX, y: minY },
+    size: { width: maxX - minX, height: maxY - minY }
+  };
 }
 
 function translatedByOriginDelta(
@@ -1616,7 +1692,7 @@ function svgGlyphPathStrokeWidth(glyph: LayoutGlyph) {
 function textClipAttrs(text: StructuredTextObject): { x: number; y: number; width: number; height: number } | null {
   const b =
     text.id === selectedTextId.value && editSession.value
-      ? editSession.value.bbox
+      ? editorClipBoundsPdf()
       : text.clip_bounds ?? null;
   if (!b) return null;
   return { x: b.origin.x, y: b.origin.y, width: b.size.width, height: b.size.height };

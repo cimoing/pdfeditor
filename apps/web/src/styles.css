@@ -365,7 +365,7 @@ button:disabled {
 .inline-text-editor {
   display: block;
   width: 100%;
-  overflow: visible;
+  overflow: hidden;
   padding: 0 2px;
   border: 1px solid rgba(31, 111, 235, 0.72);
   outline: 2px solid rgba(31, 111, 235, 0.16);

@@ -123,6 +123,7 @@ pub trait EngineDocument {
         id: TextObjectId,
         runs: Vec<TextRun>,
         origin_delta: Point,
+        clip_bounds: Option<Rect>,
     ) -> CoreResult<TextObject>;
     fn update_text_object_bounds(
         &mut self,
@@ -329,6 +330,7 @@ impl EngineDocument for MockEngineDocument {
         id: TextObjectId,
         runs: Vec<TextRun>,
         _origin_delta: Point,
+        _clip_bounds: Option<Rect>,
     ) -> CoreResult<TextObject> {
         // Mock: delegate to update_text_object_runs
         self.update_text_object_runs(id, runs)

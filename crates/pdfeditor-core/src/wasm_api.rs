@@ -1,5 +1,5 @@
 use crate::lopdf_backend::{open_lopdf_document_from_bytes_unindexed, LopdfDocument};
-use crate::types::{Color, TextRun};
+use crate::types::{Color, Rect, TextRun};
 use crate::{
     open_lopdf_document_from_bytes, page_background_png_from_pdf_bytes,
     page_font_assets_from_pdf_bytes, page_image_png_from_pdf_bytes,
@@ -548,10 +548,19 @@ pub fn pdf_update_text_runs_by_handle(
     runs_json: &str,
     origin_dx: f32,
     origin_dy: f32,
+    clip_bounds_json: &str,
 ) -> Result<(), JsValue> {
     let runs_input: Vec<TextRunInput> = serde_json::from_str(runs_json)
         .map_err(|e| JsValue::from_str(&format!("invalid runs JSON: {e}")))?;
     let runs = text_runs_from_input(runs_input);
+    let clip_bounds: Option<Rect> = if clip_bounds_json.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str(clip_bounds_json)
+                .map_err(|e| JsValue::from_str(&format!("invalid clip bounds JSON: {e}")))?,
+        )
+    };
     DOCUMENT_STORE.with(|store| {
         let mut store = store.borrow_mut();
         let document = store
@@ -563,7 +572,12 @@ pub fn pdf_update_text_runs_by_handle(
             .ensure_text_index_for_page(page_from_text_object_id(object_id))
             .map_err(core_error_to_js)?;
         document
-            .replace_text_object_with_runs(id, runs, crate::Point::new(origin_dx, origin_dy))
+            .replace_text_object_with_runs(
+                id,
+                runs,
+                crate::Point::new(origin_dx, origin_dy),
+                clip_bounds,
+            )
             .map(|_| ())
             .map_err(core_error_to_js)
     })
