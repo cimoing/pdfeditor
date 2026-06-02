@@ -1,6 +1,6 @@
 #![allow(dead_code)] // public API — used from wasm_api.rs via the wasm feature flag
 use flate2::read::ZlibDecoder;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 
 /// Parsed data from an embedded TrueType font used through Identity-H.
@@ -21,7 +21,17 @@ pub struct CjkFontData {
 }
 
 pub fn sfnt_is_truetype(sfnt: &[u8]) -> bool {
-    matches!(sfnt.get(0..4), Some([0x00, 0x01, 0x00, 0x00]) | Some(b"true"))
+    matches!(
+        sfnt.get(0..4),
+        Some([0x00, 0x01, 0x00, 0x00]) | Some(b"true")
+    )
+}
+
+#[derive(Clone)]
+struct SfntTable {
+    tag: [u8; 4],
+    offset: usize,
+    length: usize,
 }
 
 pub fn font_bytes_to_truetype_sfnt(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -132,12 +142,287 @@ fn extract_sfnt_at(data: &[u8], font_offset: usize) -> Option<Vec<u8>> {
     Some(sfnt)
 }
 
+pub fn subset_truetype_font_for_chars(
+    data: &CjkFontData,
+    chars: &BTreeSet<char>,
+) -> Option<Vec<u8>> {
+    if chars.is_empty() {
+        return Some(data.sfnt_bytes.clone());
+    }
+    let mut gids = BTreeSet::from([0u16]);
+    for ch in chars {
+        if let Some(gid) = data.unicode_to_gid.get(ch).copied() {
+            gids.insert(gid);
+        }
+    }
+    subset_truetype_font_for_gids(&data.sfnt_bytes, &gids)
+}
+
+fn subset_truetype_font_for_gids(sfnt: &[u8], gids: &BTreeSet<u16>) -> Option<Vec<u8>> {
+    let tables = sfnt_tables(sfnt)?;
+    let head = table_slice(sfnt, &tables, b"head")?;
+    let maxp = table_slice(sfnt, &tables, b"maxp")?;
+    let glyf = table_slice(sfnt, &tables, b"glyf")?;
+    let loca = table_slice(sfnt, &tables, b"loca")?;
+    let loca_format = read_i16(head, 50)?;
+    let num_glyphs = read_u16(maxp, 4)? as usize;
+    if num_glyphs == 0 {
+        return None;
+    }
+
+    let offsets = read_loca_offsets(loca, num_glyphs, loca_format)?;
+    let mut included: BTreeSet<u16> = gids
+        .iter()
+        .copied()
+        .filter(|gid| (*gid as usize) < num_glyphs)
+        .collect();
+    include_composite_dependencies(glyf, &offsets, &mut included);
+
+    let mut new_glyf = Vec::new();
+    let mut new_offsets = Vec::with_capacity(num_glyphs + 1);
+    for gid in 0..num_glyphs {
+        new_offsets.push(new_glyf.len() as u32);
+        if included.contains(&(gid as u16)) {
+            let (start, end) = glyph_range(&offsets, gid, glyf.len())?;
+            if end > start {
+                new_glyf.extend_from_slice(&glyf[start..end]);
+                while new_glyf.len() % 4 != 0 {
+                    new_glyf.push(0);
+                }
+            }
+        }
+    }
+    new_offsets.push(new_glyf.len() as u32);
+
+    let mut new_loca = Vec::with_capacity(new_offsets.len() * 4);
+    for offset in new_offsets {
+        new_loca.extend_from_slice(&offset.to_be_bytes());
+    }
+
+    let mut rebuilt_tables = Vec::with_capacity(tables.len());
+    for table in &tables {
+        let bytes = if &table.tag == b"glyf" {
+            new_glyf.clone()
+        } else if &table.tag == b"loca" {
+            new_loca.clone()
+        } else if &table.tag == b"head" {
+            let mut head = sfnt[table.offset..table.offset + table.length].to_vec();
+            if head.len() < 54 {
+                return None;
+            }
+            head[8..12].fill(0);
+            head[50..52].copy_from_slice(&1i16.to_be_bytes());
+            head
+        } else {
+            sfnt[table.offset..table.offset + table.length].to_vec()
+        };
+        rebuilt_tables.push((table.tag, bytes));
+    }
+
+    build_sfnt(sfnt.get(0..4)?.try_into().ok()?, rebuilt_tables)
+}
+
+fn sfnt_tables(sfnt: &[u8]) -> Option<Vec<SfntTable>> {
+    if sfnt.len() < 12 || !sfnt_is_truetype(sfnt) {
+        return None;
+    }
+    let num_tables = read_u16(sfnt, 4)? as usize;
+    let dir_end = 12 + num_tables * 16;
+    if dir_end > sfnt.len() {
+        return None;
+    }
+    let mut tables = Vec::with_capacity(num_tables);
+    for i in 0..num_tables {
+        let base = 12 + i * 16;
+        let tag = sfnt.get(base..base + 4)?.try_into().ok()?;
+        let offset = read_u32(sfnt, base + 8)? as usize;
+        let length = read_u32(sfnt, base + 12)? as usize;
+        if offset.checked_add(length)? > sfnt.len() {
+            return None;
+        }
+        tables.push(SfntTable {
+            tag,
+            offset,
+            length,
+        });
+    }
+    Some(tables)
+}
+
+fn table_slice<'a>(sfnt: &'a [u8], tables: &[SfntTable], tag: &[u8; 4]) -> Option<&'a [u8]> {
+    let table = tables.iter().find(|table| &table.tag == tag)?;
+    sfnt.get(table.offset..table.offset + table.length)
+}
+
+fn read_loca_offsets(loca: &[u8], num_glyphs: usize, loca_format: i16) -> Option<Vec<usize>> {
+    let count = num_glyphs.checked_add(1)?;
+    match loca_format {
+        0 => {
+            if loca.len() < count * 2 {
+                return None;
+            }
+            (0..count)
+                .map(|i| read_u16(loca, i * 2).map(|offset| offset as usize * 2))
+                .collect()
+        }
+        1 => {
+            if loca.len() < count * 4 {
+                return None;
+            }
+            (0..count)
+                .map(|i| read_u32(loca, i * 4).map(|offset| offset as usize))
+                .collect()
+        }
+        _ => None,
+    }
+}
+
+fn include_composite_dependencies(glyf: &[u8], offsets: &[usize], included: &mut BTreeSet<u16>) {
+    let mut stack: Vec<u16> = included.iter().copied().collect();
+    while let Some(gid) = stack.pop() {
+        let Some((start, end)) = glyph_range(offsets, gid as usize, glyf.len()) else {
+            continue;
+        };
+        if end <= start + 10 {
+            continue;
+        }
+        let glyph = &glyf[start..end];
+        let Some(contours) = read_i16(glyph, 0) else {
+            continue;
+        };
+        if contours >= 0 {
+            continue;
+        }
+        for component_gid in composite_component_gids(glyph) {
+            if included.insert(component_gid) {
+                stack.push(component_gid);
+            }
+        }
+    }
+}
+
+fn composite_component_gids(glyph: &[u8]) -> Vec<u16> {
+    const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
+    const WE_HAVE_A_SCALE: u16 = 0x0008;
+    const MORE_COMPONENTS: u16 = 0x0020;
+    const WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
+    const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
+
+    let mut gids = Vec::new();
+    let mut cursor = 10usize;
+    loop {
+        let Some(flags) = read_u16(glyph, cursor) else {
+            break;
+        };
+        let Some(gid) = read_u16(glyph, cursor + 2) else {
+            break;
+        };
+        gids.push(gid);
+        cursor += 4;
+        cursor += if flags & ARG_1_AND_2_ARE_WORDS != 0 {
+            4
+        } else {
+            2
+        };
+        if flags & WE_HAVE_A_SCALE != 0 {
+            cursor += 2;
+        } else if flags & WE_HAVE_AN_X_AND_Y_SCALE != 0 {
+            cursor += 4;
+        } else if flags & WE_HAVE_A_TWO_BY_TWO != 0 {
+            cursor += 8;
+        }
+        if flags & MORE_COMPONENTS == 0 {
+            break;
+        }
+    }
+    gids
+}
+
+fn glyph_range(offsets: &[usize], gid: usize, glyf_len: usize) -> Option<(usize, usize)> {
+    let start = *offsets.get(gid)?;
+    let end = *offsets.get(gid + 1)?;
+    if start > end || end > glyf_len {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn build_sfnt(flavor: [u8; 4], tables: Vec<([u8; 4], Vec<u8>)>) -> Option<Vec<u8>> {
+    let num_tables = tables.len();
+    let header_size = 12 + num_tables * 16;
+    let first_table_start = align4(header_size);
+    let mut offsets = Vec::with_capacity(num_tables);
+    let mut cursor = first_table_start;
+    for (_, bytes) in &tables {
+        offsets.push(cursor);
+        cursor = cursor.checked_add(align4(bytes.len()))?;
+    }
+
+    let mut sfnt = vec![0u8; cursor];
+    sfnt[0..4].copy_from_slice(&flavor);
+    let n = num_tables as u16;
+    sfnt[4..6].copy_from_slice(&n.to_be_bytes());
+    let max_pow2 = if n == 0 {
+        0u16
+    } else {
+        1u16 << (15 - n.leading_zeros())
+    };
+    let search_range = max_pow2 * 16;
+    let entry_selector = max_pow2.trailing_zeros() as u16;
+    let range_shift = n * 16 - search_range;
+    sfnt[6..8].copy_from_slice(&search_range.to_be_bytes());
+    sfnt[8..10].copy_from_slice(&entry_selector.to_be_bytes());
+    sfnt[10..12].copy_from_slice(&range_shift.to_be_bytes());
+
+    let mut head_table_offset = None;
+    for (i, ((tag, bytes), offset)) in tables.iter().zip(offsets.iter()).enumerate() {
+        let base = 12 + i * 16;
+        sfnt[base..base + 4].copy_from_slice(tag);
+        sfnt[base + 4..base + 8].copy_from_slice(&table_checksum(bytes).to_be_bytes());
+        sfnt[base + 8..base + 12].copy_from_slice(&(*offset as u32).to_be_bytes());
+        sfnt[base + 12..base + 16].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+        sfnt[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+        if tag == b"head" {
+            head_table_offset = Some(*offset);
+        }
+    }
+
+    let head_offset = head_table_offset?;
+    if head_offset + 12 > sfnt.len() {
+        return None;
+    }
+    sfnt[head_offset + 8..head_offset + 12].fill(0);
+    let adjustment = 0xB1B0AFBAu32.wrapping_sub(table_checksum(&sfnt));
+    sfnt[head_offset + 8..head_offset + 12].copy_from_slice(&adjustment.to_be_bytes());
+    Some(sfnt)
+}
+
+fn table_checksum(data: &[u8]) -> u32 {
+    let mut sum = 0u32;
+    for chunk in data.chunks(4) {
+        let mut padded = [0u8; 4];
+        padded[..chunk.len()].copy_from_slice(chunk);
+        sum = sum.wrapping_add(u32::from_be_bytes(padded));
+    }
+    sum
+}
+
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_be_bytes(data.get(offset..offset + 2)?.try_into().ok()?))
+    Some(u16::from_be_bytes(
+        data.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_i16(data: &[u8], offset: usize) -> Option<i16> {
+    Some(i16::from_be_bytes(
+        data.get(offset..offset + 2)?.try_into().ok()?,
+    ))
 }
 
 fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(data.get(offset..offset + 4)?.try_into().ok()?))
+    Some(u32::from_be_bytes(
+        data.get(offset..offset + 4)?.try_into().ok()?,
+    ))
 }
 
 fn align4(value: usize) -> usize {
@@ -194,11 +479,20 @@ pub fn woff1_to_sfnt(woff: &[u8]) -> Option<Vec<u8>> {
     for i in 0..num_tables {
         let b = 44 + i * 20;
         let tag = [woff[b], woff[b + 1], woff[b + 2], woff[b + 3]];
-        let offset = u32::from_be_bytes([woff[b + 4], woff[b + 5], woff[b + 6], woff[b + 7]]) as usize;
-        let comp_len = u32::from_be_bytes([woff[b + 8], woff[b + 9], woff[b + 10], woff[b + 11]]) as usize;
-        let orig_len = u32::from_be_bytes([woff[b + 12], woff[b + 13], woff[b + 14], woff[b + 15]]) as usize;
+        let offset =
+            u32::from_be_bytes([woff[b + 4], woff[b + 5], woff[b + 6], woff[b + 7]]) as usize;
+        let comp_len =
+            u32::from_be_bytes([woff[b + 8], woff[b + 9], woff[b + 10], woff[b + 11]]) as usize;
+        let orig_len =
+            u32::from_be_bytes([woff[b + 12], woff[b + 13], woff[b + 14], woff[b + 15]]) as usize;
         let checksum = u32::from_be_bytes([woff[b + 16], woff[b + 17], woff[b + 18], woff[b + 19]]);
-        entries.push(WoffEntry { tag, offset, comp_len, orig_len, checksum });
+        entries.push(WoffEntry {
+            tag,
+            offset,
+            comp_len,
+            orig_len,
+            checksum,
+        });
     }
 
     // Compute sfnt table offsets (4-byte aligned, after the sfnt header).
@@ -324,20 +618,36 @@ pub fn parse_cjk_font(sfnt_bytes: Vec<u8>) -> Option<CjkFontData> {
 /// Format: `[firstGid [w0 w1 …] firstGid [w0 w1 …] …]`
 /// We only include GIDs whose advance differs from the default (1000).
 pub fn build_w_array(data: &CjkFontData) -> Vec<lopdf::Object> {
+    build_w_array_for_gids(data, 0..data.gid_to_advance.len())
+}
+
+pub fn build_w_array_for_gids<I>(data: &CjkFontData, gids: I) -> Vec<lopdf::Object>
+where
+    I: IntoIterator<Item = usize>,
+{
     let default_w: u32 = 1000;
     let mut out: Vec<lopdf::Object> = Vec::new();
 
     let mut run_start: Option<usize> = None;
     let mut run: Vec<lopdf::Object> = Vec::new();
 
-    let flush = |out: &mut Vec<lopdf::Object>, run_start: &mut Option<usize>, run: &mut Vec<lopdf::Object>| {
+    let flush = |out: &mut Vec<lopdf::Object>,
+                 run_start: &mut Option<usize>,
+                 run: &mut Vec<lopdf::Object>| {
         if let Some(start) = run_start.take() {
             out.push(lopdf::Object::Integer(start as i64));
             out.push(lopdf::Object::Array(std::mem::take(run)));
         }
     };
 
-    for (gid, &_advance) in data.gid_to_advance.iter().enumerate() {
+    let mut gids: Vec<usize> = gids.into_iter().collect();
+    gids.sort_unstable();
+    gids.dedup();
+    let mut previous_gid: Option<usize> = None;
+    for gid in gids {
+        if previous_gid.is_some_and(|previous| gid != previous + 1) {
+            flush(&mut out, &mut run_start, &mut run);
+        }
         let w = data.advance_thousandths(gid as u16);
         if w != default_w {
             if run_start.is_none() {
@@ -347,6 +657,7 @@ pub fn build_w_array(data: &CjkFontData) -> Vec<lopdf::Object> {
         } else {
             flush(&mut out, &mut run_start, &mut run);
         }
+        previous_gid = Some(gid);
     }
     flush(&mut out, &mut run_start, &mut run);
     let _ = default_w; // suppress warning

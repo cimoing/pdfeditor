@@ -1,3 +1,7 @@
+use crate::font_embed::{
+    build_to_unicode_cmap, build_w_array, build_w_array_for_gids, subset_truetype_font_for_chars,
+    CjkFontData,
+};
 use crate::{
     BookmarkItem, Color, CoreError, CoreResult, EngineDocument, HitTestResult, ImageObject,
     ImageObjectId, LayoutGlyph, PageIndex, PageInfo, PageStructure, PdfEngine, PdfObjectId, Point,
@@ -5,10 +9,9 @@ use crate::{
     StructuredVisualTextObject, StructuredWatermark, TextEditSessionInfo, TextLayoutPreview,
     TextObject, TextObjectId, TextRun, TextStyle,
 };
-use crate::font_embed::{build_to_unicode_cmap, build_w_array, CjkFontData};
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, StringFormat};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use tiny_skia::{
@@ -169,8 +172,10 @@ pub fn open_lopdf_document_from_bytes(bytes: &[u8]) -> CoreResult<LopdfDocument>
         text_edit_groups: HashMap::new(),
         cjk_font: None,
         cjk_font_pages: HashMap::new(),
+        cjk_font_page_chars: HashMap::new(),
         local_fonts: HashMap::new(),
         local_font_pages: HashMap::new(),
+        local_font_page_chars: HashMap::new(),
     };
     result.extract_text_objects()?;
     Ok(result)
@@ -189,8 +194,10 @@ pub fn open_lopdf_document_from_bytes_unindexed(bytes: &[u8]) -> CoreResult<Lopd
         text_edit_groups: HashMap::new(),
         cjk_font: None,
         cjk_font_pages: HashMap::new(),
+        cjk_font_page_chars: HashMap::new(),
         local_fonts: HashMap::new(),
         local_font_pages: HashMap::new(),
+        local_font_page_chars: HashMap::new(),
     })
 }
 
@@ -204,8 +211,10 @@ pub struct LopdfDocument {
     cjk_font: Option<CjkFontData>,
     /// Tracks which page object IDs already have the embedded CJK font in their resources.
     cjk_font_pages: HashMap<ObjectId, String>,
+    cjk_font_page_chars: HashMap<ObjectId, BTreeSet<char>>,
     local_fonts: HashMap<String, CjkFontData>,
     local_font_pages: HashMap<(ObjectId, String), String>,
+    local_font_page_chars: HashMap<(ObjectId, String), BTreeSet<char>>,
 }
 
 impl std::fmt::Debug for LopdfDocument {
@@ -300,8 +309,10 @@ impl PdfEngine for LopdfEngine {
             text_edit_groups: HashMap::new(),
             cjk_font: None,
             cjk_font_pages: HashMap::new(),
+            cjk_font_page_chars: HashMap::new(),
             local_fonts: HashMap::new(),
             local_font_pages: HashMap::new(),
+            local_font_page_chars: HashMap::new(),
         };
         result.extract_text_objects()?;
         Ok(result)
@@ -532,9 +543,9 @@ impl EngineDocument for LopdfDocument {
         // If members have different font resources (e.g. FontA–FontB–FontA on one line),
         // a group-wide fallback would collapse all font boundaries.  In that case, keep each
         // member on its own font and rely on per-character fallback for individual chars.
-        let has_mixed_fonts = member_plans.windows(2).any(|w| {
-            w[0].font_name.as_deref() != w[1].font_name.as_deref()
-        });
+        let has_mixed_fonts = member_plans
+            .windows(2)
+            .any(|w| w[0].font_name.as_deref() != w[1].font_name.as_deref());
         // Once a text edit group needs CJK fallback, keep the whole edited line on the
         // fallback font. Mixing fallback and the original font in one line makes PDF viewers
         // use different glyph metrics than the SVG preview.
@@ -558,8 +569,13 @@ impl EngineDocument for LopdfDocument {
                         .is_err()
                     })
                 });
+        let cjk_fallback_chars = if use_group_fallback || needs_char_fallback {
+            Self::cjk_fallback_chars_for_group(&member_plans, &segments, use_group_fallback)
+        } else {
+            BTreeSet::new()
+        };
         let fallback_font_name = if use_group_fallback || needs_char_fallback {
-            Some(self.ensure_page_cjk_fallback_font(page_id)?)
+            Some(self.ensure_page_cjk_fallback_font(page_id, &cjk_fallback_chars)?)
             // Note: self.cjk_font is read below (after this mutable borrow ends).
         } else {
             None
@@ -837,7 +853,10 @@ impl EngineDocument for LopdfDocument {
                     // Determine encoding before emitting Tm so we can insert Tf first.
                     let (char_obj, char_needs_fallback) = if use_group_fallback {
                         (
-                            Object::String(encode_fallback_char(ch, cjk_u2g), StringFormat::Hexadecimal),
+                            Object::String(
+                                encode_fallback_char(ch, cjk_u2g),
+                                StringFormat::Hexadecimal,
+                            ),
                             true,
                         )
                     } else {
@@ -848,7 +867,10 @@ impl EngineDocument for LopdfDocument {
                         ) {
                             Ok(obj) => (obj, false),
                             Err(_) => (
-                                Object::String(encode_fallback_char(ch, cjk_u2g), StringFormat::Hexadecimal),
+                                Object::String(
+                                    encode_fallback_char(ch, cjk_u2g),
+                                    StringFormat::Hexadecimal,
+                                ),
                                 true,
                             ),
                         }
@@ -1042,9 +1064,7 @@ impl EngineDocument for LopdfDocument {
                     if op.operator == "Tm" && op.operands.len() == 6 {
                         let op_x = object_to_f32(&op.operands[4]).unwrap_or(0.0);
                         let op_y = object_to_f32(&op.operands[5]).unwrap_or(0.0);
-                        if (op_y - anchor_y).abs() < y_tolerance
-                            && op_x >= original_end_x - 0.5
-                        {
+                        if (op_y - anchor_y).abs() < y_tolerance && op_x >= original_end_x - 0.5 {
                             op.operands[4] = Object::Real(op_x + delta_x);
                         }
                     }
@@ -1114,9 +1134,7 @@ impl EngineDocument for LopdfDocument {
             .iter()
             .find(|o| o.id == first_member_id)
             .cloned()
-            .ok_or_else(|| {
-                CoreError::NotFound(format!("text object {}", (first_member_id.0).0))
-            })?;
+            .ok_or_else(|| CoreError::NotFound(format!("text object {}", (first_member_id.0).0)))?;
 
         let orig_font_name = first_text_ref.font_name.clone();
         let orig_font_size = first_obj.font_size;
@@ -1130,7 +1148,11 @@ impl EngineDocument for LopdfDocument {
                 break;
             }
             update_page_state(&mut pre_pass, operation);
-            let metrics = pre_pass.text.font_name.as_ref().and_then(|n| font_metrics.get(n));
+            let metrics = pre_pass
+                .text
+                .font_name
+                .as_ref()
+                .and_then(|n| font_metrics.get(n));
             advance_page_text_state(&mut pre_pass, operation, metrics);
         }
         let anchor_tm = pre_pass.text_matrix;
@@ -1142,13 +1164,22 @@ impl EngineDocument for LopdfDocument {
         // Pre-check: do any characters in any run need CJK fallback encoding?
         // We must call ensure_page_cjk_fallback_font (which mutably borrows self) BEFORE the
         // main building loop, since font_maps and font_metrics are immutable borrows of self.
-        let needs_cjk_fallback = runs.iter().any(|run| {
-            let fname = run.font_name.as_deref().or(orig_font_name.as_deref()).unwrap_or("F0");
+        let mut cjk_fallback_chars = BTreeSet::new();
+        for run in &runs {
+            let fname = run
+                .font_name
+                .as_deref()
+                .or(orig_font_name.as_deref())
+                .unwrap_or("F0");
             let fmap = font_maps.get(fname);
-            run.content.chars().any(|ch| fmap.and_then(|m| m.encode(&ch.to_string())).is_none())
-        });
-        let fallback_font_name: Option<String> = if needs_cjk_fallback {
-            Some(self.ensure_page_cjk_fallback_font(page_id)?)
+            cjk_fallback_chars.extend(
+                run.content
+                    .chars()
+                    .filter(|ch| fmap.and_then(|m| m.encode(&ch.to_string())).is_none()),
+            );
+        }
+        let fallback_font_name: Option<String> = if !cjk_fallback_chars.is_empty() {
+            Some(self.ensure_page_cjk_fallback_font(page_id, &cjk_fallback_chars)?)
         } else {
             None
         };
@@ -1209,8 +1240,7 @@ impl EngineDocument for LopdfDocument {
                 }
 
                 // Absolute Tm for this character using the anchor matrix + accumulated offset.
-                let char_tm =
-                    multiply_matrix(anchor_tm, [1.0, 0.0, 0.0, 1.0, cursor_pts, 0.0]);
+                let char_tm = multiply_matrix(anchor_tm, [1.0, 0.0, 0.0, 1.0, cursor_pts, 0.0]);
                 replacement_ops.push(Operation::new(
                     "Tm",
                     vec![
@@ -1264,12 +1294,16 @@ impl EngineDocument for LopdfDocument {
             replacement_ops.push(font_set_operation(of, orig_font_size));
         }
         if anchor_state.char_spacing != 0.0 {
-            replacement_ops
-                .push(Operation::new("Tc", vec![Object::Real(anchor_state.char_spacing)]));
+            replacement_ops.push(Operation::new(
+                "Tc",
+                vec![Object::Real(anchor_state.char_spacing)],
+            ));
         }
         if anchor_state.word_spacing != 0.0 {
-            replacement_ops
-                .push(Operation::new("Tw", vec![Object::Real(anchor_state.word_spacing)]));
+            replacement_ops.push(Operation::new(
+                "Tw",
+                vec![Object::Real(anchor_state.word_spacing)],
+            ));
         }
 
         // All content-stream indexes of the group's original text operations.
@@ -1292,8 +1326,8 @@ impl EngineDocument for LopdfDocument {
                 if let Some(ops) = replacement_opt.take() {
                     // Insert replacement at position of the FIRST targeted operation.
                     let insert_at = rebuilt.len();
-                    let new_first_tj = insert_at
-                        + first_tj_in_replacement.unwrap_or(ops.len().saturating_sub(1));
+                    let new_first_tj =
+                        insert_at + first_tj_in_replacement.unwrap_or(ops.len().saturating_sub(1));
                     rebuilt.extend(ops);
                     post_edit_idx = rebuilt.len();
 
@@ -1384,6 +1418,7 @@ impl LopdfDocument {
     pub fn set_cjk_font(&mut self, data: CjkFontData) {
         self.cjk_font = Some(data);
         self.cjk_font_pages.clear(); // invalidate per-page caches
+        self.cjk_font_page_chars.clear();
     }
 
     /// Returns `true` if an embedded CJK font is available (set via [`set_cjk_font`]).
@@ -1396,18 +1431,33 @@ impl LopdfDocument {
         page_id: ObjectId,
         runs: Vec<TextRun>,
     ) -> CoreResult<Vec<TextRun>> {
-        runs.into_iter()
-            .map(|mut run| {
-                if let Some(font_name) = run.font_name.as_deref() {
-                    if let Some(font) = BuiltinPdfFont::from_sentinel(font_name) {
-                        run.font_name = Some(self.ensure_page_builtin_font(page_id, font)?);
-                    } else if let Some(key) = local_font_key_from_resource(font_name) {
-                        run.font_name = Some(self.ensure_page_local_font(page_id, key)?);
-                    }
+        let mut local_chars: HashMap<String, BTreeSet<char>> = HashMap::new();
+        for run in &runs {
+            if let Some(key) = run
+                .font_name
+                .as_deref()
+                .and_then(local_font_key_from_resource)
+            {
+                local_chars
+                    .entry(key.to_string())
+                    .or_default()
+                    .extend(run.content.chars());
+            }
+        }
+
+        let mut resolved = Vec::with_capacity(runs.len());
+        for mut run in runs {
+            if let Some(font_name) = run.font_name.as_deref() {
+                if let Some(font) = BuiltinPdfFont::from_sentinel(font_name) {
+                    run.font_name = Some(self.ensure_page_builtin_font(page_id, font)?);
+                } else if let Some(key) = local_font_key_from_resource(font_name) {
+                    let chars = local_chars.get(key).cloned().unwrap_or_default();
+                    run.font_name = Some(self.ensure_page_local_font(page_id, key, &chars)?);
                 }
-                Ok(run)
-            })
-            .collect()
+            }
+            resolved.push(run);
+        }
+        Ok(resolved)
     }
 
     fn ensure_page_builtin_font(
@@ -1441,7 +1491,10 @@ impl LopdfDocument {
             "BaseFont" => Object::Name(font.base_font().as_bytes().to_vec()),
             "Encoding" => Object::Name(b"WinAnsiEncoding".to_vec()),
         });
-        fonts.set(resource_name.as_bytes(), Object::Reference(font_resource_id));
+        fonts.set(
+            resource_name.as_bytes(),
+            Object::Reference(font_resource_id),
+        );
         resources.set("Font", Object::Dictionary(fonts));
 
         let page = self
@@ -1459,21 +1512,45 @@ impl LopdfDocument {
     pub fn set_local_font(&mut self, key: String, data: CjkFontData) {
         self.local_fonts.insert(key, data);
         self.local_font_pages.clear();
+        self.local_font_page_chars.clear();
     }
 
-    fn ensure_page_local_font(&mut self, page_id: ObjectId, key: &str) -> CoreResult<String> {
-        if let Some(name) = self.local_font_pages.get(&(page_id, key.to_string())) {
-            return Ok(name.clone());
-        }
-        let data = self
-            .local_fonts
-            .get(key)
+    fn ensure_page_local_font(
+        &mut self,
+        page_id: ObjectId,
+        key: &str,
+        chars: &BTreeSet<char>,
+    ) -> CoreResult<String> {
+        let page_key = (page_id, key.to_string());
+        let mut combined_chars = self
+            .local_font_page_chars
+            .get(&page_key)
             .cloned()
-            .ok_or_else(|| CoreError::InvalidOperation(format!("local font is not registered: {key}")))?;
+            .unwrap_or_default();
+        combined_chars.extend(chars.iter().copied());
+
+        if let Some(name) = self.local_font_pages.get(&page_key) {
+            if self
+                .local_font_page_chars
+                .get(&page_key)
+                .is_some_and(|existing| existing == &combined_chars)
+            {
+                return Ok(name.clone());
+            }
+        }
+        let data = self.local_fonts.get(key).cloned().ok_or_else(|| {
+            CoreError::InvalidOperation(format!("local font is not registered: {key}"))
+        })?;
         let resource_name = format!("PdfEditorLocal_{}", sanitize_pdf_resource_name(key));
-        self.add_identity_truetype_font_to_page(page_id, &resource_name, &data)?;
+        self.add_identity_truetype_font_to_page(
+            page_id,
+            &resource_name,
+            &data,
+            Some(&combined_chars),
+        )?;
         self.local_font_pages
-            .insert((page_id, key.to_string()), resource_name.clone());
+            .insert(page_key.clone(), resource_name.clone());
+        self.local_font_page_chars.insert(page_key, combined_chars);
         Ok(resource_name)
     }
 
@@ -1482,11 +1559,15 @@ impl LopdfDocument {
         page_id: ObjectId,
         resource_name: &str,
         data: &CjkFontData,
+        used_chars: Option<&BTreeSet<char>>,
     ) -> CoreResult<()> {
-        let sfnt_len = data.sfnt_bytes.len() as i64;
+        let font_bytes = used_chars
+            .and_then(|chars| subset_truetype_font_for_chars(data, chars))
+            .unwrap_or_else(|| data.sfnt_bytes.clone());
+        let sfnt_len = font_bytes.len() as i64;
         let font_file_id = self.document.add_object(lopdf::Stream::new(
             dictionary! { "Length1" => sfnt_len },
-            data.sfnt_bytes.clone(),
+            font_bytes,
         ));
 
         let font_name = resource_name;
@@ -1519,17 +1600,12 @@ impl LopdfDocument {
                 "Supplement" => 0i64,
             },
             "DW" => 1000i64,
-            "W" => Object::Array(build_w_array(data)),
+            "W" => Object::Array(width_array_for_chars(data, used_chars)),
             "CIDToGIDMap" => Object::Name(b"Identity".to_vec()),
             "FontDescriptor" => Object::Reference(descriptor_id),
         });
 
-        let mut gid_to_unicode: Vec<(u16, char)> = data
-            .unicode_to_gid
-            .iter()
-            .map(|(&ch, &gid)| (gid, ch))
-            .collect();
-        gid_to_unicode.sort_unstable_by_key(|&(gid, _)| gid);
+        let gid_to_unicode = gid_to_unicode_for_chars(data, used_chars);
         let to_unicode_id = self.document.add_object(lopdf::Stream::new(
             dictionary! {},
             build_to_unicode_cmap(&gid_to_unicode).into_bytes(),
@@ -1572,6 +1648,25 @@ impl LopdfDocument {
         Ok(())
     }
 
+    fn cjk_fallback_chars_for_group(
+        member_plans: &[GroupMemberPlan],
+        segments: &[String],
+        use_group_fallback: bool,
+    ) -> BTreeSet<char> {
+        let mut chars = BTreeSet::new();
+        for (member, segment) in member_plans.iter().zip(segments.iter()) {
+            if use_group_fallback {
+                chars.extend(segment.chars());
+                continue;
+            }
+            chars.extend(segment.chars().filter(|ch| {
+                replacement_text_object(&member.template, ch.to_string(), member.font_map.as_ref())
+                    .is_err()
+            }));
+        }
+        chars
+    }
+
     /// Ensure a CJK fallback font is registered in the given page's resources.
     ///
     /// If [`set_cjk_font`] has been called, embeds the loaded TrueType font (NotoSansSC etc.)
@@ -1579,10 +1674,27 @@ impl LopdfDocument {
     /// (non-embedded) STSong-Light + UniGB-UCS2-H combination.
     ///
     /// Returns the PDF resource name added to the page.
-    fn ensure_page_cjk_fallback_font(&mut self, page_id: ObjectId) -> CoreResult<String> {
+    fn ensure_page_cjk_fallback_font(
+        &mut self,
+        page_id: ObjectId,
+        chars: &BTreeSet<char>,
+    ) -> CoreResult<String> {
         // Fast-path: already registered for this page.
+        let mut combined_chars = self
+            .cjk_font_page_chars
+            .get(&page_id)
+            .cloned()
+            .unwrap_or_default();
+        combined_chars.extend(chars.iter().copied());
         if let Some(name) = self.cjk_font_pages.get(&page_id) {
-            return Ok(name.clone());
+            if self.cjk_font.is_none()
+                || self
+                    .cjk_font_page_chars
+                    .get(&page_id)
+                    .is_some_and(|existing| existing == &combined_chars)
+            {
+                return Ok(name.clone());
+            }
         }
 
         let font_resource_id: ObjectId = if self.cjk_font.is_some() {
@@ -1591,11 +1703,13 @@ impl LopdfDocument {
 
             let data = self.cjk_font.as_ref().unwrap(); // is_some checked above
 
-            // 1. Embed the raw sfnt bytes as a FontFile2 stream.
-            let sfnt_len = data.sfnt_bytes.len() as i64;
+            // 1. Embed a glyph subset as a FontFile2 stream.
+            let font_bytes = subset_truetype_font_for_chars(data, &combined_chars)
+                .unwrap_or_else(|| data.sfnt_bytes.clone());
+            let sfnt_len = font_bytes.len() as i64;
             let font_file_id = self.document.add_object(lopdf::Stream::new(
                 dictionary! { "Length1" => sfnt_len },
-                data.sfnt_bytes.clone(),
+                font_bytes,
             ));
 
             // 2. FontDescriptor
@@ -1619,7 +1733,7 @@ impl LopdfDocument {
             });
 
             // 3. Width array (/W)
-            let w_array = build_w_array(data);
+            let w_array = width_array_for_chars(data, Some(&combined_chars));
 
             // 4. CIDFontType2
             let cid_font_id = self.document.add_object(dictionary! {
@@ -1639,20 +1753,11 @@ impl LopdfDocument {
 
             // 5. Build a compact ToUnicode CMap for all mapped characters.
             //    (Enables copy-paste from the edited text.)
-            let gid_to_unicode: Vec<(u16, char)> = {
-                let mut v: Vec<(u16, char)> = data
-                    .unicode_to_gid
-                    .iter()
-                    .map(|(&ch, &gid)| (gid, ch))
-                    .collect();
-                v.sort_unstable_by_key(|&(gid, _)| gid);
-                v
-            };
+            let gid_to_unicode = gid_to_unicode_for_chars(data, Some(&combined_chars));
             let cmap_str = build_to_unicode_cmap(&gid_to_unicode);
-            let to_unicode_id = self.document.add_object(lopdf::Stream::new(
-                dictionary! {},
-                cmap_str.into_bytes(),
-            ));
+            let to_unicode_id = self
+                .document
+                .add_object(lopdf::Stream::new(dictionary! {}, cmap_str.into_bytes()));
 
             // 6. Type0 (composite) font
             let type0_id = self.document.add_object(dictionary! {
@@ -1664,7 +1769,10 @@ impl LopdfDocument {
                 "ToUnicode" => Object::Reference(to_unicode_id),
             });
 
-            self.cjk_font_pages.insert(page_id, NOTO_FONT_NAME.to_string());
+            self.cjk_font_pages
+                .insert(page_id, NOTO_FONT_NAME.to_string());
+            self.cjk_font_page_chars
+                .insert(page_id, combined_chars.clone());
             type0_id
         } else {
             // ── Standard (non-embedded) STSong-Light path ────────────────────────────────
@@ -1688,7 +1796,8 @@ impl LopdfDocument {
                 "Encoding" => "UniGB-UCS2-H",
                 "DescendantFonts" => vec![Object::Reference(cid_font_id)],
             });
-            self.cjk_font_pages.insert(page_id, FALLBACK_FONT_NAME.to_string());
+            self.cjk_font_pages
+                .insert(page_id, FALLBACK_FONT_NAME.to_string());
             font_id
         };
 
@@ -1708,7 +1817,10 @@ impl LopdfDocument {
             .ok()
             .and_then(|object| cloned_dictionary_from_object(&self.document, object))
             .unwrap_or_default();
-        fonts.set(resource_name.as_bytes(), Object::Reference(font_resource_id));
+        fonts.set(
+            resource_name.as_bytes(),
+            Object::Reference(font_resource_id),
+        );
         resources.set("Font", Object::Dictionary(fonts));
 
         let page = self
@@ -5827,7 +5939,10 @@ fn utf16be_bytes(content: &str) -> Vec<u8> {
 /// * Otherwise returns UTF-16 BE bytes (UniGB-UCS2-H encoding).
 ///
 /// If the character has no GID in the embedded font, falls through to UTF-16 as well.
-fn encode_fallback_char(ch: char, unicode_to_gid: Option<&std::collections::HashMap<char, u16>>) -> Vec<u8> {
+fn encode_fallback_char(
+    ch: char,
+    unicode_to_gid: Option<&std::collections::HashMap<char, u16>>,
+) -> Vec<u8> {
     if let Some(map) = unicode_to_gid {
         if let Some(&gid) = map.get(&ch) {
             return gid.to_be_bytes().to_vec();
@@ -5837,9 +5952,13 @@ fn encode_fallback_char(ch: char, unicode_to_gid: Option<&std::collections::Hash
 }
 
 /// Encode a whole string for the CJK fallback font (see [`encode_fallback_char`]).
-fn encode_fallback_str(text: &str, unicode_to_gid: Option<&std::collections::HashMap<char, u16>>) -> Vec<u8> {
+fn encode_fallback_str(
+    text: &str,
+    unicode_to_gid: Option<&std::collections::HashMap<char, u16>>,
+) -> Vec<u8> {
     if let Some(map) = unicode_to_gid {
-        return text.chars()
+        return text
+            .chars()
             .flat_map(|ch| {
                 let gid = map.get(&ch).copied().unwrap_or(0);
                 gid.to_be_bytes()
@@ -5847,6 +5966,37 @@ fn encode_fallback_str(text: &str, unicode_to_gid: Option<&std::collections::Has
             .collect();
     }
     utf16be_bytes(text)
+}
+
+fn width_array_for_chars(data: &CjkFontData, chars: Option<&BTreeSet<char>>) -> Vec<Object> {
+    let Some(chars) = chars else {
+        return build_w_array(data);
+    };
+    let gids = chars
+        .iter()
+        .filter_map(|ch| data.unicode_to_gid.get(ch).copied())
+        .map(usize::from);
+    build_w_array_for_gids(data, gids)
+}
+
+fn gid_to_unicode_for_chars(
+    data: &CjkFontData,
+    chars: Option<&BTreeSet<char>>,
+) -> Vec<(u16, char)> {
+    let mut values: Vec<(u16, char)> = if let Some(chars) = chars {
+        chars
+            .iter()
+            .filter_map(|&ch| data.unicode_to_gid.get(&ch).copied().map(|gid| (gid, ch)))
+            .collect()
+    } else {
+        data.unicode_to_gid
+            .iter()
+            .map(|(&ch, &gid)| (gid, ch))
+            .collect()
+    };
+    values.sort_unstable_by_key(|&(gid, ch)| (gid, ch as u32));
+    values.dedup_by_key(|(gid, _)| *gid);
+    values
 }
 
 fn prepare_document_for_full_save(document: &mut Document) {
@@ -9274,11 +9424,7 @@ fn font_uses_identity_cid_to_gid(document: &Document, font: &Dictionary) -> bool
 }
 
 fn font_cid_to_gid_map_name(document: &Document, font: &Dictionary) -> Option<String> {
-    if let Some(name) = font
-        .get(b"CIDToGIDMap")
-        .ok()
-        .and_then(object_name_bytes)
-    {
+    if let Some(name) = font.get(b"CIDToGIDMap").ok().and_then(object_name_bytes) {
         return Some(name);
     }
 
