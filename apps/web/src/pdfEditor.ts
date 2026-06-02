@@ -1,24 +1,15 @@
 import init, {
   pdf_apply_text_edits,
-  pdf_apply_text_edits_by_handle,
   pdf_close_document,
-  pdf_commit_text_edit,
-  pdf_commit_text_edit_by_handle,
-  pdf_get_bytes_by_handle,
+  pdf_get_bytes,
   pdf_hit_test,
-  pdf_hit_test_by_handle,
   pdf_open_document,
   pdf_page_bundle,
-  pdf_page_bundle_by_handle,
-  pdf_page_structure_by_handle,
+  pdf_page_structure,
   pdf_preview_text_layout,
-  pdf_preview_text_layout_by_handle,
-  pdf_set_cjk_font_by_handle,
-  pdf_set_local_font_by_handle,
+  pdf_set_cjk_font,
+  pdf_set_local_font,
   pdf_start_text_edit,
-  pdf_start_text_edit_by_handle,
-  pdf_update_text_by_handle,
-  pdf_update_text_runs_by_handle
 } from "./wasm/pdfeditor_core";
 import notoSansScWoffUrl from "@fontsource/noto-sans-sc/files/noto-sans-sc-chinese-simplified-400-normal.woff?url";
 
@@ -281,14 +272,12 @@ export function closePdfDocument(handle: number | null) {
 }
 
 export async function loadPdfPage(
-  pdfBytes: Uint8Array,
+  handle: number,
   pageNumber: number,
-  handle?: number | null
 ): Promise<LoadedPage> {
   await ensureWasm();
   releaseLoadedFonts();
-  const bundleBytes =
-    handle == null ? pdf_page_bundle(pdfBytes, pageNumber) : pdf_page_bundle_by_handle(handle, pageNumber);
+  const bundleBytes = pdf_page_bundle(handle, pageNumber);
   const { metadata, payload } = parsePageBundle(bundleBytes);
   const structure = normalizePageStructure(metadata.structure);
   const fontFamilies = await loadEmbeddedFonts(metadata.fonts, payload);
@@ -316,85 +305,45 @@ export async function loadPdfPage(
   return { structure, backgroundUrl, fontFamilies, fontAssets };
 }
 
-export async function applyTextEdits(
-  pdfBytes: Uint8Array | null,
-  edits: Array<{ id: number; content: string }>,
-  handle?: number | null
-): Promise<Uint8Array> {
-  await ensureWasm();
-  const request = {
-    edits: edits.map((edit) => ({
-      type: "replace_text",
-      id: edit.id,
-      content: edit.content
-    }))
-  };
-  if (handle != null) {
-    return pdf_apply_text_edits_by_handle(handle, JSON.stringify(request));
-  }
-  if (!pdfBytes) {
-    throw new Error("Missing PDF bytes for text edit request");
-  }
-  return pdf_apply_text_edits(pdfBytes, JSON.stringify(request));
-}
-
 export async function hitTestPdf(
-  pdfBytes: Uint8Array | null,
+  handle: number,
   pageNumber: number,
   pdfX: number,
   pdfY: number,
-  handle?: number | null
 ): Promise<HitTestResult | null> {
   await ensureWasm();
-  const json =
-    handle == null
-      ? pdf_hit_test(requirePdfBytes(pdfBytes), pageNumber, pdfX, pdfY)
-      : pdf_hit_test_by_handle(handle, pageNumber, pdfX, pdfY);
+  const json = pdf_hit_test(handle, pageNumber, pdfX, pdfY);
   return JSON.parse(json) as HitTestResult | null;
 }
 
 export async function startTextEdit(
-  pdfBytes: Uint8Array | null,
+  handle: number,
   objectId: number,
-  handle?: number | null
 ): Promise<TextEditSessionInfo> {
   await ensureWasm();
-  const json =
-    handle == null
-      ? pdf_start_text_edit(requirePdfBytes(pdfBytes), BigInt(objectId))
-      : pdf_start_text_edit_by_handle(handle, BigInt(objectId));
+  const json = pdf_start_text_edit(handle, BigInt(objectId));
   return normalizeTextEditSession(JSON.parse(json) as TextEditSessionInfo);
 }
 
 export async function previewTextLayout(
-  pdfBytes: Uint8Array | null,
+  handle: number,
   objectId: number,
   text: string,
-  handle?: number | null
 ): Promise<TextLayoutPreview> {
   await ensureWasm();
-  const json =
-    handle == null
-      ? pdf_preview_text_layout(requirePdfBytes(pdfBytes), BigInt(objectId), text)
-      : pdf_preview_text_layout_by_handle(handle, BigInt(objectId), text);
+  const json = pdf_preview_text_layout(handle, BigInt(objectId), text);
   return normalizeTextLayoutPreview(JSON.parse(json) as TextLayoutPreview);
-}
-
-export async function commitTextEdit(
-  pdfBytes: Uint8Array | null,
-  objectId: number,
-  text: string,
-  handle?: number | null
-): Promise<Uint8Array> {
-  await ensureWasm();
-  return handle == null
-    ? pdf_commit_text_edit(requirePdfBytes(pdfBytes), BigInt(objectId), text)
-    : pdf_commit_text_edit_by_handle(handle, BigInt(objectId), text);
 }
 
 export async function updateTextByHandle(handle: number, objectId: number, text: string): Promise<void> {
   await ensureWasm();
-  pdf_update_text_by_handle(handle, BigInt(objectId), text);
+  pdf_apply_text_edits(handle, JSON.stringify({
+    edits: [{
+      type: "replace_text",
+      id: objectId,
+      content: text
+    }]
+  }));
 }
 
 /** Cached Noto Sans SC woff bytes — fetched once, reused for every document. */
@@ -423,7 +372,7 @@ export async function setCjkFontByHandle(handle: number): Promise<boolean> {
       return false;
     }
   }
-  return pdf_set_cjk_font_by_handle(handle, _notoWoffCache);
+  return pdf_set_cjk_font(handle, _notoWoffCache);
 }
 
 export async function setLocalFontByHandle(
@@ -434,7 +383,7 @@ export async function setLocalFontByHandle(
   await ensureWasm();
   const key = localFontKey(resourceName);
   if (!key) return false;
-  return pdf_set_local_font_by_handle(handle, key, fontBytes);
+  return pdf_set_local_font(handle, key, fontBytes);
 }
 
 function localFontKey(resourceName: string): string | null {
@@ -486,37 +435,32 @@ export async function updateTextRunsByHandle(
         digit_font_name: builtinPdfFontName(typography.digit_font_name ?? null)
       }
     : null;
-  pdf_update_text_runs_by_handle(
-    handle,
-    BigInt(objectId),
-    JSON.stringify(payload),
-    originDelta.x,
-    originDelta.y,
-    clipBounds ? JSON.stringify(clipBounds) : "",
-    typographyPayload ? JSON.stringify(typographyPayload) : ""
-  );
+  pdf_apply_text_edits(handle, JSON.stringify({
+    edits: [{
+      type: "replace_runs",
+      id: objectId,
+      runs: payload,
+      origin_dx: originDelta.x,
+      origin_dy: originDelta.y,
+      clip_bounds: clipBounds,
+      typography: typographyPayload
+    }]
+  }));
 }
 
 export async function getPageStructureByHandle(handle: number, pageNumber: number): Promise<PageStructure> {
   await ensureWasm();
-  const json = pdf_page_structure_by_handle(handle, pageNumber);
+  const json = pdf_page_structure(handle, pageNumber);
   return normalizePageStructure(JSON.parse(json) as PageStructure);
 }
 
 export async function getPdfBytesByHandle(handle: number): Promise<Uint8Array> {
   await ensureWasm();
-  return pdf_get_bytes_by_handle(handle);
+  return pdf_get_bytes(handle);
 }
 
 export function asBlobPart(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-}
-
-function requirePdfBytes(pdfBytes: Uint8Array | null): Uint8Array {
-  if (!pdfBytes) {
-    throw new Error("Missing PDF bytes");
-  }
-  return pdfBytes;
 }
 
 function parsePageBundle(bytes: Uint8Array): { metadata: PageBundleInfo; payload: Uint8Array } {

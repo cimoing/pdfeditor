@@ -2,6 +2,8 @@
 
 本文档说明 `pdfeditor-core` 编译为 WebAssembly 后暴露给 Web 端的接口、入参、出参和 JSON 结构。
 
+当前 wasm API 采用 handle-first 设计：除 `pdf_open_document` 外，所有文档操作都通过内存文档 `handle` 执行。编辑接口只修改内存文档，导出 PDF bytes 统一调用 `pdf_get_bytes`。
+
 ## 构建与导入
 
 构建 wasm：
@@ -16,9 +18,9 @@ npm run wasm:build
 ```ts
 import init, {
   pdf_open_document,
-  pdf_page_bundle_by_handle,
-  pdf_update_text_runs_by_handle,
-  pdf_get_bytes_by_handle,
+  pdf_page_bundle,
+  pdf_apply_text_edits,
+  pdf_get_bytes,
   pdf_close_document
 } from "./wasm/pdfeditor_core";
 
@@ -29,46 +31,48 @@ await init();
 
 ## 基础约定
 
-- `pdf_bytes: Uint8Array`：完整 PDF 文件 bytes。
-- `page_number: number`：对外入参从 `1` 开始；传 `0` 会报错。
+- `pdf_bytes: Uint8Array`：完整 PDF 文件 bytes，仅用于 `pdf_open_document`。
+- `handle: number`：`pdf_open_document` 返回的内存文档句柄。
+- `page_number: number`：wasm API 入参从 `1` 开始；传 `0` 会报错。
 - `PageIndex`：JSON 结构中的页索引从 `0` 开始。
-- `object_id: u64`：PDF 对象 ID 在 wasm 入参中使用 `BigInt(objectId)` 更稳妥；JSON 中序列化为数字。
-- 坐标单位：页面结构中的坐标为 PDF 点，原点在 PDF 页面坐标系中，页面渲染到屏幕时需要前端做 viewport 转换。
-- 颜色：后端结构使用 `{ r, g, b, a }`，编辑入参 `TextRunInput.color` 使用 `[r, g, b, a]`。
+- `object_id: u64`：PDF 对象 ID。JS 调用 wasm 函数时建议传 `BigInt(objectId)`。
+- 坐标单位：页面结构和编辑入参中的坐标为 PDF 点。
+- 颜色：后端输出使用 `{ r, g, b, a }`；编辑输入 `TextRunInput.color` 使用 `[r, g, b, a]`。
 
-## 推荐调用流程
+## 推荐流程
 
 ```ts
 const fileBytes = new Uint8Array(await file.arrayBuffer());
 const handle = pdf_open_document(fileBytes);
 
 try {
-  const bundleBytes = pdf_page_bundle_by_handle(handle, 1);
+  const bundleBytes = pdf_page_bundle(handle, 1);
   const { metadata, payload } = parsePageBundle(bundleBytes);
-
   const text = metadata.structure.text[0];
-  pdf_update_text_runs_by_handle(
-    handle,
-    BigInt(text.id),
-    JSON.stringify([
-      {
+
+  pdf_apply_text_edits(handle, JSON.stringify({
+    edits: [{
+      type: "replace_runs",
+      id: text.id,
+      page_number: 1,
+      runs: [{
         content: "新的文本",
         font_name: text.font_name,
         font_size: text.font_size,
         color: [text.color.r, text.color.g, text.color.b, text.color.a]
+      }],
+      origin_dx: 0,
+      origin_dy: 0,
+      clip_bounds: null,
+      typography: {
+        replace_spaces_with_displacements: false,
+        digit_font_name: null,
+        compress_punctuation: false
       }
-    ]),
-    0,
-    0,
-    "",
-    JSON.stringify({
-      replace_spaces_with_displacements: false,
-      digit_font_name: null,
-      compress_punctuation: false
-    })
-  );
+    }]
+  }));
 
-  const updatedPdfBytes = pdf_get_bytes_by_handle(handle);
+  const updatedPdfBytes = pdf_get_bytes(handle);
 } finally {
   pdf_close_document(handle);
 }
@@ -84,67 +88,43 @@ try {
 | --- | --- | --- | --- |
 | `pdf_open_document(pdf_bytes)` | `Uint8Array` | `number` | 打开 PDF，返回内存文档 handle。 |
 | `pdf_close_document(handle)` | `number` | `void` | 释放 handle 对应的内存文档。 |
-| `pdf_get_bytes_by_handle(handle)` | `number` | `Uint8Array` | 将 handle 中的当前文档序列化为 PDF bytes，用于下载或导出。 |
+| `pdf_get_bytes(handle)` | `number` | `Uint8Array` | 将 handle 中的当前文档序列化为 PDF bytes，用于下载或导出。 |
 
 ### 页面读取
 
 | 函数 | 入参 | 出参 | 说明 |
 | --- | --- | --- | --- |
-| `pdf_page_to_json(pdf_bytes, page_number)` | `Uint8Array`, `number` | `string` | 返回 `PageStructure` JSON 字符串，不包含背景 PNG、图片 PNG 和字体 bytes。 |
-| `pdf_page_structure_by_handle(handle, page_number)` | `number`, `number` | `string` | 返回 `PageStructure` JSON 字符串；适合编辑后刷新结构。 |
-| `pdf_page_bundle(pdf_bytes, page_number)` | `Uint8Array`, `number` | `Uint8Array` | 返回页面加载包，包含结构 JSON、背景 PNG、图片 PNG、字体资源。 |
-| `pdf_page_bundle_by_handle(handle, page_number)` | `number`, `number` | `Uint8Array` | handle 版本页面加载包，避免重复打开 PDF。 |
-| `pdf_page_background_png(pdf_bytes, page_number)` | `Uint8Array`, `number` | `Uint8Array` | 返回页面背景 PNG bytes。 |
-| `pdf_image_object_png(pdf_bytes, page_number, image_object_id)` | `Uint8Array`, `number`, `u64` | `Uint8Array` | 返回指定图片对象的 PNG bytes。 |
+| `pdf_page_bundle(handle, page_number)` | `number`, `number` | `Uint8Array` | 返回页面加载包，包含结构 JSON、背景 PNG、图片 PNG、字体资源。 |
+| `pdf_page_structure(handle, page_number)` | `number`, `number` | `string` | 返回 `PageStructure` JSON 字符串；适合编辑后刷新结构，避免重新生成背景图。 |
 
 ### 命中测试与编辑预览
 
 | 函数 | 入参 | 出参 | 说明 |
 | --- | --- | --- | --- |
-| `pdf_hit_test(pdf_bytes, page_number, pdf_x, pdf_y)` | `Uint8Array`, `number`, `number`, `number` | `string` | 返回 `HitTestResult | null` JSON。 |
-| `pdf_hit_test_by_handle(handle, page_number, pdf_x, pdf_y)` | `number`, `number`, `number`, `number` | `string` | handle 版本命中测试。 |
-| `pdf_start_text_edit(pdf_bytes, object_id)` | `Uint8Array`, `u64` | `string` | 返回 `TextEditSessionInfo` JSON。 |
-| `pdf_start_text_edit_by_handle(handle, object_id)` | `number`, `u64` | `string` | handle 版本开始编辑。 |
-| `pdf_preview_text_layout(pdf_bytes, object_id, text)` | `Uint8Array`, `u64`, `string` | `string` | 返回 `TextLayoutPreview` JSON，不修改 PDF。 |
-| `pdf_preview_text_layout_by_handle(handle, object_id, text)` | `number`, `u64`, `string` | `string` | handle 版本预览。 |
+| `pdf_hit_test(handle, page_number, pdf_x, pdf_y)` | `number`, `number`, `number`, `number` | `string` | 返回 `HitTestResult | null` JSON。 |
+| `pdf_start_text_edit(handle, object_id)` | `number`, `u64` | `string` | 返回 `TextEditSessionInfo` JSON。 |
+| `pdf_preview_text_layout(handle, object_id, text)` | `number`, `u64`, `string` | `string` | 返回 `TextLayoutPreview` JSON，不修改 PDF。 |
 
 ### 文本保存
 
 | 函数 | 入参 | 出参 | 说明 |
 | --- | --- | --- | --- |
-| `pdf_commit_text_edit(pdf_bytes, object_id, text)` | `Uint8Array`, `u64`, `string` | `Uint8Array` | 替换单个文本对象内容并返回新 PDF bytes。 |
-| `pdf_commit_text_edit_by_handle(handle, object_id, text)` | `number`, `u64`, `string` | `Uint8Array` | handle 版本；会修改内存文档并返回新 PDF bytes。 |
-| `pdf_update_text_by_handle(handle, object_id, text)` | `number`, `u64`, `string` | `void` | 修改内存文档，不立即序列化。 |
-| `pdf_apply_text_edits(pdf_bytes, edits_json)` | `Uint8Array`, `string` | `Uint8Array` | 批量编辑并返回新 PDF bytes；`edits_json` 为 `TextEditRequest`。 |
-| `pdf_apply_text_edits_by_handle(handle, edits_json)` | `number`, `string` | `Uint8Array` | handle 版本批量编辑。 |
-| `pdf_update_text_runs_by_handle(handle, object_id, runs_json, origin_dx, origin_dy, clip_bounds_json, typography_json)` | 见下方 | `void` | 用多个富文本 run 替换文本对象，并可移动起点、设置裁剪和排版参数。 |
+| `pdf_apply_text_edits(handle, edits_json)` | `number`, `string` | `void` | 批量应用文本编辑到内存文档；`edits_json` 为 `TextEditRequest`。 |
 
-`pdf_update_text_runs_by_handle` 入参说明：
+保存后如果需要下载或导出，调用 `pdf_get_bytes(handle)`。
 
-| 参数 | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| `handle` | `number` | 是 | `pdf_open_document` 返回的文档句柄。 |
-| `object_id` | `u64` | 是 | 被编辑的文本对象 ID。JS 调用时建议传 `BigInt(id)`。 |
-| `runs_json` | `string` | 是 | `TextRunInput[]` 的 JSON 字符串。 |
-| `origin_dx` | `number` | 是 | 文本起点横向偏移，单位为 PDF 点。 |
-| `origin_dy` | `number` | 是 | 文本起点纵向偏移，单位为 PDF 点。 |
-| `clip_bounds_json` | `string` | 否 | 为空字符串表示不设置裁剪；非空时为 `Rect` JSON。 |
-| `typography_json` | `string` | 否 | 为空字符串表示默认排版参数；非空时为 `TextTypography` JSON。 |
-
-### 字体资源
+### 字体注册
 
 | 函数 | 入参 | 出参 | 说明 |
 | --- | --- | --- | --- |
-| `pdf_page_fonts_to_json(pdf_bytes, page_number)` | `Uint8Array`, `number` | `string` | 返回当前页字体资源元数据数组 `FontAssetInfo[]`。 |
-| `pdf_font_asset(pdf_bytes, page_number, resource_name)` | `Uint8Array`, `number`, `string` | `Uint8Array` | 返回指定 PDF 字体资源 bytes。 |
-| `pdf_set_cjk_font_by_handle(handle, woff_bytes)` | `number`, `Uint8Array` | `boolean` | 注册 CJK fallback 字体。当前要求 WOFF1，成功后编辑时可嵌入，避免中文方块。 |
-| `pdf_set_local_font_by_handle(handle, font_key, font_bytes)` | `number`, `string`, `Uint8Array` | `boolean` | 注册系统/本地字体用于后续嵌入。当前接受 TrueType-flavoured SFNT、WOFF1、TTC；CFF/OpenType 会返回 `false`。 |
+| `pdf_set_cjk_font(handle, woff_bytes)` | `number`, `Uint8Array` | `boolean` | 注册 CJK fallback 字体。当前要求 WOFF1，成功后编辑时可嵌入，避免中文方块。 |
+| `pdf_set_local_font(handle, font_key, font_bytes)` | `number`, `string`, `Uint8Array` | `boolean` | 注册系统/本地字体用于后续嵌入。当前接受 TrueType-flavoured SFNT、WOFF1、TTC；CFF/OpenType 会返回 `false`。 |
 
-`font_key` 是前端资源名去掉 `__localfont__:` 前缀后的值。保存 run 时如果 `font_name` 使用 `__localfont__:<key>`，前端应先调用 `pdf_set_local_font_by_handle(handle, key, fontBytes)`。
+`font_key` 是前端资源名去掉 `__localfont__:` 前缀后的值。保存 run 时如果 `font_name` 使用 `__localfont__:<key>`，前端应先调用 `pdf_set_local_font(handle, key, fontBytes)`。
 
 ## 页面加载包结构
 
-`pdf_page_bundle` 和 `pdf_page_bundle_by_handle` 返回二进制包：
+`pdf_page_bundle` 返回二进制包：
 
 ```text
 4 bytes: metadata JSON 长度，big-endian u32
@@ -218,10 +198,10 @@ interface ImageAssetInfo {
 }
 ```
 
-### FontAssetInfo / FontAssetBundleInfo
+### FontAssetBundleInfo
 
 ```ts
-interface FontAssetInfo {
+interface FontAssetBundleInfo {
   resource_name: string;
   family_name: string;
   font_weight: number;
@@ -229,9 +209,6 @@ interface FontAssetInfo {
   file_name: string;
   mime_type: string;
   format: string;
-}
-
-interface FontAssetBundleInfo extends FontAssetInfo {
   asset: BinaryAssetInfo;
 }
 ```
@@ -245,7 +222,7 @@ interface FontAssetBundleInfo extends FontAssetInfo {
 | `file_name` | 字体文件名。 |
 | `mime_type` | 字体 MIME 类型。 |
 | `format` | 字体格式，例如 `truetype`、`opentype`、`cff`、`woff`。 |
-| `asset` | 仅 `FontAssetBundleInfo` 有，指向 payload 中字体 bytes。 |
+| `asset` | 指向 payload 中字体 bytes。 |
 
 ## JSON 结构体
 
@@ -314,12 +291,6 @@ interface PageInfo {
 }
 ```
 
-| 字段 | 说明 |
-| --- | --- |
-| `index` | 0-based 页索引。 |
-| `size` | 页面尺寸，单位 PDF 点。 |
-| `rotation` | 页面旋转角度，单位度。 |
-
 ### StructuredTextObject
 
 ```ts
@@ -367,8 +338,8 @@ interface StructuredTextObject {
 | `z_index` | 页面绘制顺序。 |
 | `glyphs` | 字形级布局信息。 |
 | `runs` | 富文本 run 列表。 |
-| `punct_width_squeeze` | 字体本身是否定义了较窄的全角标点宽度。为 `false` 时可能省略。 |
-| `font_features` | 检测到的 OpenType 特性，可能包含 `palt`、`halt`、`kern`、`liga`、`fwid`、`hwid`。为空时可能省略。 |
+| `punct_width_squeeze` | 字体本身是否定义了较窄的全角标点宽度；为 `false` 时可能省略。 |
+| `font_features` | 检测到的 OpenType 特性，可能包含 `palt`、`halt`、`kern`、`liga`、`fwid`、`hwid`。 |
 | `clip_bounds` | PDF 内容流中识别出的裁剪矩形；没有裁剪时省略。 |
 | `typography` | 排版识别和保存参数。 |
 
@@ -512,7 +483,7 @@ interface BookmarkItem {
 
 ### HitTestResult
 
-`pdf_hit_test*` 返回 `HitTestResult | null`。
+`pdf_hit_test` 返回 `HitTestResult | null`。
 
 ```ts
 interface HitTestResult {
@@ -526,17 +497,6 @@ interface HitTestResult {
   matrix: [number, number, number, number, number, number];
 }
 ```
-
-| 字段 | 说明 |
-| --- | --- |
-| `object_id` | 命中的对象 ID。 |
-| `object_type` | 对象类型，例如 `text`、`image`。 |
-| `page` | 0-based 页索引。 |
-| `local_position` | 命中点在对象局部坐标中的位置。 |
-| `text_run_index` | 命中的文本 run 索引；非文本或未知时为 `null`。 |
-| `glyph_index` | 命中的 glyph 索引；未知时为 `null`。 |
-| `bbox` | 命中对象边界框。 |
-| `matrix` | 对象矩阵。 |
 
 ### TextEditSessionInfo
 
@@ -584,21 +544,11 @@ interface TextLayoutPreview {
 }
 ```
 
-| 字段 | 说明 |
-| --- | --- |
-| `object_id` | 预览目标对象。 |
-| `text` | 预览文本。 |
-| `group_object_ids` | 文本组 ID。 |
-| `glyphs` | 预览布局字形。 |
-| `bbox` | 预览边界框。 |
-| `overflow` | 是否超出原对象区域。 |
-| `typography` | 预览使用或继承的排版信息。 |
-
 ## 编辑入参结构
 
 ### TextEditRequest
 
-`pdf_apply_text_edits*` 的 `edits_json`：
+`pdf_apply_text_edits` 的 `edits_json`：
 
 ```ts
 interface TextEditRequest {
@@ -610,19 +560,30 @@ interface TextEditRequest {
 
 ```ts
 interface TextEdit {
-  type: "replace_text" | "update_text" | "replace_runs";
+  type: "replace_text" | "update_text" | "replace_runs" | "replace_text_runs";
   id: TextObjectId;
+  page_number?: number | null;
+  page_index?: number | null;
   content?: string;
   runs?: TextRunInput[];
+  origin_dx?: number;
+  origin_dy?: number;
+  clip_bounds?: Rect | null;
+  typography?: TextTypography | null;
 }
 ```
 
 | 字段 | 说明 |
 | --- | --- |
-| `type` | `replace_text` / `update_text` 使用 `content`；`replace_runs` 使用 `runs`。 |
+| `type` | `replace_text` / `update_text` 使用 `content`；`replace_runs` / `replace_text_runs` 使用 `runs`。 |
 | `id` | 文本对象 ID。 |
+| `page_number` | 可选，1-based 页码。优先级低于 `page_index`。 |
+| `page_index` | 可选，0-based 页索引。传入后后端不再从 `object_id` 推导页面。 |
 | `content` | 替换后的纯文本；未传默认为空字符串。 |
 | `runs` | 富文本 run 输入；未传默认为空数组。 |
+| `origin_dx` / `origin_dy` | 文本起点偏移，单位 PDF 点。未传默认为 `0`。 |
+| `clip_bounds` | 保存到 PDF 的裁剪矩形；`null` 或省略表示不设置裁剪。 |
+| `typography` | 保存使用的排版参数；`null` 或省略表示默认排版参数。 |
 
 示例：
 
@@ -632,11 +593,13 @@ interface TextEdit {
     {
       "type": "replace_text",
       "id": 12345,
+      "page_number": 1,
       "content": "新的文本"
     },
     {
       "type": "replace_runs",
       "id": 67890,
+      "page_number": 1,
       "runs": [
         {
           "content": "PDF",
@@ -644,15 +607,21 @@ interface TextEdit {
           "font_size": 12,
           "color": [0, 0, 0, 255]
         }
-      ]
+      ],
+      "origin_dx": 0,
+      "origin_dy": 0,
+      "clip_bounds": null,
+      "typography": {
+        "replace_spaces_with_displacements": false,
+        "digit_font_name": null,
+        "compress_punctuation": false
+      }
     }
   ]
 }
 ```
 
 ### TextRunInput
-
-`runs_json` 和 `TextEdit.runs` 都使用该结构。
 
 ```ts
 interface TextRunInput {
@@ -682,9 +651,9 @@ interface TextRunInput {
 
 ## 裁剪与排版保存
 
-### clip_bounds_json
+### clip_bounds
 
-为空字符串表示不裁剪；否则传 `Rect`：
+`null` 或省略表示不裁剪；否则传 `Rect`：
 
 ```json
 {
@@ -695,9 +664,9 @@ interface TextRunInput {
 
 后端保存时会将该裁剪矩形写入 PDF 内容流，使超出边框的内容在 PDF 查看器中也被裁掉。
 
-### typography_json
+### typography
 
-为空字符串表示使用默认值：
+`null` 或省略表示使用默认值：
 
 ```json
 {
@@ -721,8 +690,8 @@ interface TextRunInput {
 
 ## 字体嵌入注意事项
 
-- `pdf_set_cjk_font_by_handle` 接受 WOFF1，并在后续需要 CJK fallback 时嵌入到 PDF。
-- `pdf_set_local_font_by_handle` 当前只接受可转换为 TrueType-flavoured SFNT 的字体，包括 TTF、TrueType OTF、WOFF1、TTC。CFF/OpenType 字体会返回 `false`。
+- `pdf_set_cjk_font` 接受 WOFF1，并在后续需要 CJK fallback 时嵌入到 PDF。
+- `pdf_set_local_font` 当前只接受可转换为 TrueType-flavoured SFNT 的字体，包括 TTF、TrueType OTF、WOFF1、TTC。CFF/OpenType 字体会返回 `false`。
 - 后端保存时会对后嵌入字体做子集化，只保留本次文档实际使用到的字符，避免导出的 PDF 过大。
 - 如果某个 run 的 `font_name` 指向本地字体，前端必须先注册该字体 bytes；否则保存时无法使用该字体。
 

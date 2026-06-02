@@ -55,10 +55,10 @@ export function usePdfDocument() {
   }
 
   async function loadCurrentPage() {
-    if (!pdfBytes.value) return null;
+    if (pdfHandle.value == null) return null;
     status.value = "正在解析 PDF 页面...";
     revokeUrls();
-    const loaded = await loadPdfPage(pdfBytes.value, pageNumber.value, pdfHandle.value);
+    const loaded = await loadPdfPage(pdfHandle.value, pageNumber.value);
     page.value = loaded.structure;
     backgroundUrl.value = loaded.backgroundUrl;
     fontAssets.value = loaded.fontAssets;

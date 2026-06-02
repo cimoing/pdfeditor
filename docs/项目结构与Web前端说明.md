@@ -76,7 +76,13 @@ interaction layer:  透明文本对象热区、内联编辑框、布局预览
 保存时，前端把文本修改整理为 JSON，调用：
 
 ```text
-pdf_apply_text_edits(pdf_bytes, edits_json)
+pdf_apply_text_edits(handle, edits_json)
+```
+
+编辑会更新内存文档；导出时调用：
+
+```text
+pdf_get_bytes(handle)
 ```
 
 返回值是更新后的 PDF bytes，可直接生成 Blob 下载。

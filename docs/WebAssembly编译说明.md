@@ -4,16 +4,23 @@
 
 ## 目标
 
-`pdfeditor-core` 支持编译为 `wasm32-unknown-unknown`，用于 Web 端直接解析 PDF bytes 并输出页面结构 JSON。
+`pdfeditor-core` 支持编译为 `wasm32-unknown-unknown`，用于 Web 端打开 PDF bytes，获得内存文档 handle，并通过 handle 读取页面结构、编辑文本和导出 PDF。
 
-当前 wasm MVP 暴露能力：
+当前 wasm 暴露能力：
 
-- `pdf_page_to_json(pdf_bytes, page_number)`
-- `pdf_page_background_png(pdf_bytes, page_number)`
-- `pdf_image_object_png(pdf_bytes, page_number, image_object_id)`
-- `pdf_apply_text_edits(pdf_bytes, edits_json)`
+- `pdf_open_document(pdf_bytes)`
+- `pdf_page_bundle(handle, page_number)`
+- `pdf_page_structure(handle, page_number)`
+- `pdf_hit_test(handle, page_number, pdf_x, pdf_y)`
+- `pdf_start_text_edit(handle, object_id)`
+- `pdf_preview_text_layout(handle, object_id, text)`
+- `pdf_apply_text_edits(handle, edits_json)`
+- `pdf_get_bytes(handle)`
+- `pdf_set_cjk_font(handle, woff_bytes)`
+- `pdf_set_local_font(handle, font_key, font_bytes)`
+- `pdf_close_document(handle)`
 - `page_number` 从 1 开始
-- 输入/输出均基于内存 bytes，不依赖本地文件路径
+- 输入/输出均基于内存数据，不依赖本地文件路径
 
 ## 编译
 
@@ -62,16 +69,28 @@ wasm-bindgen \
 浏览器侧示例：
 
 ```js
-import init, { pdf_page_to_json } from "./pkg/pdfeditor_core.js";
+import init, {
+  pdf_open_document,
+  pdf_page_structure,
+  pdf_page_bundle,
+  pdf_apply_text_edits,
+  pdf_get_bytes,
+  pdf_close_document
+} from "./pkg/pdfeditor_core.js";
 
 await init();
 
 const file = document.querySelector("input[type=file]").files[0];
 const bytes = new Uint8Array(await file.arrayBuffer());
-const json = pdf_page_to_json(bytes, 1);
-const page = JSON.parse(json);
+const handle = pdf_open_document(bytes);
 
-console.log(page.page.size);
+try {
+  const json = pdf_page_structure(handle, 1);
+  const page = JSON.parse(json);
+  console.log(page.page.size);
+} finally {
+  pdf_close_document(handle);
+}
 ```
 
 ## Web 编辑流程
@@ -86,7 +105,8 @@ interaction layer:  hit test、文本编辑预览与提交 API
 页面加载：
 
 ```js
-const bundle = pdf_page_bundle(bytes, 1);
+const handle = pdf_open_document(bytes);
+const bundle = pdf_page_bundle(handle, 1);
 const { structure, background_png, fonts } = parsePageBundle(bundle);
 await skiaRenderer.render({ structure, background_png, fonts });
 ```
@@ -104,14 +124,15 @@ const edits = {
   ]
 };
 
-const updatedPdfBytes = pdf_apply_text_edits(bytes, JSON.stringify(edits));
+pdf_apply_text_edits(handle, JSON.stringify(edits));
+const updatedPdfBytes = pdf_get_bytes(handle);
 ```
 
 `id` 来自 `page.text[].id`。
 
 ## 当前限制
 
-- wasm API 当前支持页面结构导出、背景 PNG bytes、图片对象 PNG bytes、文本对象内容替换。
+- wasm API 当前支持页面结构导出、页面加载包、文本编辑、字体注册和 PDF bytes 导出。
 - 当前编辑操作以已有文本对象为单位，不新增或删除 PDF 对象。
 - 图片替换、对象移动、复杂文字重排后续再扩展。
 - 原生 CLI 仍负责本地文件路径模式和批量导出文件模式。

@@ -2,7 +2,6 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch, watchEffect } from "vue";
 import type { LayoutGlyph, LocalSystemFontOption, RichTextRun, StructuredImageObject, StructuredTextObject, TextTypography } from "./pdfEditor";
 import {
-  commitTextEdit,
   describePdfFontUsage,
   getPdfBytesByHandle,
   getPageStructureByHandle,
@@ -983,7 +982,7 @@ async function ensureSystemFontsForRuns(handle: number, runs: RichTextRun[], typ
 }
 
 async function beginTextEdit(objectId: number) {
-  if (!pdfBytes.value) return;
+  if (pdfHandle.value == null) return;
   resetEditBoxOverrides();
   clearPreviewTimer();
   selectedTextId.value = objectId;
@@ -993,7 +992,7 @@ async function beginTextEdit(objectId: number) {
   const currentSelection = incrementSelection();
 
   try {
-    const session = await startTextEdit(pdfBytes.value, objectId, pdfHandle.value);
+    const session = await startTextEdit(pdfHandle.value, objectId);
     if (currentSelection !== getSelectionToken()) return;
     editSession.value = session;
 
@@ -1174,10 +1173,10 @@ function setActiveRunSize(size: number | null) {
 }
 
 async function refreshPreview(objectId: number, text: string, selectionToken = getSelectionToken()) {
-  if (!pdfBytes.value) return;
+  if (pdfHandle.value == null) return;
   const requestId = incrementPreviewToken();
   try {
-    const preview = await previewTextLayout(pdfBytes.value, objectId, text, pdfHandle.value);
+    const preview = await previewTextLayout(pdfHandle.value, objectId, text);
     if (requestId !== getPreviewToken() || selectionToken !== getSelectionToken() || selectedTextId.value !== objectId) {
       return;
     }
@@ -1269,31 +1268,7 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
         }
       }
     } else {
-      // Fallback path (no document handle): serialize + full page reload.
-      if (!pdfBytes.value) return;
-      const updatedBytes = await commitTextEdit(pdfBytes.value, objectId, savedText, null);
-      pdfBytes.value = new Uint8Array(updatedBytes);
-      if (closeAfterSave) {
-        await loadPage();
-        if (savedClipBounds && page.value) {
-          const nextObjectId = findSavedTextObjectId(page.value.text, objectId, savedText, savedBounds);
-          const savedObject = nextObjectId == null ? null : page.value.text.find((item) => item.id === nextObjectId);
-          if (savedObject) savedObject.clip_bounds = savedClipBounds;
-        }
-        clearEditingState();
-      } else {
-        const loaded = await loadPage();
-        const nextObjectId = loaded ? findSavedTextObjectId(loaded.structure.text, objectId, savedText, savedBounds) : null;
-        if (nextObjectId != null && savedClipBounds && loaded) {
-          const savedObject = loaded.structure.text.find((item) => item.id === nextObjectId);
-          if (savedObject) savedObject.clip_bounds = savedClipBounds;
-        }
-        if (nextObjectId == null) {
-          clearEditingState();
-        } else {
-          await beginTextEdit(nextObjectId);
-        }
-      }
+      throw new Error("保存失败：PDF 文档句柄不存在，请重新打开文件。");
     }
     status.value = `文本对象 ${objectId} 已保存`;
   } catch (error) {

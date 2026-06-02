@@ -1,11 +1,8 @@
 use crate::lopdf_backend::{open_lopdf_document_from_bytes_unindexed, LopdfDocument};
 use crate::types::{Color, Rect, TextRun};
 use crate::{
-    open_lopdf_document_from_bytes, page_background_png_from_pdf_bytes,
-    page_font_assets_from_pdf_bytes, page_image_png_from_pdf_bytes,
-    page_load_bundle_from_pdf_bytes, page_structure_from_pdf_bytes, save_pdf_document_to_bytes,
-    BackgroundRenderOptions, CoreError, EngineDocument, ImageObjectId, PageIndex, PdfObjectId,
-    Point, TextObjectId, TextTypography,
+    save_pdf_document_to_bytes, BackgroundRenderOptions, CoreError, EngineDocument, PageIndex,
+    PdfObjectId, Point, TextObjectId, TextTypography,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -35,23 +32,6 @@ impl DocumentStore {
 }
 
 #[wasm_bindgen]
-pub fn pdf_page_to_json(pdf_bytes: &[u8], page_number: u32) -> Result<String, JsValue> {
-    let page = wasm_page_index(page_number)?;
-    let structure = page_structure_from_pdf_bytes(pdf_bytes, page).map_err(core_error_to_js)?;
-    serde_json::to_string_pretty(&structure)
-        .map_err(|error| JsValue::from_str(&format!("failed to serialize page JSON: {error}")))
-}
-
-#[wasm_bindgen]
-pub fn pdf_page_bundle(pdf_bytes: &[u8], page_number: u32) -> Result<Vec<u8>, JsValue> {
-    let page = wasm_page_index(page_number)?;
-    let bundle =
-        page_load_bundle_from_pdf_bytes(pdf_bytes, page, BackgroundRenderOptions::default())
-            .map_err(core_error_to_js)?;
-    encode_page_bundle(bundle)
-}
-
-#[wasm_bindgen]
 pub fn pdf_open_document(pdf_bytes: &[u8]) -> Result<u32, JsValue> {
     let document = open_lopdf_document_from_bytes_unindexed(pdf_bytes).map_err(core_error_to_js)?;
     Ok(DOCUMENT_STORE.with(|store| store.borrow_mut().insert(document)))
@@ -65,19 +45,14 @@ pub fn pdf_close_document(handle: u32) -> Result<(), JsValue> {
             .documents
             .remove(&handle)
             .map(|_| ())
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))
+            .ok_or_else(|| invalid_handle_error(handle))
     })
 }
 
 #[wasm_bindgen]
-pub fn pdf_page_bundle_by_handle(handle: u32, page_number: u32) -> Result<Vec<u8>, JsValue> {
+pub fn pdf_page_bundle(handle: u32, page_number: u32) -> Result<Vec<u8>, JsValue> {
     let page = wasm_page_index(page_number)?;
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+    with_document_mut(handle, |document| {
         document
             .ensure_text_index_for_page(page)
             .map_err(core_error_to_js)?;
@@ -88,36 +63,32 @@ pub fn pdf_page_bundle_by_handle(handle: u32, page_number: u32) -> Result<Vec<u8
     })
 }
 
+/// Return the page structure (text objects, images, fonts) as JSON without
+/// rendering the background PNG. Much faster than `pdf_page_bundle` for
+/// post-edit refreshes where the background image hasn't changed.
 #[wasm_bindgen]
-pub fn pdf_hit_test(
-    pdf_bytes: &[u8],
-    page_number: u32,
-    pdf_x: f64,
-    pdf_y: f64,
-) -> Result<String, JsValue> {
+pub fn pdf_page_structure(handle: u32, page_number: u32) -> Result<String, JsValue> {
     let page = wasm_page_index(page_number)?;
-    let document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
-    let result = document
-        .hit_test(page, Point::new(pdf_x as f32, pdf_y as f32))
-        .map_err(core_error_to_js)?;
-    serde_json::to_string(&result)
-        .map_err(|error| JsValue::from_str(&format!("failed to serialize hit-test JSON: {error}")))
+    with_document_mut(handle, |document| {
+        document
+            .ensure_text_index_for_page(page)
+            .map_err(core_error_to_js)?;
+        let structure = document.page_structure(page).map_err(core_error_to_js)?;
+        serde_json::to_string(&structure).map_err(|error| {
+            JsValue::from_str(&format!("failed to serialize page structure JSON: {error}"))
+        })
+    })
 }
 
 #[wasm_bindgen]
-pub fn pdf_hit_test_by_handle(
+pub fn pdf_hit_test(
     handle: u32,
     page_number: u32,
     pdf_x: f64,
     pdf_y: f64,
 ) -> Result<String, JsValue> {
     let page = wasm_page_index(page_number)?;
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+    with_document_mut(handle, |document| {
         document
             .ensure_text_index_for_page(page)
             .map_err(core_error_to_js)?;
@@ -131,26 +102,8 @@ pub fn pdf_hit_test_by_handle(
 }
 
 #[wasm_bindgen]
-pub fn pdf_start_text_edit(pdf_bytes: &[u8], object_id: u64) -> Result<String, JsValue> {
-    let document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
-    let result = document
-        .start_text_edit(TextObjectId(PdfObjectId(object_id)))
-        .map_err(core_error_to_js)?;
-    serde_json::to_string(&result).map_err(|error| {
-        JsValue::from_str(&format!(
-            "failed to serialize text edit session JSON: {error}"
-        ))
-    })
-}
-
-#[wasm_bindgen]
-pub fn pdf_start_text_edit_by_handle(handle: u32, object_id: u64) -> Result<String, JsValue> {
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+pub fn pdf_start_text_edit(handle: u32, object_id: u64) -> Result<String, JsValue> {
+    with_document_mut(handle, |document| {
         document
             .ensure_text_index_for_page(page_from_text_object_id(object_id))
             .map_err(core_error_to_js)?;
@@ -167,129 +120,109 @@ pub fn pdf_start_text_edit_by_handle(handle: u32, object_id: u64) -> Result<Stri
 
 #[wasm_bindgen]
 pub fn pdf_preview_text_layout(
-    pdf_bytes: &[u8],
-    object_id: u64,
-    text: &str,
-) -> Result<String, JsValue> {
-    let document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
-    let result = document
-        .preview_text_layout(TextObjectId(PdfObjectId(object_id)), text.to_string())
-        .map_err(core_error_to_js)?;
-    serde_json::to_string(&result)
-        .map_err(|error| JsValue::from_str(&format!("failed to serialize preview JSON: {error}")))
-}
-
-#[wasm_bindgen]
-pub fn pdf_preview_text_layout_by_handle(
     handle: u32,
     object_id: u64,
     text: &str,
 ) -> Result<String, JsValue> {
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
+    with_document_mut(handle, |document| {
         document
             .ensure_text_index_for_page(page_from_text_object_id(object_id))
             .map_err(core_error_to_js)?;
         let result = document
             .preview_text_layout(TextObjectId(PdfObjectId(object_id)), text.to_string())
             .map_err(core_error_to_js)?;
-        serde_json::to_string(&result).map_err(|error| {
-            JsValue::from_str(&format!("failed to serialize preview JSON: {error}"))
-        })
+        serde_json::to_string(&result)
+            .map_err(|error| JsValue::from_str(&format!("failed to serialize preview JSON: {error}")))
     })
 }
 
+/// Apply text edits to the in-memory document. Use `pdf_get_bytes` when PDF
+/// bytes are needed for download or export.
 #[wasm_bindgen]
-pub fn pdf_commit_text_edit(
-    pdf_bytes: &[u8],
-    object_id: u64,
-    text: &str,
-) -> Result<Vec<u8>, JsValue> {
-    let mut document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
-    document
-        .update_text_object(TextObjectId(PdfObjectId(object_id)), text.to_string(), None)
-        .map_err(core_error_to_js)?;
-    save_pdf_document_to_bytes(&document).map_err(core_error_to_js)
+pub fn pdf_apply_text_edits(handle: u32, edits_json: &str) -> Result<(), JsValue> {
+    let request: TextEditRequest = serde_json::from_str(edits_json)
+        .map_err(|error| JsValue::from_str(&format!("invalid edits JSON: {error}")))?;
+    with_document_mut(handle, |document| {
+        for edit in request.edits {
+            apply_text_edit(document, edit).map_err(core_error_to_js)?;
+        }
+        Ok(())
+    })
 }
 
+/// Serialize the in-memory document to PDF bytes.
 #[wasm_bindgen]
-pub fn pdf_commit_text_edit_by_handle(
-    handle: u32,
-    object_id: u64,
-    text: &str,
-) -> Result<Vec<u8>, JsValue> {
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
-        document
-            .ensure_text_index_for_page(page_from_text_object_id(object_id))
-            .map_err(core_error_to_js)?;
-        document
-            .update_text_object(TextObjectId(PdfObjectId(object_id)), text.to_string(), None)
-            .map_err(core_error_to_js)?;
+pub fn pdf_get_bytes(handle: u32) -> Result<Vec<u8>, JsValue> {
+    with_document(handle, |document| {
         save_pdf_document_to_bytes(document).map_err(core_error_to_js)
     })
 }
 
-/// Apply a text edit to the in-memory document without serializing the PDF bytes.
-/// Use `pdf_get_bytes_by_handle` to retrieve bytes when needed (e.g. for download).
+/// Load an embedded CJK fallback font from WOFF1 bytes.
+///
+/// Once set, subsequent edits that need a CJK fallback will embed this TrueType font
+/// (Identity-H encoding) instead of the unembedded STSong-Light standard font.
 #[wasm_bindgen]
-pub fn pdf_update_text_by_handle(handle: u32, object_id: u64, text: &str) -> Result<(), JsValue> {
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
-        document
-            .ensure_text_index_for_page(page_from_text_object_id(object_id))
-            .map_err(core_error_to_js)?;
-        document
-            .update_text_object(TextObjectId(PdfObjectId(object_id)), text.to_string(), None)
-            .map(|_| ())
-            .map_err(core_error_to_js)
+pub fn pdf_set_cjk_font(handle: u32, woff_bytes: &[u8]) -> Result<bool, JsValue> {
+    with_document_mut(handle, |document| {
+        if let Some(sfnt) = crate::font_embed::woff1_to_sfnt(woff_bytes) {
+            if let Some(data) = crate::font_embed::parse_cjk_font(sfnt) {
+                document.set_cjk_font(data);
+                return Ok(true);
+            }
+        }
+        Ok(false)
     })
 }
 
-/// Return the page structure (text objects, images, fonts) as JSON without
-/// rendering the background PNG. Much faster than `pdf_page_bundle_by_handle`
-/// for post-edit refreshes where the background image hasn't changed.
+/// Register a local TrueType/SFNT font for later embedding.
+///
+/// `font_key` is the frontend resource key after the `__localfont__:` prefix.
+/// Only TrueType-flavoured SFNT/WOFF1/TTC fonts are accepted for now.
 #[wasm_bindgen]
-pub fn pdf_page_structure_by_handle(handle: u32, page_number: u32) -> Result<String, JsValue> {
-    let page = wasm_page_index(page_number)?;
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
-        document
-            .ensure_text_index_for_page(page)
-            .map_err(core_error_to_js)?;
-        let structure = document.page_structure(page).map_err(core_error_to_js)?;
-        serde_json::to_string(&structure).map_err(|error| {
-            JsValue::from_str(&format!("failed to serialize page structure JSON: {error}"))
-        })
+pub fn pdf_set_local_font(
+    handle: u32,
+    font_key: &str,
+    font_bytes: &[u8],
+) -> Result<bool, JsValue> {
+    let Some(sfnt) = crate::font_embed::font_bytes_to_truetype_sfnt(font_bytes) else {
+        return Ok(false);
+    };
+    let Some(data) = crate::font_embed::parse_cjk_font(sfnt) else {
+        return Ok(false);
+    };
+
+    with_document_mut(handle, |document| {
+        document.set_local_font(font_key.to_string(), data);
+        Ok(true)
     })
 }
 
-/// Serialize the in-memory document to PDF bytes (for download / export).
-#[wasm_bindgen]
-pub fn pdf_get_bytes_by_handle(handle: u32) -> Result<Vec<u8>, JsValue> {
+fn with_document<T>(
+    handle: u32,
+    f: impl FnOnce(&LopdfDocument) -> Result<T, JsValue>,
+) -> Result<T, JsValue> {
     DOCUMENT_STORE.with(|store| {
         let store = store.borrow();
         let document = store
             .documents
             .get(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
-        save_pdf_document_to_bytes(document).map_err(core_error_to_js)
+            .ok_or_else(|| invalid_handle_error(handle))?;
+        f(document)
+    })
+}
+
+fn with_document_mut<T>(
+    handle: u32,
+    f: impl FnOnce(&mut LopdfDocument) -> Result<T, JsValue>,
+) -> Result<T, JsValue> {
+    DOCUMENT_STORE.with(|store| {
+        let mut store = store.borrow_mut();
+        let document = store
+            .documents
+            .get_mut(&handle)
+            .ok_or_else(|| invalid_handle_error(handle))?;
+        f(document)
     })
 }
 
@@ -350,86 +283,42 @@ fn encode_page_bundle(bundle: crate::PageLoadBundle) -> Result<Vec<u8>, JsValue>
     Ok(output)
 }
 
-#[wasm_bindgen]
-pub fn pdf_page_background_png(pdf_bytes: &[u8], page_number: u32) -> Result<Vec<u8>, JsValue> {
-    let page = wasm_page_index(page_number)?;
-    page_background_png_from_pdf_bytes(pdf_bytes, page, BackgroundRenderOptions::default())
-        .map_err(core_error_to_js)
-}
-
-#[wasm_bindgen]
-pub fn pdf_image_object_png(
-    pdf_bytes: &[u8],
-    page_number: u32,
-    image_object_id: u64,
-) -> Result<Vec<u8>, JsValue> {
-    let page = wasm_page_index(page_number)?;
-    page_image_png_from_pdf_bytes(pdf_bytes, page, ImageObjectId(PdfObjectId(image_object_id)))
-        .map_err(core_error_to_js)
-}
-
-#[wasm_bindgen]
-pub fn pdf_page_fonts_to_json(pdf_bytes: &[u8], page_number: u32) -> Result<String, JsValue> {
-    let page = wasm_page_index(page_number)?;
-    let fonts = page_font_assets_from_pdf_bytes(pdf_bytes, page).map_err(core_error_to_js)?;
-    let metadata = fonts
-        .into_iter()
-        .map(|font| FontAssetInfo {
-            resource_name: font.resource_name,
-            family_name: font.family_name,
-            font_weight: font.font_weight,
-            is_bold: font.is_bold,
-            file_name: font.file_name,
-            mime_type: font.mime_type,
-            format: font.format,
-        })
-        .collect::<Vec<_>>();
-    serde_json::to_string_pretty(&metadata)
-        .map_err(|error| JsValue::from_str(&format!("failed to serialize font JSON: {error}")))
-}
-
-#[wasm_bindgen]
-pub fn pdf_font_asset(
-    pdf_bytes: &[u8],
-    page_number: u32,
-    resource_name: &str,
-) -> Result<Vec<u8>, JsValue> {
-    let page = wasm_page_index(page_number)?;
-    let fonts = page_font_assets_from_pdf_bytes(pdf_bytes, page).map_err(core_error_to_js)?;
-    fonts
-        .into_iter()
-        .find(|font| font.resource_name == resource_name)
-        .map(|font| font.bytes)
-        .ok_or_else(|| JsValue::from_str(&format!("font resource not found: {resource_name}")))
-}
-
-#[wasm_bindgen]
-pub fn pdf_apply_text_edits(pdf_bytes: &[u8], edits_json: &str) -> Result<Vec<u8>, JsValue> {
-    let request: TextEditRequest = serde_json::from_str(edits_json)
-        .map_err(|error| JsValue::from_str(&format!("invalid edits JSON: {error}")))?;
-    let mut document = open_lopdf_document_from_bytes(pdf_bytes).map_err(core_error_to_js)?;
-
-    for edit in request.edits {
-        apply_text_edit(&mut document, edit).map_err(core_error_to_js)?;
-    }
-
-    save_pdf_document_to_bytes(&document).map_err(core_error_to_js)
-}
-
 fn page_from_text_object_id(object_id: u64) -> PageIndex {
     PageIndex((object_id >> 32) as u32)
 }
 
+fn page_from_text_edit(edit: &TextEdit) -> crate::CoreResult<PageIndex> {
+    if let Some(page_index) = edit.page_index {
+        return Ok(PageIndex(page_index));
+    }
+    if let Some(page_number) = edit.page_number {
+        if page_number == 0 {
+            return Err(crate::CoreError::InvalidOperation(
+                "page_number is 1-based and must be greater than 0".to_string(),
+            ));
+        }
+        return Ok(PageIndex(page_number - 1));
+    }
+    Ok(page_from_text_object_id(edit.id))
+}
+
 fn apply_text_edit(document: &mut LopdfDocument, edit: TextEdit) -> crate::CoreResult<()> {
+    let page = page_from_text_edit(&edit)?;
     let id = TextObjectId(PdfObjectId(edit.id));
-    document.ensure_text_index_for_page(page_from_text_object_id(edit.id))?;
+    document.ensure_text_index_for_page(page)?;
     match edit.kind.as_str() {
         "replace_text" | "update_text" => {
             document.update_text_object(id, edit.content, None)?;
         }
-        "replace_runs" => {
+        "replace_runs" | "replace_text_runs" => {
             let runs = text_runs_from_input(edit.runs);
-            document.update_text_object_runs(id, runs)?;
+            document.replace_text_object_with_runs(
+                id,
+                runs,
+                Point::new(edit.origin_dx, edit.origin_dy),
+                edit.clip_bounds,
+                edit.typography.unwrap_or_default(),
+            )?;
         }
         kind => {
             return Err(crate::CoreError::InvalidOperation(format!(
@@ -459,138 +348,6 @@ fn text_runs_from_input(inputs: Vec<TextRunInput>) -> Vec<TextRun> {
         .collect()
 }
 
-#[wasm_bindgen]
-pub fn pdf_apply_text_edits_by_handle(handle: u32, edits_json: &str) -> Result<Vec<u8>, JsValue> {
-    let request: TextEditRequest = serde_json::from_str(edits_json)
-        .map_err(|error| JsValue::from_str(&format!("invalid edits JSON: {error}")))?;
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
-
-        for edit in request.edits {
-            apply_text_edit(document, edit).map_err(core_error_to_js)?;
-        }
-
-        save_pdf_document_to_bytes(document).map_err(core_error_to_js)
-    })
-}
-
-/// Load an embedded CJK fallback font from WOFF1 bytes.
-///
-/// Once set, subsequent edits that need a CJK fallback will embed this TrueType font
-/// (Identity-H encoding) instead of the unembedded STSong-Light standard font.
-/// This prevents "box" rendering in PDF viewers that lack STSong-Light.
-///
-/// `woff_bytes` must be a valid WOFF1 file (magic 0x774F4646).
-///
-/// Returns `true` when the font was decoded, parsed, and stored for later PDF
-/// embedding; `false` means later fallback text would still use the unembedded
-/// STSong-Light path.
-#[wasm_bindgen]
-pub fn pdf_set_cjk_font_by_handle(handle: u32, woff_bytes: &[u8]) -> Result<bool, JsValue> {
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
-
-        // WOFF1 → sfnt → parse font metadata
-        if let Some(sfnt) = crate::font_embed::woff1_to_sfnt(woff_bytes) {
-            if let Some(data) = crate::font_embed::parse_cjk_font(sfnt) {
-                document.set_cjk_font(data);
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    })
-}
-
-/// Register a local TrueType/SFNT font for later embedding.
-///
-/// `font_key` is the frontend resource key after the `__localfont__:` prefix.
-/// Only TrueType-flavoured SFNT/WOFF1/TTC fonts are accepted for now; CFF/OpenType
-/// fonts are rejected so the writer does not create invalid PDF font objects.
-#[wasm_bindgen]
-pub fn pdf_set_local_font_by_handle(
-    handle: u32,
-    font_key: &str,
-    font_bytes: &[u8],
-) -> Result<bool, JsValue> {
-    let Some(sfnt) = crate::font_embed::font_bytes_to_truetype_sfnt(font_bytes) else {
-        return Ok(false);
-    };
-    let Some(data) = crate::font_embed::parse_cjk_font(sfnt) else {
-        return Ok(false);
-    };
-
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
-        document.set_local_font(font_key.to_string(), data);
-        Ok(true)
-    })
-}
-
-/// Update a text object with multiple styled runs without serializing PDF bytes.
-/// `runs_json` is a JSON array of `{ content, font_name, font_size, color }` objects,
-/// where `color` is `[r, g, b, a]` (0–255 each).
-#[wasm_bindgen]
-pub fn pdf_update_text_runs_by_handle(
-    handle: u32,
-    object_id: u64,
-    runs_json: &str,
-    origin_dx: f32,
-    origin_dy: f32,
-    clip_bounds_json: &str,
-    typography_json: &str,
-) -> Result<(), JsValue> {
-    let runs_input: Vec<TextRunInput> = serde_json::from_str(runs_json)
-        .map_err(|e| JsValue::from_str(&format!("invalid runs JSON: {e}")))?;
-    let runs = text_runs_from_input(runs_input);
-    let clip_bounds: Option<Rect> = if clip_bounds_json.trim().is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::from_str(clip_bounds_json)
-                .map_err(|e| JsValue::from_str(&format!("invalid clip bounds JSON: {e}")))?,
-        )
-    };
-    let typography: TextTypography = if typography_json.trim().is_empty() {
-        TextTypography::default()
-    } else {
-        serde_json::from_str(typography_json)
-            .map_err(|e| JsValue::from_str(&format!("invalid typography JSON: {e}")))?
-    };
-    DOCUMENT_STORE.with(|store| {
-        let mut store = store.borrow_mut();
-        let document = store
-            .documents
-            .get_mut(&handle)
-            .ok_or_else(|| JsValue::from_str(&format!("invalid PDF document handle: {handle}")))?;
-        let id = TextObjectId(PdfObjectId(object_id));
-        document
-            .ensure_text_index_for_page(page_from_text_object_id(object_id))
-            .map_err(core_error_to_js)?;
-        document
-            .replace_text_object_with_runs(
-                id,
-                runs,
-                crate::Point::new(origin_dx, origin_dy),
-                clip_bounds,
-                typography,
-            )
-            .map(|_| ())
-            .map_err(core_error_to_js)
-    })
-}
-
 #[derive(Debug, Deserialize)]
 struct TextEditRequest {
     edits: Vec<TextEdit>,
@@ -602,9 +359,21 @@ struct TextEdit {
     kind: String,
     id: u64,
     #[serde(default)]
+    page_number: Option<u32>,
+    #[serde(default)]
+    page_index: Option<u32>,
+    #[serde(default)]
     content: String,
     #[serde(default)]
     runs: Vec<TextRunInput>,
+    #[serde(default)]
+    origin_dx: f32,
+    #[serde(default)]
+    origin_dy: f32,
+    #[serde(default)]
+    clip_bounds: Option<Rect>,
+    #[serde(default)]
+    typography: Option<TextTypography>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -613,17 +382,6 @@ struct TextRunInput {
     font_name: Option<String>,
     font_size: f32,
     color: [u8; 4],
-}
-
-#[derive(Debug, Serialize)]
-struct FontAssetInfo {
-    resource_name: String,
-    family_name: String,
-    font_weight: u16,
-    is_bold: bool,
-    file_name: String,
-    mime_type: String,
-    format: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -683,6 +441,10 @@ fn wasm_page_index(page_number: u32) -> Result<PageIndex, JsValue> {
         ));
     }
     Ok(PageIndex(page_number - 1))
+}
+
+fn invalid_handle_error(handle: u32) -> JsValue {
+    JsValue::from_str(&format!("invalid PDF document handle: {handle}"))
 }
 
 fn core_error_to_js(error: CoreError) -> JsValue {

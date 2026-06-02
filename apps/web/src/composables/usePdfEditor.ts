@@ -1,5 +1,4 @@
 import { ref } from "vue";
-import { startTextEdit, previewTextLayout, commitTextEdit } from "../pdfEditor";
 import type { TextEditSessionInfo, TextLayoutPreview, RichTextRun } from "../pdfEditor";
 
 export function usePdfEditor() {
