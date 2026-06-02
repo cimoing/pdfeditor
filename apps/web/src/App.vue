@@ -110,6 +110,7 @@ const draftTypography = ref<TextTypography>(defaultTextTypography());
  */
 const isToolbarInteracting = ref(false);
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
+let editorPanelInteractionTimer: number | null = null;
 
 function defaultTextTypography(): TextTypography {
   return {
@@ -758,6 +759,7 @@ const previewStatus = computed(() => {
 onBeforeUnmount(() => {
   cleanupPdf();
   clearPreviewTimer();
+  if (editorPanelInteractionTimer != null) window.clearTimeout(editorPanelInteractionTimer);
   stopEdgeDrag();
   stopMoveDrag();
 });
@@ -1053,6 +1055,12 @@ function onInlineEditorInput() {
   }, 120);
 }
 
+function onDraftTypographyUpdate(next: TextTypography) {
+  draftTypography.value = next;
+  onDraftInput();
+  finishEditorPanelInteraction();
+}
+
 function onInlineEditorSelectionChange() {
   if (document.activeElement !== inlineEditor.value) return;
   activeRunId.value = getActiveRunId();
@@ -1088,6 +1096,29 @@ function onToolbarMousedown() {
   // Capture selection BEFORE the toolbar steals focus (mousedown fires before blur).
   saveEditorSelection();
   isToolbarInteracting.value = true;
+}
+
+function onEditorPanelInteraction() {
+  saveEditorSelection();
+  isToolbarInteracting.value = true;
+  if (editorPanelInteractionTimer != null) {
+    window.clearTimeout(editorPanelInteractionTimer);
+  }
+  editorPanelInteractionTimer = window.setTimeout(() => {
+    isToolbarInteracting.value = false;
+    editorPanelInteractionTimer = null;
+  }, 500);
+}
+
+function finishEditorPanelInteraction() {
+  if (editorPanelInteractionTimer != null) {
+    window.clearTimeout(editorPanelInteractionTimer);
+    editorPanelInteractionTimer = null;
+  }
+  window.setTimeout(() => {
+    isToolbarInteracting.value = false;
+    inlineEditor.value?.focus({ preventScroll: true });
+  }, 0);
 }
 
 /** Call on blur of a toolbar control; restores focus to the editor. */
@@ -1790,54 +1821,17 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
             {{ selectedFontUsage.fellBack ? selectedFontUsage.fallbackReason : "已命中嵌入字体" }}
           </div>
         </div>
-        <div class="typography-controls">
-          <label class="typography-toggle">
-            <input
-              type="checkbox"
-              v-model="draftTypography.replace_spaces_with_displacements"
-              :disabled="isPreparingEdit || isSavingEdit"
-            />
-            <span>空格写为 TJ 位移</span>
-          </label>
-          <label class="typography-toggle">
-            <input
-              type="checkbox"
-              v-model="draftTypography.compress_multi_punctuation"
-              :disabled="isPreparingEdit || isSavingEdit"
-            />
-            <span>多标点压缩识别</span>
-          </label>
-          <label class="typography-field">
-            <span>数字字体</span>
-            <select
-              v-model="draftTypography.digit_font_name"
-              :disabled="isPreparingEdit || isSavingEdit"
-            >
-              <option :value="null">（继承）</option>
-              <option
-                v-for="font in allFontOptions"
-                :key="`digit-${font.resource_name}`"
-                :value="font.resource_name"
-              >{{ font.family_name }}</option>
-            </select>
-          </label>
-          <div class="typography-detected" v-if="draftTypography.detected_tj_displacements || draftTypography.detected_space_displacements || draftTypography.detected_multi_punctuation || draftTypography.detected_digit_font_name">
-            识别：{{ [
-              draftTypography.detected_tj_displacements ? "TJ 位移" : "",
-              draftTypography.detected_space_displacements ? "位移空格" : "",
-              draftTypography.detected_multi_punctuation ? "多标点" : "",
-              draftTypography.detected_digit_font_name ? "数字字体" : ""
-            ].filter(Boolean).join(" / ") }}
-          </div>
-        </div>
         <RunsEditor
           :runs="draftRuns"
           :font-assets="allFontOptions"
           :base-font-name="editSession?.font_id ?? selectedTextObject.font_name ?? null"
           :base-font-size="editSession?.font_size ?? selectedTextObject.font_size"
           :base-color="selectedTextObject.color"
+          :typography="draftTypography"
           :disabled="isPreparingEdit || isSavingEdit"
           @update:runs="(newRuns) => { draftRuns = newRuns; onDraftInput(); }"
+          @update:typography="onDraftTypographyUpdate"
+          @interact="onEditorPanelInteraction"
         />
         <p class="helper-text" :class="{ danger: hasEffectiveOverflow }">
           {{ previewStatus }}
@@ -1966,47 +1960,58 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
                   Legacy textLength rendering for text objects without per-glyph
                   position data.  A single <text> distributes characters via
                   lengthAdjust across the object's PDF-measured width.
+
+                  The clip-path MUST live on this transform-less wrapping <g>, not
+                  on the inner <text>.  clipPathUnits="userSpaceOnUse" resolves the
+                  clip rect in the user space of the element referencing it; the
+                  <text> carries its own font matrix transform, which would
+                  reinterpret the PDF-space clip coordinates in the text's local
+                  (font-size-1) space and clip the entire line away.  The per-glyph
+                  path above wraps its clip on a <g> for the same reason.
                 -->
-                <text
+                <g
                   v-else
-                  :transform="svgTextTransform(item.text)"
-                  :font-family="svgFontFamily(item.text.font_name)"
-                  :font-weight="fontWeightFor(item.text.font_name)"
-                  :fill="svgFill(item.text)"
-                  :stroke="svgStroke(item.text)"
-                  :stroke-width="svgStrokeWidth(item.text)"
-                  :paint-order="svgPaintOrder(item.text)"
-                  :style="item.fontFeatureStyle"
-                  font-size="1"
-                  xml:space="preserve"
-                  dominant-baseline="alphabetic"
-                  :textLength="item.textLength"
-                  :lengthAdjust="item.textLength != null ? 'spacingAndGlyphs' : undefined"
                   :clip-path="textClipAttrs(item.text) != null ? `url(#clip-text-${item.text.id})` : undefined"
                 >
-                  <template v-if="svgTextRuns(item.text)">
-                    <tspan
-                      v-for="(run, runIndex) in svgTextRuns(item.text) ?? []"
-                      :key="`run-${item.text.id}-${runIndex}`"
-                      :font-family="svgFontFamily(run.font_name)"
-                      :font-weight="fontWeightFor(run.font_name)"
-                      :fill="colorToCss(run.color)"
-                    >
-                      {{ run.content }}
-                    </tspan>
-                  </template>
-                  <template v-else-if="svgTextLines(item.text).length > 1">
-                    <tspan
-                      v-for="(line, lineIndex) in svgTextLines(item.text)"
-                      :key="`line-${item.text.id}-${lineIndex}`"
-                      x="0"
-                      :y="lineIndex === 0 ? 0 : lineIndex * 1.2"
-                    >
-                      {{ line }}
-                    </tspan>
-                  </template>
-                  <template v-else>{{ item.text.content }}</template>
-                </text>
+                  <text
+                    :transform="svgTextTransform(item.text)"
+                    :font-family="svgFontFamily(item.text.font_name)"
+                    :font-weight="fontWeightFor(item.text.font_name)"
+                    :fill="svgFill(item.text)"
+                    :stroke="svgStroke(item.text)"
+                    :stroke-width="svgStrokeWidth(item.text)"
+                    :paint-order="svgPaintOrder(item.text)"
+                    :style="item.fontFeatureStyle"
+                    font-size="1"
+                    xml:space="preserve"
+                    dominant-baseline="alphabetic"
+                    :textLength="item.textLength"
+                    :lengthAdjust="item.textLength != null ? 'spacingAndGlyphs' : undefined"
+                  >
+                    <template v-if="svgTextRuns(item.text)">
+                      <tspan
+                        v-for="(run, runIndex) in svgTextRuns(item.text) ?? []"
+                        :key="`run-${item.text.id}-${runIndex}`"
+                        :font-family="svgFontFamily(run.font_name)"
+                        :font-weight="fontWeightFor(run.font_name)"
+                        :fill="colorToCss(run.color)"
+                      >
+                        {{ run.content }}
+                      </tspan>
+                    </template>
+                    <template v-else-if="svgTextLines(item.text).length > 1">
+                      <tspan
+                        v-for="(line, lineIndex) in svgTextLines(item.text)"
+                        :key="`line-${item.text.id}-${lineIndex}`"
+                        x="0"
+                        :y="lineIndex === 0 ? 0 : lineIndex * 1.2"
+                      >
+                        {{ line }}
+                      </tspan>
+                    </template>
+                    <template v-else>{{ item.text.content }}</template>
+                  </text>
+                </g>
               </g>
             </g>
           </svg>

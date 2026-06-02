@@ -127,41 +127,6 @@ h2 {
   color: #027a48;
 }
 
-.typography-controls {
-  display: grid;
-  gap: 8px;
-  margin: 10px 0;
-  padding: 10px 0;
-  border-top: 1px solid #e4e7ec;
-  border-bottom: 1px solid #e4e7ec;
-  font-size: 12px;
-}
-
-.typography-toggle {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: #344054;
-}
-
-.typography-field {
-  display: grid;
-  gap: 4px;
-  color: #344054;
-}
-
-.typography-field select {
-  width: 100%;
-  border: 1px solid #b9c3cd;
-  background: #fff;
-  padding: 6px 8px;
-  font-size: 12px;
-}
-
-.typography-detected {
-  color: #667085;
-}
-
 textarea {
   width: 100%;
   min-height: 140px;
