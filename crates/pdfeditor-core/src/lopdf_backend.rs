@@ -1582,10 +1582,10 @@ impl LopdfDocument {
             .and_then(|chars| subset_truetype_font_for_chars(data, chars))
             .unwrap_or_else(|| data.sfnt_bytes.clone());
         let sfnt_len = font_bytes.len() as i64;
-        let font_file_id = self.document.add_object(lopdf::Stream::new(
+        let font_file_id = self.document.add_object(compressed_stream(
             dictionary! { "Length1" => sfnt_len },
             font_bytes,
-        ));
+        )?);
 
         let font_name = resource_name;
         let upm = data.units_per_em as f64;
@@ -1623,10 +1623,10 @@ impl LopdfDocument {
         });
 
         let gid_to_unicode = gid_to_unicode_for_chars(data, used_chars);
-        let to_unicode_id = self.document.add_object(lopdf::Stream::new(
+        let to_unicode_id = self.document.add_object(compressed_stream(
             dictionary! {},
             build_to_unicode_cmap(&gid_to_unicode).into_bytes(),
-        ));
+        )?);
 
         let type0_id = self.document.add_object(dictionary! {
             "Type" => "Font",
@@ -1724,10 +1724,10 @@ impl LopdfDocument {
             let font_bytes = subset_truetype_font_for_chars(data, &combined_chars)
                 .unwrap_or_else(|| data.sfnt_bytes.clone());
             let sfnt_len = font_bytes.len() as i64;
-            let font_file_id = self.document.add_object(lopdf::Stream::new(
+            let font_file_id = self.document.add_object(compressed_stream(
                 dictionary! { "Length1" => sfnt_len },
                 font_bytes,
-            ));
+            )?);
 
             // 2. FontDescriptor
             let upm = data.units_per_em as f64;
@@ -1774,7 +1774,7 @@ impl LopdfDocument {
             let cmap_str = build_to_unicode_cmap(&gid_to_unicode);
             let to_unicode_id = self
                 .document
-                .add_object(lopdf::Stream::new(dictionary! {}, cmap_str.into_bytes()));
+                .add_object(compressed_stream(dictionary! {}, cmap_str.into_bytes())?);
 
             // 6. Type0 (composite) font
             let type0_id = self.document.add_object(dictionary! {
@@ -6057,6 +6057,14 @@ fn restore_text_state_ops(
             vec![Object::Integer(state.rendering_mode as i64)],
         ));
     }
+}
+
+fn compressed_stream(dict: Dictionary, content: Vec<u8>) -> CoreResult<lopdf::Stream> {
+    let mut stream = lopdf::Stream::new(dict, content);
+    stream
+        .compress()
+        .map_err(|err| CoreError::Engine(format!("failed to compress PDF stream: {err}")))?;
+    Ok(stream)
 }
 
 fn width_array_for_chars(data: &CjkFontData, chars: Option<&BTreeSet<char>>) -> Vec<Object> {
