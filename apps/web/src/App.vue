@@ -611,6 +611,9 @@ function normalizeVector(vector: { x: number; y: number }, fallback: { x: number
   return { x: vector.x / length, y: vector.y / length };
 }
 
+function trailingSpacePunctuationCount(text: string) {
+  return Array.from(text).filter((ch) => "，。、：；！？）》」』》…—,.:;!?".includes(ch)).length;
+}
 
 function inlineEditorGeometry(text: StructuredTextObject): InlineEditorGeometry | null {
   const viewport = currentViewport.value;
@@ -639,11 +642,21 @@ function inlineEditorGeometry(text: StructuredTextObject): InlineEditorGeometry 
   const totalAdvance = sessionGlyphs.length
     ? sessionGlyphs.reduce((s, g) => s + Math.max(g.advance, 0), 0)
     : 0;
+  const compressionPadding = (draftTypography.value.compress_punctuation || draftTypography.value.detected_punctuation)
+    ? trailingSpacePunctuationCount(draftText.value || session.original_text) * effFs * viewport.zoom * 0.5
+    : 0;
+  const visibleBoundsWidth = pdfRectToViewportRect(viewport, text.clip_bounds ?? text.bounds).width;
   const naturalWidth = totalAdvance > 0
     ? Math.max(totalAdvance * effFs * viewport.zoom, fontSize * 4)
     : fontSize * 8;
 
-  return { fontSize, naturalWidth, origin, axisX, axisY };
+  return {
+    fontSize,
+    naturalWidth: Math.max(naturalWidth + compressionPadding, visibleBoundsWidth),
+    origin,
+    axisX,
+    axisY
+  };
 }
 
 function editorStartOffsetPx() {

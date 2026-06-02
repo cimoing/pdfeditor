@@ -5413,11 +5413,7 @@ fn merge_text_group_objects(
         .collect::<Vec<_>>();
     fix_scatter_glyph_advances(&mut glyphs, group.font_size);
     let bounds = glyph_bounds(&glyphs).unwrap_or(group.bounds);
-    let mut typography = merge_text_typography(members, group.font_name.as_deref());
-    if has_compressible_punctuation(&content) {
-        typography.detected_punctuation = true;
-        typography.compress_punctuation = true;
-    }
+    let typography = merge_text_typography(members, group.font_name.as_deref());
 
     StructuredTextObject {
         id: primary.id,
@@ -5794,7 +5790,7 @@ fn tj_compression_factor(
                 font_metric_advance += adv;
             }
         } else if let Some(wi) = object_to_f32(item) {
-            if wi > 0.0 {
+            if is_likely_punctuation_compression_adjustment(wi) {
                 // Positive TJ value = tighten spacing; scale by Th so the units match
                 // the per-character advances returned by text_advance.
                 total_positive_adj += wi / 1000.0 * (state.horizontal_scaling / 100.0);
@@ -5977,6 +5973,7 @@ fn operation_text_with_typography(
                         .chars()
                         .last()
                         .is_some_and(is_trailing_space_punctuation)
+                    && is_likely_punctuation_compression_adjustment(adjustment)
                 {
                     typography.detected_punctuation = true;
                     typography.compress_punctuation = true;
@@ -5986,10 +5983,6 @@ fn operation_text_with_typography(
         }
         _ => return None,
     };
-    if has_compressible_punctuation(&text) {
-        typography.detected_punctuation = true;
-        typography.compress_punctuation = true;
-    }
     Some((text, typography))
 }
 
@@ -6158,6 +6151,10 @@ fn punctuation_compression_adjustment(advance: f32) -> f32 {
     (advance.max(0.0) * 0.5).min(0.5)
 }
 
+fn is_likely_punctuation_compression_adjustment(adjustment: f32) -> bool {
+    adjustment >= 250.0
+}
+
 fn is_trailing_space_punctuation(ch: char) -> bool {
     matches!(
         ch,
@@ -6180,10 +6177,6 @@ fn is_trailing_space_punctuation(ch: char) -> bool {
             | '!'
             | '?'
     )
-}
-
-fn has_compressible_punctuation(text: &str) -> bool {
-    text.chars().any(is_trailing_space_punctuation)
 }
 
 fn merge_text_typography(
