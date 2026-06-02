@@ -8,15 +8,15 @@ pdfeditor/
     pdfeditor-core/    Rust 核心层、PDF 解析编辑、wasm API
     pdfeditor-cli/     命令行工具
   apps/
-    web/               Vue Web demo
+    web/               Vue Web 前端
   docs/                设计和使用说明
 ```
 
-## Web Demo
+## Web 前端
 
 前端使用 Vue + Vite，核心能力来自 `pdfeditor-core` 编译出的 WebAssembly。
 
-Demo 支持：
+Web 前端支持：
 
 - 选择本地 PDF 文件。
 - 指定页码并解析页面。

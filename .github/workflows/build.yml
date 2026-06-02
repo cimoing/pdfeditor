@@ -39,7 +39,7 @@ jobs:
         run: cargo check -p pdfeditor-core --target wasm32-unknown-unknown --features wasm
 
   web:
-    name: Web Demo
+    name: Web
     runs-on: ubuntu-latest
 
     steps:
@@ -68,7 +68,7 @@ jobs:
         working-directory: apps/web
         run: npm ci
 
-      - name: Build web demo
+      - name: Build web
         working-directory: apps/web
         run: npm run build
 

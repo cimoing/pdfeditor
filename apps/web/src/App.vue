@@ -1790,7 +1790,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   <main class="app-shell">
     <aside class="sidebar">
       <header>
-        <h1>PDF Editor Web Demo</h1>
+        <h1>PDF Editor Web</h1>
       </header>
 
       <label class="field">

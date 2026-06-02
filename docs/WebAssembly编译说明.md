@@ -1,5 +1,7 @@
 # WebAssembly 编译说明
 
+完整 wasm API、入参和出参结构见：[后端 wasm 使用说明](后端wasm使用说明.md)。
+
 ## 目标
 
 `pdfeditor-core` 支持编译为 `wasm32-unknown-unknown`，用于 Web 端直接解析 PDF bytes 并输出页面结构 JSON。
