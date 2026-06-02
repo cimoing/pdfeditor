@@ -436,7 +436,8 @@ export async function updateTextRunsByHandle(
   runs: RichTextRun[],
   baseColor: { r: number; g: number; b: number; a: number },
   baseFontName: string | null,
-  baseFontSize: number
+  baseFontSize: number,
+  originDelta: { x: number; y: number } = { x: 0, y: 0 }
 ): Promise<void> {
   await ensureWasm();
   // Built-in browser fonts need PDF-side resource names.  Noto Sans SC keeps using
@@ -464,7 +465,13 @@ export async function updateTextRunsByHandle(
       return [c.r, c.g, c.b, c.a];
     })()
   }));
-  pdf_update_text_runs_by_handle(handle, BigInt(objectId), JSON.stringify(payload));
+  pdf_update_text_runs_by_handle(
+    handle,
+    BigInt(objectId),
+    JSON.stringify(payload),
+    originDelta.x,
+    originDelta.y
+  );
 }
 
 export async function getPageStructureByHandle(handle: number, pageNumber: number): Promise<PageStructure> {

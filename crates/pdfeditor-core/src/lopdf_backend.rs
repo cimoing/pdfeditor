@@ -1100,6 +1100,7 @@ impl EngineDocument for LopdfDocument {
         &mut self,
         id: TextObjectId,
         runs: Vec<TextRun>,
+        origin_delta: Point,
     ) -> CoreResult<TextObject> {
         let edit_group = self.text_edit_group(id)?;
         let page_id = self.page_id(edit_group.page)?;
@@ -1155,7 +1156,9 @@ impl EngineDocument for LopdfDocument {
                 .and_then(|n| font_metrics.get(n));
             advance_page_text_state(&mut pre_pass, operation, metrics);
         }
-        let anchor_tm = pre_pass.text_matrix;
+        let mut anchor_tm = pre_pass.text_matrix;
+        anchor_tm[4] += origin_delta.x;
+        anchor_tm[5] += origin_delta.y;
         let anchor_state = pre_pass.text.clone();
         let anchor_x = anchor_tm[4];
         let anchor_y = anchor_tm[5];
@@ -1348,7 +1351,8 @@ impl EngineDocument for LopdfDocument {
         // Post-edit: shift subsequent same-baseline Tm operators by the width delta.
         let new_end_x = anchor_x + anchor_scale_x * cursor_pts;
         let delta_x = new_end_x - original_end_x;
-        if delta_x.abs() > 0.5 && post_edit_idx > 0 {
+        let moved_origin = origin_delta.x.abs() > 0.0001 || origin_delta.y.abs() > 0.0001;
+        if !moved_origin && delta_x.abs() > 0.5 && post_edit_idx > 0 {
             let y_tolerance = 1.0f32 + anchor_scale_x * 0.1;
             for op in &mut rebuilt[post_edit_idx..] {
                 if op.operator == "Tm" && op.operands.len() == 6 {

@@ -115,6 +115,10 @@ const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
 const editBoxWidthOverride = ref<number | null>(null);
 /** Local x-axis offset override in viewport pixels set by dragging the left edge. */
 const editBoxLeftOverride = ref<number | null>(null);
+/** Local x-axis offset in viewport pixels set by dragging the top/bottom edge. */
+const editBoxMoveOffset = ref<number | null>(null);
+/** True while edit-box handles may transiently steal focus from the editor. */
+const isEdgeDragInteracting = ref(false);
 
 interface EdgeDragState {
   edge: "left" | "right";
@@ -125,6 +129,14 @@ interface EdgeDragState {
   initialWidth: number;
 }
 let edgeDragState: EdgeDragState | null = null;
+
+interface MoveDragState {
+  startX: number;
+  startY: number;
+  axisX: { x: number; y: number };
+  initialOffset: number;
+}
+let moveDragState: MoveDragState | null = null;
 const renderImageObjects = computed(() => page.value?.images.filter((image) => image.objectUrl) ?? []);
 
 const selectedTextObject = computed<StructuredTextObject | null>(
@@ -458,6 +470,7 @@ const renderTextObjects = computed(() => {
     runFontName ?? editSession.value!.font_id;
   const primaryPreviewFont =
     effectiveFontForRun(draftRuns.value[0]?.font_name ?? null);
+  const originDelta = editorOriginDeltaPdf();
 
   // Patch glyph font names so the per-glyph SVG path uses the user-selected font.
   const previewGlyphs = (layoutPreview.value.glyphs ?? []).map((g) => {
@@ -465,7 +478,12 @@ const renderTextObjects = computed(() => {
     // In practice most edits are single-run so all glyphs get the same override.
     const matchingRun = draftRuns.value.find((r) => r.content.includes(g.ch));
     const overrideFont = effectiveFontForRun(matchingRun?.font_name ?? null);
-    return g.font_name !== overrideFont ? { ...g, font_name: overrideFont } : g;
+    return {
+      ...(g.font_name !== overrideFont ? { ...g, font_name: overrideFont } : g),
+      x: g.x + originDelta.x,
+      y: g.y + originDelta.y,
+      bbox: translatedByOriginDelta(g.bbox, originDelta)!
+    };
   });
 
   // Build per-run data for the runs-based SVG rendering path.
@@ -476,13 +494,16 @@ const renderTextObjects = computed(() => {
     color: r.color ?? selectedTextObject.value!.color,
   }));
 
+  const previewTransform = [...editSession.value.matrix] as Matrix2D;
+  previewTransform[4] += originDelta.x;
+  previewTransform[5] += originDelta.y;
   const previewObject: StructuredTextObject = {
     ...selectedTextObject.value,
-    bounds: layoutPreview.value.bbox,
+    bounds: translatedByOriginDelta(layoutPreview.value.bbox, originDelta)!,
     content: layoutPreview.value.text,
     font_name: primaryPreviewFont,
     font_size: editSession.value.font_size,
-    transform: editSession.value.matrix,
+    transform: previewTransform,
     glyphs: previewGlyphs,
     runs: previewRuns,
   };
@@ -525,7 +546,10 @@ const svgViewportTransform = computed((): string => {
 
 const selectedViewportRect = computed(() => {
   const viewport = currentViewport.value;
-  const targetBounds = layoutPreview.value?.bbox ?? selectedTextObject.value?.bounds;
+  const targetBounds = translatedByOriginDelta(
+    layoutPreview.value?.bbox ?? selectedTextObject.value?.bounds ?? null,
+    editorOriginDeltaPdf()
+  );
   if (!viewport || !targetBounds) return null;
   return pdfRectToViewportRect(viewport, targetBounds);
 });
@@ -534,9 +558,10 @@ const previewGlyphRects = computed(() => {
   const viewport = currentViewport.value;
   const glyphs = layoutPreview.value?.glyphs ?? [];
   if (!viewport) return [];
+  const originDelta = editorOriginDeltaPdf();
   return glyphs.map((glyph, index) => ({
     id: `${index}-${glyph.ch}-${glyph.x}-${glyph.y}`,
-    rect: pdfRectToViewportRect(viewport, glyph.bbox)
+    rect: pdfRectToViewportRect(viewport, translatedByOriginDelta(glyph.bbox, originDelta)!)
   }));
 });
 
@@ -593,13 +618,17 @@ function inlineEditorGeometry(text: StructuredTextObject): InlineEditorGeometry 
   return { fontSize, naturalWidth, origin, axisX, axisY };
 }
 
+function editorStartOffsetPx() {
+  return (editBoxLeftOverride.value ?? 0) + (editBoxMoveOffset.value ?? 0);
+}
+
 /** Layout styles (position, size) for the editor wrapper div. */
 const inlineEditorWrapStyle = computed(() => {
   const text = selectedTextObject.value;
   if (!text) return {};
   const geometry = inlineEditorGeometry(text);
   if (!geometry) return {};
-  const startOffset = editBoxLeftOverride.value ?? 0;
+  const startOffset = editorStartOffsetPx();
   const left = geometry.origin.x + geometry.axisX.x * startOffset;
   const top = geometry.origin.y + geometry.axisX.y * startOffset;
 
@@ -645,19 +674,21 @@ const activeRun = computed(() => {
   return draftRuns.value.find((r) => r.id === activeRunId.value) ?? draftRuns.value[0] ?? null;
 });
 
-const canSaveEdit = computed(() => {
-  if (!selectedTextObject.value || !editSession.value || isSavingEdit.value || isPreparingEdit.value) {
-    return false;
-  }
-  // Allow save if text or any run's style changed.
-  return draftText.value !== editSession.value.original_text || hasRunStyleChanges.value;
-});
-
 const hasRunStyleChanges = computed(() => {
   // Any run with an explicit (non-null) font_name, font_size, or color means a style was applied.
   // Using this simple check avoids false positives from comparing against text.runs which is
   // often empty for basic PDF text objects.
   return draftRuns.value.some((r) => r.font_name !== null || r.font_size !== null || r.color !== null);
+});
+
+const hasEditorPositionChange = computed(() => Math.abs(editorStartOffsetPx()) > 0.5);
+
+const canSaveEdit = computed(() => {
+  if (!selectedTextObject.value || !editSession.value || isSavingEdit.value || isPreparingEdit.value) {
+    return false;
+  }
+  // Allow save if text, style, or the edit-box start position changed.
+  return draftText.value !== editSession.value.original_text || hasRunStyleChanges.value || hasEditorPositionChange.value;
 });
 
 const draftUsesBuiltInFont = computed(() =>
@@ -682,11 +713,13 @@ onBeforeUnmount(() => {
   cleanupPdf();
   clearPreviewTimer();
   stopEdgeDrag();
+  stopMoveDrag();
 });
 
 function resetEditBoxOverrides() {
   editBoxWidthOverride.value = null;
   editBoxLeftOverride.value = null;
+  editBoxMoveOffset.value = null;
 }
 
 function stopEdgeDrag() {
@@ -696,11 +729,20 @@ function stopEdgeDrag() {
   window.removeEventListener("pointerup", onEdgeDragEnd);
 }
 
+function stopMoveDrag() {
+  if (!moveDragState) return;
+  moveDragState = null;
+  window.removeEventListener("pointermove", onMoveDragMove);
+  window.removeEventListener("pointerup", onMoveDragEnd);
+}
+
 function onEdgeDragStart(event: PointerEvent, edge: "left" | "right") {
   const text = selectedTextObject.value;
   if (!text) return;
   const geometry = inlineEditorGeometry(text);
   if (!geometry) return;
+  saveEditorSelection();
+  isEdgeDragInteracting.value = true;
   const initialLeft = editBoxLeftOverride.value ?? 0;
   const initialWidth = editBoxWidthOverride.value ?? geometry.naturalWidth;
   edgeDragState = { edge, startX: event.clientX, startY: event.clientY, axisX: geometry.axisX, initialLeft, initialWidth };
@@ -726,7 +768,48 @@ function onEdgeDragMove(event: PointerEvent) {
 function onEdgeDragEnd() {
   stopEdgeDrag();
   // Restore focus to the inline editor after releasing the resize handle.
-  void nextTick(() => inlineEditor.value?.focus());
+  void nextTick(() => {
+    window.setTimeout(() => {
+      inlineEditor.value?.focus({ preventScroll: true });
+      isEdgeDragInteracting.value = false;
+    }, 0);
+  });
+}
+
+function onMoveDragStart(event: PointerEvent) {
+  const text = selectedTextObject.value;
+  if (!text) return;
+  const geometry = inlineEditorGeometry(text);
+  if (!geometry) return;
+  saveEditorSelection();
+  isEdgeDragInteracting.value = true;
+  moveDragState = {
+    startX: event.clientX,
+    startY: event.clientY,
+    axisX: geometry.axisX,
+    initialOffset: editBoxMoveOffset.value ?? 0
+  };
+  window.addEventListener("pointermove", onMoveDragMove);
+  window.addEventListener("pointerup", onMoveDragEnd);
+  event.preventDefault();
+}
+
+function onMoveDragMove(event: PointerEvent) {
+  if (!moveDragState) return;
+  const dx = event.clientX - moveDragState.startX;
+  const dy = event.clientY - moveDragState.startY;
+  const delta = dx * moveDragState.axisX.x + dy * moveDragState.axisX.y;
+  editBoxMoveOffset.value = moveDragState.initialOffset + delta;
+}
+
+function onMoveDragEnd() {
+  stopMoveDrag();
+  void nextTick(() => {
+    window.setTimeout(() => {
+      inlineEditor.value?.focus({ preventScroll: true });
+      isEdgeDragInteracting.value = false;
+    }, 0);
+  });
 }
 
 async function onFileChange(event: Event) {
@@ -884,6 +967,9 @@ async function beginTextEdit(objectId: number) {
     status.value = `已选中文本对象 ${objectId}，可直接修改并保存`;
     await nextTick();
     writeRunsToEditor(draftRuns.value);
+    if (currentSelection !== getSelectionToken()) return;
+    isPreparingEdit.value = false;
+    await nextTick();
     inlineEditor.value?.focus();
   } catch (error) {
     console.error(error);
@@ -893,7 +979,7 @@ async function beginTextEdit(objectId: number) {
     editSession.value = null;
     layoutPreview.value = null;
   } finally {
-    if (currentSelection === getSelectionToken()) {
+    if (currentSelection === getSelectionToken() && isPreparingEdit.value) {
       isPreparingEdit.value = false;
     }
   }
@@ -942,7 +1028,7 @@ function onInlineEditorFocus() {
 
 function onInlineEditorBlur() {
   // Ignore transient blur caused by edge-drag handles or toolbar controls.
-  if (edgeDragState || isToolbarInteracting.value) return;
+  if (edgeDragState || isEdgeDragInteracting.value || isToolbarInteracting.value) return;
   document.removeEventListener("selectionchange", onInlineEditorSelectionChange);
   void saveTextEditOnBlur();
 }
@@ -1017,7 +1103,11 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
   status.value = `正在保存文本对象 ${selectedTextId.value}...`;
   const objectId = selectedTextId.value;
   const savedText = draftText.value;
-  const savedBounds = layoutPreview.value?.bbox ?? editSession.value?.bbox ?? selectedTextObject.value?.bounds ?? null;
+  const originDelta = editorOriginDeltaPdf();
+  const savedBounds = translatedByOriginDelta(
+    layoutPreview.value?.bbox ?? editSession.value?.bbox ?? selectedTextObject.value?.bounds ?? null,
+    originDelta
+  );
   // Overflow saves skip re-opening the edit session to avoid an extra WASM round-trip.
   const closeAfterSave = options.closeAfterSave ?? Boolean(layoutPreview.value?.overflow);
 
@@ -1038,12 +1128,13 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
         (page.value?.images ?? []).map((img) => [img.id, img.objectUrl])
       );
       const textObj = page.value?.text.find((t) => t.id === objectId);
-      if (draftRuns.value.length > 1 || hasRunStyleChanges.value) {
+      if (draftRuns.value.length > 1 || hasRunStyleChanges.value || hasEditorPositionChange.value) {
         await updateTextRunsByHandle(
           pdfHandle.value, objectId, draftRuns.value,
           textObj?.color ?? { r: 0, g: 0, b: 0, a: 255 },
           editSession.value?.font_id ?? textObj?.font_name ?? null,
-          editSession.value?.font_size ?? textObj?.font_size ?? 12
+          editSession.value?.font_size ?? textObj?.font_size ?? 12,
+          originDelta
         );
       } else {
         await updateTextByHandle(pdfHandle.value, objectId, savedText);
@@ -1125,6 +1216,37 @@ function rectCenterDistanceSquared(left: StructuredTextObject["bounds"], right: 
   return (leftX - rightX) ** 2 + (leftY - rightY) ** 2;
 }
 
+function editorOriginDeltaPdf() {
+  const text = selectedTextObject.value;
+  const viewport = currentViewport.value;
+  if (!text || !viewport) return { x: 0, y: 0 };
+  const geometry = inlineEditorGeometry(text);
+  if (!geometry) return { x: 0, y: 0 };
+  const offset = editorStartOffsetPx();
+  if (Math.abs(offset) <= 0.5) return { x: 0, y: 0 };
+  const from = viewportToPdf(viewport, geometry.origin.x, geometry.origin.y);
+  const to = viewportToPdf(
+    viewport,
+    geometry.origin.x + geometry.axisX.x * offset,
+    geometry.origin.y + geometry.axisX.y * offset
+  );
+  return { x: to.x - from.x, y: to.y - from.y };
+}
+
+function translatedByOriginDelta(
+  bounds: StructuredTextObject["bounds"] | null,
+  delta: { x: number; y: number }
+) {
+  if (!bounds) return null;
+  return {
+    ...bounds,
+    origin: {
+      x: bounds.origin.x + delta.x,
+      y: bounds.origin.y + delta.y
+    }
+  };
+}
+
 async function saveTextEditOnBlur() {
   if (isPreparingEdit.value || isSavingEdit.value) return;
   if (!selectedTextObject.value || !editSession.value) return;
@@ -1168,10 +1290,18 @@ async function onCanvasClick(event: MouseEvent) {
   const hitObject = findTextObjectAtPoint(pdfPoint.x, pdfPoint.y);
 
   try {
-    if (hitObject) {
+    if (editSession.value || isPreparingEdit.value) {
+      const nextObjectId = hitObject?.id !== selectedTextId.value ? hitObject?.id : null;
+      if (isPreparingEdit.value) {
+        clearSelection();
+      } else {
+        await saveTextEditOnBlur();
+      }
+      if (nextObjectId != null) {
+        await beginTextEdit(nextObjectId);
+      }
+    } else if (hitObject) {
       await beginTextEdit(hitObject.id);
-    } else if (editSession.value) {
-      await saveTextEditOnBlur();
     } else {
       clearSelection();
     }
@@ -1812,6 +1942,14 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
               title="拖拽调整编辑框宽度"
               @mousedown.prevent
               @pointerdown.prevent.stop="onEdgeDragStart($event, 'left')"
+              @click.stop
+            />
+            <div
+              class="editor-move-edge editor-move-edge-top"
+              title="拖拽移动编辑框位置"
+              @mousedown.prevent
+              @pointerdown.prevent.stop="onMoveDragStart($event)"
+              @click.stop
             />
             <div
               ref="inlineEditor"
@@ -1828,10 +1966,18 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
               @click.stop
             />
             <div
+              class="editor-move-edge editor-move-edge-bottom"
+              title="拖拽移动编辑框位置"
+              @mousedown.prevent
+              @pointerdown.prevent.stop="onMoveDragStart($event)"
+              @click.stop
+            />
+            <div
               class="editor-edge editor-edge-right"
               title="拖拽调整编辑框宽度"
               @mousedown.prevent
               @pointerdown.prevent.stop="onEdgeDragStart($event, 'right')"
+              @click.stop
             />
           </div>
         </div>

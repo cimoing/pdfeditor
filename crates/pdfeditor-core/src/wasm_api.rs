@@ -241,11 +241,7 @@ pub fn pdf_commit_text_edit_by_handle(
 /// Apply a text edit to the in-memory document without serializing the PDF bytes.
 /// Use `pdf_get_bytes_by_handle` to retrieve bytes when needed (e.g. for download).
 #[wasm_bindgen]
-pub fn pdf_update_text_by_handle(
-    handle: u32,
-    object_id: u64,
-    text: &str,
-) -> Result<(), JsValue> {
+pub fn pdf_update_text_by_handle(handle: u32, object_id: u64, text: &str) -> Result<(), JsValue> {
     DOCUMENT_STORE.with(|store| {
         let mut store = store.borrow_mut();
         let document = store
@@ -447,7 +443,19 @@ fn apply_text_edit(document: &mut LopdfDocument, edit: TextEdit) -> crate::CoreR
 fn text_runs_from_input(inputs: Vec<TextRunInput>) -> Vec<TextRun> {
     inputs
         .into_iter()
-        .map(|r| TextRun::new(r.content, r.font_name, r.font_size, Color { r: r.color[0], g: r.color[1], b: r.color[2], a: r.color[3] }))
+        .map(|r| {
+            TextRun::new(
+                r.content,
+                r.font_name,
+                r.font_size,
+                Color {
+                    r: r.color[0],
+                    g: r.color[1],
+                    b: r.color[2],
+                    a: r.color[3],
+                },
+            )
+        })
         .collect()
 }
 
@@ -538,6 +546,8 @@ pub fn pdf_update_text_runs_by_handle(
     handle: u32,
     object_id: u64,
     runs_json: &str,
+    origin_dx: f32,
+    origin_dy: f32,
 ) -> Result<(), JsValue> {
     let runs_input: Vec<TextRunInput> = serde_json::from_str(runs_json)
         .map_err(|e| JsValue::from_str(&format!("invalid runs JSON: {e}")))?;
@@ -553,7 +563,7 @@ pub fn pdf_update_text_runs_by_handle(
             .ensure_text_index_for_page(page_from_text_object_id(object_id))
             .map_err(core_error_to_js)?;
         document
-            .replace_text_object_with_runs(id, runs)
+            .replace_text_object_with_runs(id, runs, crate::Point::new(origin_dx, origin_dy))
             .map(|_| ())
             .map_err(core_error_to_js)
     })

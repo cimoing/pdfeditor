@@ -300,6 +300,30 @@ button:disabled {
   right: -5px;
 }
 
+.editor-move-edge {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  height: 8px;
+  cursor: move;
+  z-index: 2;
+  touch-action: none;
+  border-radius: 3px;
+  transition: background 0.15s;
+}
+
+.editor-move-edge:hover {
+  background: rgba(31, 111, 235, 0.18);
+}
+
+.editor-move-edge-top {
+  top: -4px;
+}
+
+.editor-move-edge-bottom {
+  bottom: -4px;
+}
+
 .inline-run-toolbar {
   position: absolute;
   bottom: 100%;
