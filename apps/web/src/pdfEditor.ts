@@ -176,10 +176,10 @@ export interface TextLayoutPreview {
 export interface TextTypography {
   replace_spaces_with_displacements: boolean;
   digit_font_name?: string | null;
-  compress_multi_punctuation: boolean;
+  compress_punctuation: boolean;
   detected_tj_displacements: boolean;
   detected_space_displacements: boolean;
-  detected_multi_punctuation: boolean;
+  detected_punctuation: boolean;
   detected_digit_font_name?: string | null;
 }
 
@@ -577,10 +577,10 @@ export function normalizeTextTypography(typography?: Partial<TextTypography> | n
   return {
     replace_spaces_with_displacements: Boolean(typography?.replace_spaces_with_displacements),
     digit_font_name: typography?.digit_font_name ?? null,
-    compress_multi_punctuation: Boolean(typography?.compress_multi_punctuation),
+    compress_punctuation: Boolean(typography?.compress_punctuation),
     detected_tj_displacements: Boolean(typography?.detected_tj_displacements),
     detected_space_displacements: Boolean(typography?.detected_space_displacements),
-    detected_multi_punctuation: Boolean(typography?.detected_multi_punctuation),
+    detected_punctuation: Boolean(typography?.detected_punctuation),
     detected_digit_font_name: typography?.detected_digit_font_name ?? null
   };
 }

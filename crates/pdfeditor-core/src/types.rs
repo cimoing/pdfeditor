@@ -304,20 +304,21 @@ pub struct TextTypography {
     /// Optional font resource name to use for ASCII digits during save.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digit_font_name: Option<String>,
-    /// Prefer compacting adjacent CJK/fullwidth punctuation with `TJ`
-    /// displacements during save.
+    /// Prefer compacting CJK/fullwidth punctuation with `TJ` displacements
+    /// during save.  This can apply even when the text contains only one
+    /// punctuation mark.
     #[serde(default)]
-    pub compress_multi_punctuation: bool,
+    pub compress_punctuation: bool,
     /// Original PDF operation used `TJ` numeric adjustments.
     #[serde(default)]
     pub detected_tj_displacements: bool,
     /// Original PDF had `TJ` adjustments that look like visual spaces.
     #[serde(default)]
     pub detected_space_displacements: bool,
-    /// Original text contains adjacent punctuation that can benefit from
-    /// punctuation compression.
+    /// Original text contains punctuation that can benefit from punctuation
+    /// compression.
     #[serde(default)]
-    pub detected_multi_punctuation: bool,
+    pub detected_punctuation: bool,
     /// Original extracted runs used a different font for ASCII digits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_digit_font_name: Option<String>,
@@ -328,10 +329,10 @@ impl Default for TextTypography {
         Self {
             replace_spaces_with_displacements: false,
             digit_font_name: None,
-            compress_multi_punctuation: false,
+            compress_punctuation: false,
             detected_tj_displacements: false,
             detected_space_displacements: false,
-            detected_multi_punctuation: false,
+            detected_punctuation: false,
             detected_digit_font_name: None,
         }
     }

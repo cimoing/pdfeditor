@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import type { RichTextRun, TextTypography } from "../pdfEditor";
+import type { RichTextRun } from "../pdfEditor";
 
 export interface FontOption {
   resource_name: string;
@@ -13,13 +13,11 @@ const props = defineProps<{
   baseFontName: string | null;
   baseFontSize: number;
   baseColor: { r: number; g: number; b: number; a: number };
-  typography: TextTypography;
   disabled?: boolean;
 }>();
 
 const emit = defineEmits<{
   "update:runs": [runs: RichTextRun[]];
-  "update:typography": [typography: TextTypography];
   interact: [];
 }>();
 
@@ -55,10 +53,6 @@ function moveRun(id: string, delta: -1 | 1) {
   if (swapIdx < 0 || swapIdx >= next.length) return;
   [next[idx], next[swapIdx]] = [next[swapIdx], next[idx]];
   emit("update:runs", next);
-}
-
-function updateTypography(patch: Partial<TextTypography>) {
-  emit("update:typography", { ...props.typography, ...patch });
 }
 
 function beginPanelInteraction() {
@@ -155,50 +149,6 @@ const fontOptions = computed(() => [
     </div>
 
     <button class="add-run-btn" :disabled="disabled" @click="addRun">+ 添加文字段</button>
-
-    <div class="typography-controls">
-      <label class="typography-toggle">
-        <input
-          type="checkbox"
-          :checked="typography.replace_spaces_with_displacements"
-          :disabled="disabled"
-          @change="updateTypography({ replace_spaces_with_displacements: ($event.target as HTMLInputElement).checked })"
-        />
-        <span>空格写为 TJ 位移</span>
-      </label>
-      <label class="typography-toggle">
-        <input
-          type="checkbox"
-          :checked="typography.compress_multi_punctuation"
-          :disabled="disabled"
-          @change="updateTypography({ compress_multi_punctuation: ($event.target as HTMLInputElement).checked })"
-        />
-        <span>多标点压缩识别</span>
-      </label>
-      <label class="typography-field">
-        <span>数字字体</span>
-        <select
-          :value="typography.digit_font_name ?? ''"
-          :disabled="disabled"
-          @change="updateTypography({ digit_font_name: ($event.target as HTMLSelectElement).value || null })"
-        >
-          <option value="">（继承）</option>
-          <option
-            v-for="font in props.fontAssets"
-            :key="`digit-${font.resource_name}`"
-            :value="font.resource_name"
-          >{{ font.family_name }}</option>
-        </select>
-      </label>
-      <div class="typography-detected" v-if="typography.detected_tj_displacements || typography.detected_space_displacements || typography.detected_multi_punctuation || typography.detected_digit_font_name">
-        识别：{{ [
-          typography.detected_tj_displacements ? "TJ 位移" : "",
-          typography.detected_space_displacements ? "位移空格" : "",
-          typography.detected_multi_punctuation ? "多标点" : "",
-          typography.detected_digit_font_name ? "数字字体" : ""
-        ].filter(Boolean).join(" / ") }}
-      </div>
-    </div>
   </div>
 </template>
 
@@ -327,36 +277,4 @@ const fontOptions = computed(() => [
   cursor: not-allowed;
 }
 
-.typography-controls {
-  display: grid;
-  gap: 8px;
-  padding-top: 8px;
-  border-top: 1px solid #e4e7ec;
-  font-size: 12px;
-}
-
-.typography-toggle {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: #344054;
-}
-
-.typography-field {
-  display: grid;
-  gap: 4px;
-  color: #344054;
-}
-
-.typography-field select {
-  width: 100%;
-  border: 1px solid #b9c3cd;
-  background: #fff;
-  padding: 6px 8px;
-  font-size: 12px;
-}
-
-.typography-detected {
-  color: #667085;
-}
 </style>

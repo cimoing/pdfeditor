@@ -1219,7 +1219,7 @@ impl EngineDocument for LopdfDocument {
         let mut current_font_key: Option<(String, u32)> = None; // (name, size*1000)
         let mut first_tj_in_replacement: Option<usize> = None;
         let use_tj_typography = typography.replace_spaces_with_displacements
-            || typography.compress_multi_punctuation
+            || typography.compress_punctuation
             || typography.digit_font_name.is_some();
 
         // Reset char/word spacing so runs flow cleanly.
@@ -1239,7 +1239,7 @@ impl EngineDocument for LopdfDocument {
             let chars = run.content.chars().collect::<Vec<_>>();
             let mut tj_segment: Option<TjSegmentBuilder> = None;
 
-            for (char_index, ch) in chars.iter().copied().enumerate() {
+            for ch in chars.iter().copied() {
                 let char_str = ch.to_string();
                 let preferred_font_name = if ch.is_ascii_digit() {
                     typography
@@ -1319,16 +1319,12 @@ impl EngineDocument for LopdfDocument {
                         cursor_pts += advance * run_font_size;
                         continue;
                     }
-                    if typography.compress_multi_punctuation
-                        && char_index > 0
-                        && is_compressible_punctuation(chars[char_index - 1])
-                        && is_compressible_punctuation(ch)
-                    {
-                        let adjustment = multi_punctuation_adjustment();
+                    segment.items.push(char_obj);
+                    if typography.compress_punctuation && is_trailing_space_punctuation(ch) {
+                        let adjustment = punctuation_compression_adjustment(advance);
                         segment.adjust_by(adjustment * 1000.0);
                         cursor_pts -= adjustment * run_font_size;
                     }
-                    segment.items.push(char_obj);
                 } else {
                     if current_font_key.as_ref() != Some(&effective_font_key) {
                         replacement_ops
@@ -5418,9 +5414,9 @@ fn merge_text_group_objects(
     fix_scatter_glyph_advances(&mut glyphs, group.font_size);
     let bounds = glyph_bounds(&glyphs).unwrap_or(group.bounds);
     let mut typography = merge_text_typography(members, group.font_name.as_deref());
-    if has_adjacent_compressible_punctuation(&content) {
-        typography.detected_multi_punctuation = true;
-        typography.compress_multi_punctuation = true;
+    if has_compressible_punctuation(&content) {
+        typography.detected_punctuation = true;
+        typography.compress_punctuation = true;
     }
 
     StructuredTextObject {
@@ -5977,23 +5973,22 @@ fn operation_text_with_typography(
                     typography.detected_space_displacements = true;
                     typography.replace_spaces_with_displacements = true;
                 } else if adjustment > 0.0
-                    && text.chars().last().is_some_and(is_compressible_punctuation)
-                    && next_text
-                        .as_deref()
-                        .and_then(|part| part.chars().next())
-                        .is_some_and(is_compressible_punctuation)
+                    && text
+                        .chars()
+                        .last()
+                        .is_some_and(is_trailing_space_punctuation)
                 {
-                    typography.detected_multi_punctuation = true;
-                    typography.compress_multi_punctuation = true;
+                    typography.detected_punctuation = true;
+                    typography.compress_punctuation = true;
                 }
             }
             text
         }
         _ => return None,
     };
-    if has_adjacent_compressible_punctuation(&text) {
-        typography.detected_multi_punctuation = true;
-        typography.compress_multi_punctuation = true;
+    if has_compressible_punctuation(&text) {
+        typography.detected_punctuation = true;
+        typography.compress_punctuation = true;
     }
     Some((text, typography))
 }
@@ -6159,11 +6154,11 @@ fn text_matrix_op(matrix: [f32; 6]) -> Operation {
     )
 }
 
-fn multi_punctuation_adjustment() -> f32 {
-    0.5
+fn punctuation_compression_adjustment(advance: f32) -> f32 {
+    (advance.max(0.0) * 0.5).min(0.5)
 }
 
-fn is_compressible_punctuation(ch: char) -> bool {
+fn is_trailing_space_punctuation(ch: char) -> bool {
     matches!(
         ch,
         '，' | '。'
@@ -6172,13 +6167,9 @@ fn is_compressible_punctuation(ch: char) -> bool {
             | '；'
             | '！'
             | '？'
-            | '（'
             | '）'
-            | '「'
             | '」'
-            | '『'
             | '』'
-            | '《'
             | '》'
             | '…'
             | '—'
@@ -6191,15 +6182,8 @@ fn is_compressible_punctuation(ch: char) -> bool {
     )
 }
 
-fn has_adjacent_compressible_punctuation(text: &str) -> bool {
-    let mut previous = None;
-    for ch in text.chars() {
-        if previous.is_some_and(is_compressible_punctuation) && is_compressible_punctuation(ch) {
-            return true;
-        }
-        previous = Some(ch);
-    }
-    false
+fn has_compressible_punctuation(text: &str) -> bool {
+    text.chars().any(is_trailing_space_punctuation)
 }
 
 fn merge_text_typography(
@@ -6211,10 +6195,10 @@ fn merge_text_typography(
         let member_typography = &member.typography;
         typography.detected_tj_displacements |= member_typography.detected_tj_displacements;
         typography.detected_space_displacements |= member_typography.detected_space_displacements;
-        typography.detected_multi_punctuation |= member_typography.detected_multi_punctuation;
+        typography.detected_punctuation |= member_typography.detected_punctuation;
         typography.replace_spaces_with_displacements |=
             member_typography.replace_spaces_with_displacements;
-        typography.compress_multi_punctuation |= member_typography.compress_multi_punctuation;
+        typography.compress_punctuation |= member_typography.compress_punctuation;
         if typography.digit_font_name.is_none() {
             typography.digit_font_name = member_typography.digit_font_name.clone();
         }

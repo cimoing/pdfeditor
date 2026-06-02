@@ -116,10 +116,10 @@ function defaultTextTypography(): TextTypography {
   return {
     replace_spaces_with_displacements: false,
     digit_font_name: null,
-    compress_multi_punctuation: false,
+    compress_punctuation: false,
     detected_tj_displacements: false,
     detected_space_displacements: false,
-    detected_multi_punctuation: false,
+    detected_punctuation: false,
     detected_digit_font_name: null
   };
 }
@@ -1055,10 +1055,11 @@ function onInlineEditorInput() {
   }, 120);
 }
 
-function onDraftTypographyUpdate(next: TextTypography) {
-  draftTypography.value = next;
+function onToolbarTypographyChange(patch: Partial<TextTypography>) {
+  draftTypography.value = { ...draftTypography.value, ...patch };
   onDraftInput();
-  finishEditorPanelInteraction();
+  isToolbarInteracting.value = false;
+  void nextTick(() => inlineEditor.value?.focus({ preventScroll: true }));
 }
 
 function onInlineEditorSelectionChange() {
@@ -1827,10 +1828,8 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
           :base-font-name="editSession?.font_id ?? selectedTextObject.font_name ?? null"
           :base-font-size="editSession?.font_size ?? selectedTextObject.font_size"
           :base-color="selectedTextObject.color"
-          :typography="draftTypography"
           :disabled="isPreparingEdit || isSavingEdit"
           @update:runs="(newRuns) => { draftRuns = newRuns; onDraftInput(); }"
-          @update:typography="onDraftTypographyUpdate"
           @interact="onEditorPanelInteraction"
         />
         <p class="helper-text" :class="{ danger: hasEffectiveOverflow }">
@@ -2094,6 +2093,55 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
               <span class="toolbar-run-label" v-if="draftRuns.length > 1">
                 段 {{ (draftRuns.findIndex(r => r.id === (activeRunId ?? draftRuns[0]?.id)) + 1) }} / {{ draftRuns.length }}
               </span>
+              <span class="toolbar-separator" aria-hidden="true"></span>
+              <label class="toolbar-toggle" title="保存时将普通空格写为 TJ 数字位移">
+                <input
+                  type="checkbox"
+                  :checked="draftTypography.replace_spaces_with_displacements"
+                  :disabled="isPreparingEdit || isSavingEdit"
+                  @mousedown="onToolbarMousedown"
+                  @change="onToolbarTypographyChange({ replace_spaces_with_displacements: ($event.target as HTMLInputElement).checked })"
+                  @blur="onToolbarControlBlur($event)"
+                />
+                <span>TJ 空格</span>
+              </label>
+              <label class="toolbar-toggle" title="保存时对单个或多个标点使用 TJ 位移压缩">
+                <input
+                  type="checkbox"
+                  :checked="draftTypography.compress_punctuation"
+                  :disabled="isPreparingEdit || isSavingEdit"
+                  @mousedown="onToolbarMousedown"
+                  @change="onToolbarTypographyChange({ compress_punctuation: ($event.target as HTMLInputElement).checked })"
+                  @blur="onToolbarControlBlur($event)"
+                />
+                <span>标点压缩</span>
+              </label>
+              <select
+                class="toolbar-digit-font-select"
+                :value="draftTypography.digit_font_name ?? ''"
+                :disabled="isPreparingEdit || isSavingEdit"
+                title="数字字体"
+                @mousedown="onToolbarMousedown"
+                @change="onToolbarTypographyChange({ digit_font_name: ($event.target as HTMLSelectElement).value || null })"
+                @blur="onToolbarControlBlur($event)"
+              >
+                <option value="">数字继承</option>
+                <option
+                  v-for="font in allFontOptions"
+                  :key="`toolbar-digit-${font.resource_name}`"
+                  :value="font.resource_name"
+                >{{ font.family_name }}</option>
+              </select>
+              <span
+                class="toolbar-run-label"
+                v-if="draftTypography.detected_tj_displacements || draftTypography.detected_space_displacements || draftTypography.detected_punctuation || draftTypography.detected_digit_font_name"
+                :title="[
+                  draftTypography.detected_tj_displacements ? 'TJ 位移' : '',
+                  draftTypography.detected_space_displacements ? '位移空格' : '',
+                  draftTypography.detected_punctuation ? '标点压缩' : '',
+                  draftTypography.detected_digit_font_name ? '数字字体' : ''
+                ].filter(Boolean).join(' / ')"
+              >已识别</span>
             </div>
 
             <div
