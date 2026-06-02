@@ -35,5 +35,5 @@ pub use types::{
     BookmarkItem, Color, HitTestResult, ImageObject, ImageObjectId, LayoutGlyph, PageIndex,
     PageInfo, PageStructure, PdfObjectId, Point, Rect, RenderedPage, Size, StructuredAnnotation,
     StructuredImageObject, StructuredTextObject, StructuredVisualTextObject, StructuredWatermark,
-    TextEditSessionInfo, TextLayoutPreview, TextObject, TextObjectId, TextRun,
+    TextEditSessionInfo, TextLayoutPreview, TextObject, TextObjectId, TextRun, TextTypography,
 };

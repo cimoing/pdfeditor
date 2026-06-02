@@ -192,6 +192,8 @@ pub struct StructuredTextObject {
     /// clipped to.  Absent when no explicit clip was set on the text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip_bounds: Option<Rect>,
+    #[serde(default)]
+    pub typography: TextTypography,
 }
 
 const fn default_stroke_color() -> Color {
@@ -275,6 +277,8 @@ pub struct TextEditSessionInfo {
     pub font_size: f32,
     pub writing_mode: Option<String>,
     pub glyphs: Vec<LayoutGlyph>,
+    #[serde(default)]
+    pub typography: TextTypography,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -286,6 +290,51 @@ pub struct TextLayoutPreview {
     pub glyphs: Vec<LayoutGlyph>,
     pub bbox: Rect,
     pub overflow: bool,
+    #[serde(default)]
+    pub typography: TextTypography,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct TextTypography {
+    /// Prefer writing normal spaces as `TJ` numeric displacements instead of
+    /// a literal space glyph.  Useful for PDFs whose original layout encoded
+    /// visual spaces through text-showing adjustments.
+    #[serde(default)]
+    pub replace_spaces_with_displacements: bool,
+    /// Optional font resource name to use for ASCII digits during save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digit_font_name: Option<String>,
+    /// Prefer compacting adjacent CJK/fullwidth punctuation with `TJ`
+    /// displacements during save.
+    #[serde(default)]
+    pub compress_multi_punctuation: bool,
+    /// Original PDF operation used `TJ` numeric adjustments.
+    #[serde(default)]
+    pub detected_tj_displacements: bool,
+    /// Original PDF had `TJ` adjustments that look like visual spaces.
+    #[serde(default)]
+    pub detected_space_displacements: bool,
+    /// Original text contains adjacent punctuation that can benefit from
+    /// punctuation compression.
+    #[serde(default)]
+    pub detected_multi_punctuation: bool,
+    /// Original extracted runs used a different font for ASCII digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_digit_font_name: Option<String>,
+}
+
+impl Default for TextTypography {
+    fn default() -> Self {
+        Self {
+            replace_spaces_with_displacements: false,
+            digit_font_name: None,
+            compress_multi_punctuation: false,
+            detected_tj_displacements: false,
+            detected_space_displacements: false,
+            detected_multi_punctuation: false,
+            detected_digit_font_name: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

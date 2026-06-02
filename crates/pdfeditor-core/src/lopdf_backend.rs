@@ -7,7 +7,7 @@ use crate::{
     ImageObjectId, LayoutGlyph, PageIndex, PageInfo, PageStructure, PdfEngine, PdfObjectId, Point,
     Rect, RenderedPage, Size, StructuredAnnotation, StructuredImageObject, StructuredTextObject,
     StructuredVisualTextObject, StructuredWatermark, TextEditSessionInfo, TextLayoutPreview,
-    TextObject, TextObjectId, TextRun, TextStyle,
+    TextObject, TextObjectId, TextRun, TextStyle, TextTypography,
 };
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, StringFormat};
@@ -1102,10 +1102,12 @@ impl EngineDocument for LopdfDocument {
         runs: Vec<TextRun>,
         origin_delta: Point,
         clip_bounds: Option<Rect>,
+        typography: TextTypography,
     ) -> CoreResult<TextObject> {
         let edit_group = self.text_edit_group(id)?;
         let page_id = self.page_id(edit_group.page)?;
         let runs = self.resolve_builtin_run_fonts(page_id, runs)?;
+        let typography = self.resolve_typography_fonts(page_id, typography, &runs)?;
         let font_maps = self.page_font_maps(page_id);
         let font_metrics = self.page_font_metrics(page_id);
         let content_bytes = self.document.get_page_content(page_id).map_err(|err| {
@@ -1175,12 +1177,17 @@ impl EngineDocument for LopdfDocument {
                 .as_deref()
                 .or(orig_font_name.as_deref())
                 .unwrap_or("F0");
-            let fmap = font_maps.get(fname);
-            cjk_fallback_chars.extend(
-                run.content
-                    .chars()
-                    .filter(|ch| fmap.and_then(|m| m.encode(&ch.to_string())).is_none()),
-            );
+            cjk_fallback_chars.extend(run.content.chars().filter(|ch| {
+                let effective_font_name = if ch.is_ascii_digit() {
+                    typography.digit_font_name.as_deref().unwrap_or(fname)
+                } else {
+                    fname
+                };
+                font_maps
+                    .get(effective_font_name)
+                    .and_then(|m| m.encode(&ch.to_string()))
+                    .is_none()
+            }));
         }
         let fallback_font_name: Option<String> = if !cjk_fallback_chars.is_empty() {
             Some(self.ensure_page_cjk_fallback_font(page_id, &cjk_fallback_chars)?)
@@ -1191,13 +1198,18 @@ impl EngineDocument for LopdfDocument {
         let cjk_u2g: Option<&std::collections::HashMap<char, u16>> =
             self.cjk_font.as_ref().map(|f| &f.unicode_to_gid);
 
-        // Build replacement operations: per-char Tm+Tj, one Tf per font/size change.
+        // Build replacement operations.  The default path keeps the existing
+        // per-character absolute Tm+Tj behavior.  When typography options need
+        // PDF text-showing adjustments, consecutive same-font chars are emitted
+        // as TJ arrays so spaces and punctuation compression are represented in
+        // the PDF content stream itself.
         let mut replacement_ops: Vec<Operation> = Vec::new();
         let mut cursor_pts = 0.0f32; // accumulated advance in pre-matrix units
-        let mut prev_font_key: Option<(String, u32)> = None; // (name, size*1000)
+        let mut current_font_key: Option<(String, u32)> = None; // (name, size*1000)
         let mut first_tj_in_replacement: Option<usize> = None;
-        // Track whether the last emitted Tf pointed at the CJK fallback font.
-        let mut current_on_fallback = false;
+        let use_tj_typography = typography.replace_spaces_with_displacements
+            || typography.compress_multi_punctuation
+            || typography.digit_font_name.is_some();
 
         // Reset char/word spacing so runs flow cleanly.
         replacement_ops.push(Operation::new("Tc", vec![Object::Integer(0)]));
@@ -1213,49 +1225,39 @@ impl EngineDocument for LopdfDocument {
                 .or(orig_font_name.as_deref())
                 .unwrap_or("F0");
             let run_font_size = run.font_size;
-            let font_key = (run_font_name.to_string(), (run_font_size * 1000.0) as u32);
+            let chars = run.content.chars().collect::<Vec<_>>();
+            let mut tj_segment: Option<TjSegmentBuilder> = None;
 
-            // Emit Tf at run boundary only when not currently on the fallback font
-            // (the per-char loop will emit its own Tf when switching to/from fallback).
-            if !current_on_fallback && prev_font_key.as_ref() != Some(&font_key) {
-                replacement_ops.push(font_set_operation(run_font_name, run_font_size));
-                prev_font_key = Some(font_key.clone());
-            }
-
-            let run_font_map = font_maps.get(run_font_name);
-            let run_metrics = font_metrics.get(run_font_name);
-
-            for ch in run.content.chars() {
+            for (char_index, ch) in chars.iter().copied().enumerate() {
                 let char_str = ch.to_string();
+                let preferred_font_name = if ch.is_ascii_digit() {
+                    typography
+                        .digit_font_name
+                        .as_deref()
+                        .unwrap_or(run_font_name)
+                } else {
+                    run_font_name
+                };
+                let preferred_font_map = font_maps.get(preferred_font_name);
+                let preferred_metrics = font_metrics.get(preferred_font_name);
 
-                // Try to encode with the run's font; fall back to the CJK fallback font.
-                let encoded = run_font_map.and_then(|fm| fm.encode(&char_str));
+                // Try to encode with the preferred font; fall back to the CJK fallback font.
+                let encoded = preferred_font_map.and_then(|fm| fm.encode(&char_str));
                 let char_needs_fallback = encoded.is_none();
-
-                // Switch fonts at the PDF level if the fallback requirement changed.
-                if char_needs_fallback && !current_on_fallback {
-                    let fb = fallback_font_name.as_deref().unwrap_or("F0");
-                    replacement_ops.push(font_set_operation(fb, run_font_size));
-                    current_on_fallback = true;
-                } else if !char_needs_fallback && current_on_fallback {
-                    replacement_ops.push(font_set_operation(run_font_name, run_font_size));
-                    prev_font_key = Some(font_key.clone());
-                    current_on_fallback = false;
-                }
-
-                // Absolute Tm for this character using the anchor matrix + accumulated offset.
-                let char_tm = multiply_matrix(anchor_tm, [1.0, 0.0, 0.0, 1.0, cursor_pts, 0.0]);
-                replacement_ops.push(Operation::new(
-                    "Tm",
-                    vec![
-                        Object::Real(char_tm[0]),
-                        Object::Real(char_tm[1]),
-                        Object::Real(char_tm[2]),
-                        Object::Real(char_tm[3]),
-                        Object::Real(char_tm[4]),
-                        Object::Real(char_tm[5]),
-                    ],
-                ));
+                let effective_font_name = if char_needs_fallback {
+                    fallback_font_name.as_deref().unwrap_or("F0")
+                } else {
+                    preferred_font_name
+                };
+                let effective_font_key = (
+                    effective_font_name.to_string(),
+                    (run_font_size * 1000.0) as u32,
+                );
+                let effective_metrics = if char_needs_fallback {
+                    None
+                } else {
+                    preferred_metrics
+                };
 
                 // Always use Hexadecimal format — Literal strings require careful escaping of
                 // bytes like 0x28 '(' and 0x29 ')' which would corrupt the content stream.
@@ -1265,32 +1267,82 @@ impl EngineDocument for LopdfDocument {
                     Object::String(encoded.unwrap(), StringFormat::Hexadecimal)
                 };
 
-                let tj_idx = replacement_ops.len();
-                if first_tj_in_replacement.is_none() {
-                    first_tj_in_replacement = Some(tj_idx);
-                }
-                replacement_ops.push(Operation::new("Tj", vec![char_obj]));
-
                 // Advance the cursor by this glyph's advance in pre-matrix units.
                 let advance = if char_needs_fallback {
                     fallback_char_advance(ch) * (anchor_state.horizontal_scaling / 100.0)
                 } else {
-                    let enc = run_font_map.and_then(|fm| fm.encode(&char_str));
+                    let enc = preferred_font_map.and_then(|fm| fm.encode(&char_str));
                     enc.as_deref()
-                        .and_then(|bytes| run_metrics.map(|m| m.text_advance(bytes, &anchor_state)))
+                        .and_then(|bytes| {
+                            effective_metrics.map(|m| m.text_advance(bytes, &anchor_state))
+                        })
                         .unwrap_or_else(|| {
                             fallback_char_advance(ch) * (anchor_state.horizontal_scaling / 100.0)
                         })
                 };
+
+                if use_tj_typography {
+                    if tj_segment
+                        .as_ref()
+                        .is_some_and(|segment| segment.font_key != effective_font_key)
+                    {
+                        flush_tj_segment(
+                            &mut replacement_ops,
+                            &mut first_tj_in_replacement,
+                            anchor_tm,
+                            &mut current_font_key,
+                            tj_segment.take(),
+                        );
+                    }
+                    if tj_segment.is_none() {
+                        tj_segment = Some(TjSegmentBuilder::new(
+                            effective_font_key.clone(),
+                            effective_font_name.to_string(),
+                            run_font_size,
+                            cursor_pts,
+                        ));
+                    }
+                    let segment = tj_segment.as_mut().expect("TJ segment exists");
+                    if typography.replace_spaces_with_displacements && ch == ' ' {
+                        segment.adjust_by(-advance * 1000.0);
+                        cursor_pts += advance * run_font_size;
+                        continue;
+                    }
+                    if typography.compress_multi_punctuation
+                        && char_index > 0
+                        && is_compressible_punctuation(chars[char_index - 1])
+                        && is_compressible_punctuation(ch)
+                    {
+                        let adjustment = multi_punctuation_adjustment();
+                        segment.adjust_by(adjustment * 1000.0);
+                        cursor_pts -= adjustment * run_font_size;
+                    }
+                    segment.items.push(char_obj);
+                } else {
+                    if current_font_key.as_ref() != Some(&effective_font_key) {
+                        replacement_ops
+                            .push(font_set_operation(effective_font_name, run_font_size));
+                        current_font_key = Some(effective_font_key);
+                    }
+                    // Absolute Tm for this character using the anchor matrix + accumulated offset.
+                    push_text_matrix_at(&mut replacement_ops, anchor_tm, cursor_pts);
+                    let tj_idx = replacement_ops.len();
+                    if first_tj_in_replacement.is_none() {
+                        first_tj_in_replacement = Some(tj_idx);
+                    }
+                    replacement_ops.push(Operation::new("Tj", vec![char_obj]));
+                }
+
                 cursor_pts += advance * run_font_size;
             }
 
-            // If the run ended on the fallback font, restore the run's own font for the next run.
-            if current_on_fallback {
-                replacement_ops.push(font_set_operation(run_font_name, run_font_size));
-                prev_font_key = Some(font_key);
-                current_on_fallback = false;
-            }
+            flush_tj_segment(
+                &mut replacement_ops,
+                &mut first_tj_in_replacement,
+                anchor_tm,
+                &mut current_font_key,
+                tj_segment,
+            );
         }
 
         // Restore original font and spacing after all runs.
@@ -1475,6 +1527,30 @@ impl LopdfDocument {
             resolved.push(run);
         }
         Ok(resolved)
+    }
+
+    fn resolve_typography_fonts(
+        &mut self,
+        page_id: ObjectId,
+        mut typography: TextTypography,
+        runs: &[TextRun],
+    ) -> CoreResult<TextTypography> {
+        let Some(font_name) = typography.digit_font_name.clone() else {
+            return Ok(typography);
+        };
+        if let Some(font) = BuiltinPdfFont::from_sentinel(&font_name) {
+            typography.digit_font_name = Some(self.ensure_page_builtin_font(page_id, font)?);
+            return Ok(typography);
+        }
+        if let Some(key) = local_font_key_from_resource(&font_name) {
+            let chars = runs
+                .iter()
+                .flat_map(|run| run.content.chars())
+                .filter(|ch| ch.is_ascii_digit())
+                .collect::<BTreeSet<_>>();
+            typography.digit_font_name = Some(self.ensure_page_local_font(page_id, key, &chars)?);
+        }
+        Ok(typography)
     }
 
     fn ensure_page_builtin_font(
@@ -1925,6 +2001,7 @@ impl LopdfDocument {
             font_size: context.object.font_size,
             writing_mode: Some("horizontal".to_string()),
             glyphs,
+            typography: context.object.typography,
         })
     }
 
@@ -1947,6 +2024,7 @@ impl LopdfDocument {
             glyphs,
             bbox,
             overflow,
+            typography: context.object.typography,
         })
     }
 
@@ -2074,7 +2152,9 @@ impl LopdfDocument {
                 .font_name
                 .as_ref()
                 .and_then(|name| font_maps.get(name));
-            if let Some(text) = operation_text(operation, font_map) {
+            if let Some((text, _typography)) =
+                operation_text_with_typography(operation, font_map, None, &state)
+            {
                 if text.is_empty() {
                     continue;
                 }
@@ -2555,7 +2635,9 @@ impl LopdfDocument {
                 .font_name
                 .as_ref()
                 .is_some_and(|_| !state.text.is_svg_safe());
-            if let Some(text) = operation_text(operation, font_map) {
+            if let Some((text, typography)) =
+                operation_text_with_typography(operation, font_map, metrics, &state.text)
+            {
                 if text.is_empty() {
                     advance_page_text_state(&mut state, operation, metrics);
                     continue;
@@ -2592,6 +2674,7 @@ impl LopdfDocument {
                         punct_width_squeeze: false,
                         font_features: Vec::new(),
                         clip_bounds: None,
+                        typography: typography.clone(),
                         runs: Vec::new(),
                     },
                     state: state.text.clone(),
@@ -2650,6 +2733,7 @@ impl LopdfDocument {
                     punct_width_squeeze,
                     font_features,
                     clip_bounds: active_clip,
+                    typography,
                     runs: vec![TextRun::new(
                         text,
                         state.text.font_name.clone(),
@@ -5303,6 +5387,7 @@ fn merge_text_group_objects(
         punct_width_squeeze: false,
         font_features: Vec::new(),
         clip_bounds: None,
+        typography: TextTypography::default(),
         runs: Vec::new(),
     });
     let content = members
@@ -5315,6 +5400,12 @@ fn merge_text_group_objects(
         .collect::<Vec<_>>();
     fix_scatter_glyph_advances(&mut glyphs, group.font_size);
     let bounds = glyph_bounds(&glyphs).unwrap_or(group.bounds);
+    let mut typography = merge_text_typography(members, group.font_name.as_deref());
+    if has_adjacent_compressible_punctuation(&content) {
+        typography.detected_multi_punctuation = true;
+        typography.compress_multi_punctuation = true;
+    }
+
     StructuredTextObject {
         id: primary.id,
         bounds,
@@ -5345,6 +5436,7 @@ fn merge_text_group_objects(
         // All members of a group share the same surrounding clip (if any); take it from
         // the primary member.
         clip_bounds: primary.clip_bounds,
+        typography,
         runs: members
             .iter()
             .flat_map(|member| member.runs.iter().cloned())
@@ -5817,6 +5909,78 @@ fn operation_text(operation: &Operation, font_map: Option<&ToUnicodeMap>) -> Opt
     }
 }
 
+fn operation_text_with_typography(
+    operation: &Operation,
+    font_map: Option<&ToUnicodeMap>,
+    metrics: Option<&FontMetrics>,
+    state: &TextParseState,
+) -> Option<(String, TextTypography)> {
+    let mut typography = TextTypography::default();
+    let text = match operation.operator.as_str() {
+        "Tj" | "'" | "\"" => operation
+            .operands
+            .last()
+            .and_then(|object| object_text(object, font_map))?,
+        "TJ" => {
+            let array = operation.operands.first()?.as_array().ok()?;
+            let mut text = String::new();
+            let space_advance = metrics
+                .and_then(|m| {
+                    font_map
+                        .and_then(|map| map.encode(" "))
+                        .as_deref()
+                        .map(|bytes| m.text_advance(bytes, state))
+                })
+                .unwrap_or_else(|| fallback_char_advance(' '));
+            for (index, item) in array.iter().enumerate() {
+                if let Some(part) = object_text(item, font_map) {
+                    text.push_str(&part);
+                    continue;
+                }
+                let Some(adjustment) = object_to_f32(item) else {
+                    continue;
+                };
+                if adjustment.abs() > 0.01 {
+                    typography.detected_tj_displacements = true;
+                }
+                let next_text = array[index + 1..]
+                    .iter()
+                    .find_map(|next| object_text(next, font_map));
+                if adjustment < 0.0
+                    && (-adjustment / 1000.0) >= space_advance.max(0.01) * 0.6
+                    && !text.chars().last().is_some_and(char::is_whitespace)
+                    && !next_text
+                        .as_deref()
+                        .is_some_and(|part| part.chars().next().is_some_and(char::is_whitespace))
+                {
+                    let count = ((-adjustment / 1000.0) / space_advance.max(0.01))
+                        .round()
+                        .clamp(1.0, 16.0) as usize;
+                    text.extend(std::iter::repeat(' ').take(count));
+                    typography.detected_space_displacements = true;
+                    typography.replace_spaces_with_displacements = true;
+                } else if adjustment > 0.0
+                    && text.chars().last().is_some_and(is_compressible_punctuation)
+                    && next_text
+                        .as_deref()
+                        .and_then(|part| part.chars().next())
+                        .is_some_and(is_compressible_punctuation)
+                {
+                    typography.detected_multi_punctuation = true;
+                    typography.compress_multi_punctuation = true;
+                }
+            }
+            text
+        }
+        _ => return None,
+    };
+    if has_adjacent_compressible_punctuation(&text) {
+        typography.detected_multi_punctuation = true;
+        typography.compress_multi_punctuation = true;
+    }
+    Some((text, typography))
+}
+
 fn operation_text_bytes(operation: &Operation) -> Option<Vec<u8>> {
     match operation.operator.as_str() {
         "Tj" | "'" | "\"" => operation
@@ -5895,6 +6059,162 @@ fn font_set_operation(font_name: &str, font_size: f32) -> Operation {
             Object::Real(font_size),
         ],
     )
+}
+
+#[derive(Debug)]
+struct TjSegmentBuilder {
+    font_key: (String, u32),
+    font_name: String,
+    font_size: f32,
+    start_cursor_pts: f32,
+    items: Vec<Object>,
+}
+
+impl TjSegmentBuilder {
+    fn new(
+        font_key: (String, u32),
+        font_name: String,
+        font_size: f32,
+        start_cursor_pts: f32,
+    ) -> Self {
+        Self {
+            font_key,
+            font_name,
+            font_size,
+            start_cursor_pts,
+            items: Vec::new(),
+        }
+    }
+
+    fn adjust_by(&mut self, adjustment: f32) {
+        if let Some(last) = self.items.last_mut() {
+            if let Some(current) = object_to_f32(last) {
+                *last = Object::Real(round_pdf_value(current + adjustment));
+                return;
+            }
+        }
+        self.items.push(Object::Real(round_pdf_value(adjustment)));
+    }
+}
+
+fn flush_tj_segment(
+    out: &mut Vec<Operation>,
+    first_tj: &mut Option<usize>,
+    anchor_tm: [f32; 6],
+    current_font_key: &mut Option<(String, u32)>,
+    segment: Option<TjSegmentBuilder>,
+) {
+    let Some(segment) = segment else {
+        return;
+    };
+    if segment.items.is_empty() {
+        return;
+    }
+    if current_font_key.as_ref() != Some(&segment.font_key) {
+        out.push(font_set_operation(&segment.font_name, segment.font_size));
+        *current_font_key = Some(segment.font_key);
+    }
+    push_text_matrix_at(out, anchor_tm, segment.start_cursor_pts);
+    let tj_idx = out.len();
+    if first_tj.is_none() {
+        *first_tj = Some(tj_idx);
+    }
+    out.push(Operation::new("TJ", vec![Object::Array(segment.items)]));
+}
+
+fn push_text_matrix_at(out: &mut Vec<Operation>, anchor_tm: [f32; 6], cursor_pts: f32) {
+    let char_tm = multiply_matrix(anchor_tm, [1.0, 0.0, 0.0, 1.0, cursor_pts, 0.0]);
+    out.push(Operation::new(
+        "Tm",
+        vec![
+            Object::Real(char_tm[0]),
+            Object::Real(char_tm[1]),
+            Object::Real(char_tm[2]),
+            Object::Real(char_tm[3]),
+            Object::Real(char_tm[4]),
+            Object::Real(char_tm[5]),
+        ],
+    ));
+}
+
+fn multi_punctuation_adjustment() -> f32 {
+    0.5
+}
+
+fn is_compressible_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '，' | '。'
+            | '、'
+            | '：'
+            | '；'
+            | '！'
+            | '？'
+            | '（'
+            | '）'
+            | '「'
+            | '」'
+            | '『'
+            | '』'
+            | '《'
+            | '》'
+            | '…'
+            | '—'
+            | ','
+            | '.'
+            | ':'
+            | ';'
+            | '!'
+            | '?'
+    )
+}
+
+fn has_adjacent_compressible_punctuation(text: &str) -> bool {
+    let mut previous = None;
+    for ch in text.chars() {
+        if previous.is_some_and(is_compressible_punctuation) && is_compressible_punctuation(ch) {
+            return true;
+        }
+        previous = Some(ch);
+    }
+    false
+}
+
+fn merge_text_typography(
+    members: &[StructuredTextObject],
+    group_font_name: Option<&str>,
+) -> TextTypography {
+    let mut typography = TextTypography::default();
+    for member in members {
+        let member_typography = &member.typography;
+        typography.detected_tj_displacements |= member_typography.detected_tj_displacements;
+        typography.detected_space_displacements |= member_typography.detected_space_displacements;
+        typography.detected_multi_punctuation |= member_typography.detected_multi_punctuation;
+        typography.replace_spaces_with_displacements |=
+            member_typography.replace_spaces_with_displacements;
+        typography.compress_multi_punctuation |= member_typography.compress_multi_punctuation;
+        if typography.digit_font_name.is_none() {
+            typography.digit_font_name = member_typography.digit_font_name.clone();
+        }
+        if typography.detected_digit_font_name.is_none() {
+            typography.detected_digit_font_name =
+                member_typography.detected_digit_font_name.clone();
+        }
+
+        let Some(member_font_name) = member.font_name.as_deref() else {
+            continue;
+        };
+        if group_font_name == Some(member_font_name) {
+            continue;
+        }
+        if member.content.chars().any(|ch| ch.is_ascii_digit()) {
+            typography.detected_digit_font_name = Some(member_font_name.to_string());
+            typography
+                .digit_font_name
+                .get_or_insert_with(|| member_font_name.to_string());
+        }
+    }
+    typography
 }
 
 fn needs_cjk_fallback_font(member: &GroupMemberPlan, replacement: &str) -> bool {

@@ -5,7 +5,7 @@ use crate::{
     page_font_assets_from_pdf_bytes, page_image_png_from_pdf_bytes,
     page_load_bundle_from_pdf_bytes, page_structure_from_pdf_bytes, save_pdf_document_to_bytes,
     BackgroundRenderOptions, CoreError, EngineDocument, ImageObjectId, PageIndex, PdfObjectId,
-    Point, TextObjectId,
+    Point, TextObjectId, TextTypography,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -549,6 +549,7 @@ pub fn pdf_update_text_runs_by_handle(
     origin_dx: f32,
     origin_dy: f32,
     clip_bounds_json: &str,
+    typography_json: &str,
 ) -> Result<(), JsValue> {
     let runs_input: Vec<TextRunInput> = serde_json::from_str(runs_json)
         .map_err(|e| JsValue::from_str(&format!("invalid runs JSON: {e}")))?;
@@ -560,6 +561,12 @@ pub fn pdf_update_text_runs_by_handle(
             serde_json::from_str(clip_bounds_json)
                 .map_err(|e| JsValue::from_str(&format!("invalid clip bounds JSON: {e}")))?,
         )
+    };
+    let typography: TextTypography = if typography_json.trim().is_empty() {
+        TextTypography::default()
+    } else {
+        serde_json::from_str(typography_json)
+            .map_err(|e| JsValue::from_str(&format!("invalid typography JSON: {e}")))?
     };
     DOCUMENT_STORE.with(|store| {
         let mut store = store.borrow_mut();
@@ -577,6 +584,7 @@ pub fn pdf_update_text_runs_by_handle(
                 runs,
                 crate::Point::new(origin_dx, origin_dy),
                 clip_bounds,
+                typography,
             )
             .map(|_| ())
             .map_err(core_error_to_js)

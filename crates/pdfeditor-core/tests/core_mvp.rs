@@ -7,6 +7,7 @@ use pdfeditor_core::{
     BackgroundRenderOptions, Color, DocumentSession, EngineDocument, LopdfEngine, MockPdfEngine,
     OpenOptions, PageBitmapCache, PageIndex, PageInfo, PageStructure, Point, Rect, RenderedPage,
     ResourceBudget, SaveOptions, Size, StructuredTextObject, TextObjectId, TextRun, TextStyle,
+    TextTypography,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -799,6 +800,7 @@ fn writes_single_page_pdf_from_page_structure() {
             punct_width_squeeze: false,
             font_features: Vec::new(),
             clip_bounds: None,
+            typography: TextTypography::default(),
             runs: Vec::new(),
         }],
         visual_text: Vec::new(),
@@ -853,6 +855,7 @@ fn writes_single_page_pdf_from_page_structure_with_chinese_text() {
             punct_width_squeeze: false,
             font_features: Vec::new(),
             clip_bounds: None,
+            typography: TextTypography::default(),
             runs: Vec::new(),
         }],
         visual_text: Vec::new(),
@@ -903,6 +906,7 @@ fn lopdf_backend_preserves_hex_unicode_text_when_updating_chinese() {
             punct_width_squeeze: false,
             font_features: Vec::new(),
             clip_bounds: None,
+            typography: TextTypography::default(),
             runs: Vec::new(),
         }],
         visual_text: Vec::new(),
@@ -982,6 +986,7 @@ fn lopdf_backend_uses_narrow_advances_for_ascii_inside_cjk_text() {
             punct_width_squeeze: false,
             font_features: Vec::new(),
             clip_bounds: None,
+            typography: TextTypography::default(),
             runs: Vec::new(),
         }],
         visual_text: Vec::new(),

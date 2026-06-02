@@ -73,6 +73,7 @@ export interface StructuredTextObject {
   /** Clipping rectangle from a surrounding `q re W n … Q` sequence in the PDF content stream.
    *  When present, the SVG overlay should clip this text to this rect rather than `bounds`. */
   clip_bounds?: Rect;
+  typography?: TextTypography;
 }
 
 export interface TextRunInfo {
@@ -159,6 +160,7 @@ export interface TextEditSessionInfo {
   font_size: number;
   writing_mode: string | null;
   glyphs: LayoutGlyph[];
+  typography?: TextTypography;
 }
 
 export interface TextLayoutPreview {
@@ -168,6 +170,17 @@ export interface TextLayoutPreview {
   glyphs: LayoutGlyph[];
   bbox: Rect;
   overflow: boolean;
+  typography?: TextTypography;
+}
+
+export interface TextTypography {
+  replace_spaces_with_displacements: boolean;
+  digit_font_name?: string | null;
+  compress_multi_punctuation: boolean;
+  detected_tj_displacements: boolean;
+  detected_space_displacements: boolean;
+  detected_multi_punctuation: boolean;
+  detected_digit_font_name?: string | null;
 }
 
 export interface EmbeddedFontInfo {
@@ -438,7 +451,8 @@ export async function updateTextRunsByHandle(
   baseFontName: string | null,
   baseFontSize: number,
   originDelta: { x: number; y: number } = { x: 0, y: 0 },
-  clipBounds: Rect | null = null
+  clipBounds: Rect | null = null,
+  typography: TextTypography | null = null
 ): Promise<void> {
   await ensureWasm();
   // Built-in browser fonts need PDF-side resource names.  Noto Sans SC keeps using
@@ -466,13 +480,20 @@ export async function updateTextRunsByHandle(
       return [c.r, c.g, c.b, c.a];
     })()
   }));
+  const typographyPayload = typography
+    ? {
+        ...typography,
+        digit_font_name: builtinPdfFontName(typography.digit_font_name ?? null)
+      }
+    : null;
   pdf_update_text_runs_by_handle(
     handle,
     BigInt(objectId),
     JSON.stringify(payload),
     originDelta.x,
     originDelta.y,
-    clipBounds ? JSON.stringify(clipBounds) : ""
+    clipBounds ? JSON.stringify(clipBounds) : "",
+    typographyPayload ? JSON.stringify(typographyPayload) : ""
   );
 }
 
@@ -523,6 +544,7 @@ function normalizePageStructure(structure: PageStructure): PageStructure {
       ...text,
       content: normalizeCompatibilityText(text.content),
       glyphs: normalizeLayoutGlyphs(text.glyphs),
+      typography: normalizeTextTypography(text.typography),
       runs: text.runs?.map((run) => ({
         ...run,
         content: normalizeCompatibilityText(run.content)
@@ -536,7 +558,8 @@ function normalizeTextEditSession(session: TextEditSessionInfo): TextEditSession
     ...session,
     original_text: normalizeCompatibilityText(session.original_text),
     group_object_ids: session.group_object_ids ?? [session.object_id],
-    glyphs: normalizeLayoutGlyphs(session.glyphs)
+    glyphs: normalizeLayoutGlyphs(session.glyphs),
+    typography: normalizeTextTypography(session.typography)
   };
 }
 
@@ -545,7 +568,20 @@ function normalizeTextLayoutPreview(preview: TextLayoutPreview): TextLayoutPrevi
     ...preview,
     text: normalizeCompatibilityText(preview.text),
     group_object_ids: preview.group_object_ids ?? [preview.object_id],
-    glyphs: normalizeLayoutGlyphs(preview.glyphs)
+    glyphs: normalizeLayoutGlyphs(preview.glyphs),
+    typography: normalizeTextTypography(preview.typography)
+  };
+}
+
+export function normalizeTextTypography(typography?: Partial<TextTypography> | null): TextTypography {
+  return {
+    replace_spaces_with_displacements: Boolean(typography?.replace_spaces_with_displacements),
+    digit_font_name: typography?.digit_font_name ?? null,
+    compress_multi_punctuation: Boolean(typography?.compress_multi_punctuation),
+    detected_tj_displacements: Boolean(typography?.detected_tj_displacements),
+    detected_space_displacements: Boolean(typography?.detected_space_displacements),
+    detected_multi_punctuation: Boolean(typography?.detected_multi_punctuation),
+    detected_digit_font_name: typography?.detected_digit_font_name ?? null
   };
 }
 

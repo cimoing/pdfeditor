@@ -1,7 +1,7 @@
 use crate::{
     BookmarkItem, Color, CoreError, CoreResult, ImageObject, ImageObjectId, PageIndex, PageInfo,
     PageStructure, PdfObjectId, Point, Rect, RenderedPage, Size, StructuredImageObject,
-    StructuredTextObject, TextObject, TextObjectId, TextRun, TextStyle,
+    StructuredTextObject, TextObject, TextObjectId, TextRun, TextStyle, TextTypography,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -54,6 +54,7 @@ pub trait EngineDocument {
                 punct_width_squeeze: false,
                 font_features: Vec::new(),
                 clip_bounds: None,
+                typography: TextTypography::default(),
                 runs: object.runs,
             })
             .collect();
@@ -124,6 +125,7 @@ pub trait EngineDocument {
         runs: Vec<TextRun>,
         origin_delta: Point,
         clip_bounds: Option<Rect>,
+        typography: TextTypography,
     ) -> CoreResult<TextObject>;
     fn update_text_object_bounds(
         &mut self,
@@ -331,6 +333,7 @@ impl EngineDocument for MockEngineDocument {
         runs: Vec<TextRun>,
         _origin_delta: Point,
         _clip_bounds: Option<Rect>,
+        _typography: TextTypography,
     ) -> CoreResult<TextObject> {
         // Mock: delegate to update_text_object_runs
         self.update_text_object_runs(id, runs)

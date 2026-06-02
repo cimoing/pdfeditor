@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch, watchEffect } from "vue";
-import type { LayoutGlyph, LocalSystemFontOption, RichTextRun, StructuredImageObject, StructuredTextObject } from "./pdfEditor";
+import type { LayoutGlyph, LocalSystemFontOption, RichTextRun, StructuredImageObject, StructuredTextObject, TextTypography } from "./pdfEditor";
 import {
   commitTextEdit,
   describePdfFontUsage,
@@ -103,12 +103,34 @@ const inlineEditor = ref<HTMLDivElement | null>(null);
 let skipNextDomSync = false;
 /** ID of the run span currently under the cursor (used to set toolbar values) */
 const activeRunId = ref<string | null>(null);
+const draftTypography = ref<TextTypography>(defaultTextTypography());
 /**
  * True while a toolbar control (font select / size input) is receiving interaction.
  * Prevents onInlineEditorBlur from treating the transient focus-loss as a real blur.
  */
 const isToolbarInteracting = ref(false);
 const zoomPercent = computed(() => `${Math.round(zoom.value * 100)}%`);
+
+function defaultTextTypography(): TextTypography {
+  return {
+    replace_spaces_with_displacements: false,
+    digit_font_name: null,
+    compress_multi_punctuation: false,
+    detected_tj_displacements: false,
+    detected_space_displacements: false,
+    detected_multi_punctuation: false,
+    detected_digit_font_name: null
+  };
+}
+
+function normalizeDraftTypography(value?: Partial<TextTypography> | null): TextTypography {
+  return {
+    ...defaultTextTypography(),
+    ...value,
+    digit_font_name: value?.digit_font_name ?? null,
+    detected_digit_font_name: value?.detected_digit_font_name ?? null
+  };
+}
 
 // ── Edit-box resize state ──────────────────────────────────────────────────
 /** Width override in viewport pixels set by dragging the right edge. */
@@ -697,6 +719,11 @@ const hasEditorClipChange = computed(() => {
   return Math.abs(width - geometry.naturalWidth) > 0.5;
 });
 
+const hasTypographyChanges = computed(() => {
+  const base = normalizeDraftTypography(editSession.value?.typography ?? selectedTextObject.value?.typography);
+  return JSON.stringify(draftTypography.value) !== JSON.stringify(base);
+});
+
 const canSaveEdit = computed(() => {
   if (!selectedTextObject.value || !editSession.value || isSavingEdit.value || isPreparingEdit.value) {
     return false;
@@ -705,11 +732,13 @@ const canSaveEdit = computed(() => {
   return draftText.value !== editSession.value.original_text
     || hasRunStyleChanges.value
     || hasEditorPositionChange.value
-    || hasEditorClipChange.value;
+    || hasEditorClipChange.value
+    || hasTypographyChanges.value;
 });
 
 const draftUsesBuiltInFont = computed(() =>
   draftRuns.value.some((r) => r.font_name?.startsWith("__builtin__:"))
+  || Boolean(draftTypography.value.digit_font_name?.startsWith("__builtin__:"))
 );
 
 /** Overflow only matters when the user actually changed the text from the original. */
@@ -910,10 +939,12 @@ function cssEscapeFontFamily(value: string) {
   return value.replace(/["\\]/g, "\\$&");
 }
 
-async function ensureSystemFontsForRuns(handle: number, runs: RichTextRun[]) {
+async function ensureSystemFontsForRuns(handle: number, runs: RichTextRun[], typography?: TextTypography | null) {
   const names = Array.from(new Set(
-    runs
-      .map((run) => run.font_name)
+    [
+      ...runs.map((run) => run.font_name),
+      typography?.digit_font_name ?? null
+    ]
       .filter((name): name is string => Boolean(name?.startsWith("__localfont__:")))
   ));
   for (const name of names) {
@@ -953,6 +984,7 @@ async function beginTextEdit(objectId: number) {
 
     // Initialize draftRuns from the text object's existing runs (or a single default run).
     const textObj = page.value?.text.find((t) => t.id === objectId);
+    draftTypography.value = normalizeDraftTypography(session.typography ?? textObj?.typography);
     const existingRuns = textObj?.runs?.filter((r) => r.content) ?? [];
     if (existingRuns.length > 0) {
       draftRuns.value = existingRuns.map((r) => ({
@@ -979,7 +1011,8 @@ async function beginTextEdit(objectId: number) {
       group_object_ids: session.group_object_ids,
       glyphs: session.glyphs,
       bbox: session.bbox,
-      overflow: false
+      overflow: false,
+      typography: draftTypography.value
     };
     status.value = `已选中文本对象 ${objectId}，可直接修改并保存`;
     await nextTick();
@@ -1103,7 +1136,7 @@ async function refreshPreview(objectId: number, text: string, selectionToken = g
     if (requestId !== getPreviewToken() || selectionToken !== getSelectionToken() || selectedTextId.value !== objectId) {
       return;
     }
-    layoutPreview.value = preview;
+    layoutPreview.value = { ...preview, typography: draftTypography.value };
   } catch (error) {
     console.error(error);
     if (requestId !== getPreviewToken() || selectionToken !== getSelectionToken()) {
@@ -1139,7 +1172,7 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
       if (draftUsesBuiltInFont.value && !cjkFontEmbedded) {
         throw new Error("保存失败：用于写入 PDF 的内置字体没有成功嵌入，请检查字体资源是否可加载后重试。");
       }
-      await ensureSystemFontsForRuns(pdfHandle.value, draftRuns.value);
+      await ensureSystemFontsForRuns(pdfHandle.value, draftRuns.value, draftTypography.value);
 
       // Fast path: update in-memory document, then refresh only the page structure.
       const existingImageUrls = new Map(
@@ -1151,6 +1184,7 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
         || hasRunStyleChanges.value
         || hasEditorPositionChange.value
         || hasEditorClipChange.value
+        || hasTypographyChanges.value
         || Boolean(layoutPreview.value?.overflow)
       ) {
         await updateTextRunsByHandle(
@@ -1159,7 +1193,8 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
           editSession.value?.font_id ?? textObj?.font_name ?? null,
           editSession.value?.font_size ?? textObj?.font_size ?? 12,
           originDelta,
-          savedClipBounds
+          savedClipBounds,
+          draftTypography.value
         );
       } else {
         await updateTextByHandle(pdfHandle.value, objectId, savedText);
@@ -1171,9 +1206,12 @@ async function saveTextEdit(options: { closeAfterSave?: boolean } = {}) {
         if (url) img.objectUrl = url;
       }
       const nextObjectId = findSavedTextObjectId(structure.text, objectId, savedText, savedBounds);
-      if (nextObjectId != null && savedClipBounds) {
+      if (nextObjectId != null) {
         const savedObject = structure.text.find((item) => item.id === nextObjectId);
-        if (savedObject) savedObject.clip_bounds = savedClipBounds;
+        if (savedObject) {
+          if (savedClipBounds) savedObject.clip_bounds = savedClipBounds;
+          savedObject.typography = draftTypography.value;
+        }
       }
       page.value = structure;
       if (closeAfterSave) {
@@ -1750,6 +1788,46 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
           <div>字号：{{ (editSession?.font_size ?? selectedTextObject.font_size).toFixed(2) }}</div>
           <div :class="selectedFontUsage.fellBack ? 'font-fallback' : 'font-embedded'">
             {{ selectedFontUsage.fellBack ? selectedFontUsage.fallbackReason : "已命中嵌入字体" }}
+          </div>
+        </div>
+        <div class="typography-controls">
+          <label class="typography-toggle">
+            <input
+              type="checkbox"
+              v-model="draftTypography.replace_spaces_with_displacements"
+              :disabled="isPreparingEdit || isSavingEdit"
+            />
+            <span>空格写为 TJ 位移</span>
+          </label>
+          <label class="typography-toggle">
+            <input
+              type="checkbox"
+              v-model="draftTypography.compress_multi_punctuation"
+              :disabled="isPreparingEdit || isSavingEdit"
+            />
+            <span>多标点压缩识别</span>
+          </label>
+          <label class="typography-field">
+            <span>数字字体</span>
+            <select
+              v-model="draftTypography.digit_font_name"
+              :disabled="isPreparingEdit || isSavingEdit"
+            >
+              <option :value="null">（继承）</option>
+              <option
+                v-for="font in allFontOptions"
+                :key="`digit-${font.resource_name}`"
+                :value="font.resource_name"
+              >{{ font.family_name }}</option>
+            </select>
+          </label>
+          <div class="typography-detected" v-if="draftTypography.detected_tj_displacements || draftTypography.detected_space_displacements || draftTypography.detected_multi_punctuation || draftTypography.detected_digit_font_name">
+            识别：{{ [
+              draftTypography.detected_tj_displacements ? "TJ 位移" : "",
+              draftTypography.detected_space_displacements ? "位移空格" : "",
+              draftTypography.detected_multi_punctuation ? "多标点" : "",
+              draftTypography.detected_digit_font_name ? "数字字体" : ""
+            ].filter(Boolean).join(" / ") }}
           </div>
         </div>
         <RunsEditor
