@@ -1166,6 +1166,17 @@ impl EngineDocument for LopdfDocument {
         let anchor_x = anchor_tm[4];
         let anchor_y = anchor_tm[5];
         let anchor_scale_x = f32::hypot(anchor_tm[0], anchor_tm[1]).max(0.001);
+        // Text LINE matrix of the edited line in the ORIGINAL stream.  Subsequent
+        // non-targeted text that is positioned RELATIVELY (Td / TD / T*) chains off
+        // this matrix, not off the edited object's advance.  Our replacement emits
+        // absolute Tm operators (and, when clipping, an ET…BT pair that resets the
+        // line matrix to the identity), which would otherwise leave the line matrix
+        // pointing at the end of the replacement (or the page origin).  We therefore
+        // re-establish this line matrix after the replacement so every following
+        // relatively-positioned line keeps its original placement instead of
+        // collapsing toward (0,0) and disappearing.  It is intentionally captured
+        // WITHOUT origin_delta: moving the edited object must not drag other text.
+        let resume_text_line_matrix = pre_pass.text_line_matrix;
 
         // Pre-check: do any characters in any run need CJK fallback encoding?
         // We must call ensure_page_cjk_fallback_font (which mutably borrows self) BEFORE the
@@ -1368,9 +1379,15 @@ impl EngineDocument for LopdfDocument {
                 &anchor_state,
                 orig_font_name.as_deref(),
                 orig_font_size,
+                resume_text_line_matrix,
             )
         } else {
-            (replacement_ops, 0)
+            // Re-establish the original text line matrix so any following
+            // relatively-positioned (Td/TD/T*) text continues from the correct
+            // place rather than the end of the replacement's absolute Tm.
+            let mut ops = replacement_ops;
+            ops.push(text_matrix_op(resume_text_line_matrix));
+            (ops, 0)
         };
 
         // All content-stream indexes of the group's original text operations.
@@ -6124,17 +6141,22 @@ fn flush_tj_segment(
 
 fn push_text_matrix_at(out: &mut Vec<Operation>, anchor_tm: [f32; 6], cursor_pts: f32) {
     let char_tm = multiply_matrix(anchor_tm, [1.0, 0.0, 0.0, 1.0, cursor_pts, 0.0]);
-    out.push(Operation::new(
+    out.push(text_matrix_op(char_tm));
+}
+
+/// Builds a `Tm` (set text matrix) operation from a 6-element matrix.
+fn text_matrix_op(matrix: [f32; 6]) -> Operation {
+    Operation::new(
         "Tm",
         vec![
-            Object::Real(char_tm[0]),
-            Object::Real(char_tm[1]),
-            Object::Real(char_tm[2]),
-            Object::Real(char_tm[3]),
-            Object::Real(char_tm[4]),
-            Object::Real(char_tm[5]),
+            Object::Real(matrix[0]),
+            Object::Real(matrix[1]),
+            Object::Real(matrix[2]),
+            Object::Real(matrix[3]),
+            Object::Real(matrix[4]),
+            Object::Real(matrix[5]),
         ],
-    ));
+    )
 }
 
 fn multi_punctuation_adjustment() -> f32 {
@@ -6311,6 +6333,7 @@ fn wrap_text_replacement_ops_with_clip(
     anchor_state: &TextParseState,
     original_font_name: Option<&str>,
     original_font_size: f32,
+    resume_text_line_matrix: [f32; 6],
 ) -> (Vec<Operation>, usize) {
     let mut wrapped = Vec::with_capacity(replacement_ops.len() + 16);
     wrapped.push(Operation::new("ET", vec![]));
@@ -6344,6 +6367,10 @@ fn wrap_text_replacement_ops_with_clip(
         original_font_name,
         original_font_size,
     );
+    // The reopening BT above reset the text line matrix to the identity.  Restore
+    // the edited line's original line matrix so following relatively-positioned
+    // (Td/TD/T*) text keeps its placement instead of collapsing toward the origin.
+    wrapped.push(text_matrix_op(resume_text_line_matrix));
     (wrapped, prefix_len)
 }
 

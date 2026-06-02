@@ -555,6 +555,63 @@ fn lopdf_backend_preserves_following_relative_text_after_group_edit() {
 }
 
 #[test]
+fn lopdf_backend_preserves_following_relative_text_after_runs_edit() {
+    // Regression: editing a text object through the rich-text (runs) path must not
+    // disturb the following relatively-positioned (Td/TD/T*) line.  The runs rewrite
+    // emits an absolute Tm — and, when a clip is supplied, an ET…BT pair that resets
+    // the text line matrix to the identity.  Without restoring the edited line's
+    // original line matrix afterwards, every following relatively-positioned line
+    // collapses toward the page origin and disappears (in the saved PDF as well as
+    // the web preview).  Both the clipped and unclipped paths are exercised.
+    let source = write_lopdf_relative_text_block_pdf("lopdf-relative-after-runs-edit");
+    let bytes = fs::read(source).unwrap();
+
+    for clip in [None, Some(Rect::new(61.6, 645.0, 200.0, 12.0))] {
+        let mut document = open_lopdf_document_from_bytes(&bytes).unwrap();
+        let object = document
+            .page_structure(PageIndex(0))
+            .unwrap()
+            .text
+            .into_iter()
+            .find(|object| object.content.starts_with("2 "))
+            .expect("line 2 text");
+
+        let runs = vec![TextRun::new(
+            "2 Business name changed".to_string(),
+            object.font_name.clone(),
+            object.font_size,
+            object.color,
+        )];
+        document
+            .replace_text_object_with_runs(
+                object.id,
+                runs,
+                Point::new(0.0, 0.0),
+                clip,
+                TextTypography::default(),
+            )
+            .unwrap();
+
+        let updated = document.page_structure(PageIndex(0)).unwrap();
+        let following = updated
+            .text
+            .iter()
+            .find(|object| object.content.starts_with("3a "))
+            .unwrap_or_else(|| panic!("following relative line preserved (clip={clip:?})"));
+        assert!(
+            (following.transform[4] - 61.6).abs() < 0.01,
+            "following x drifted to {} (clip={clip:?})",
+            following.transform[4]
+        );
+        assert!(
+            (following.transform[5] - 627.973).abs() < 0.01,
+            "following y drifted to {} (clip={clip:?})",
+            following.transform[5]
+        );
+    }
+}
+
+#[test]
 fn lopdf_backend_advances_consecutive_structured_text_runs() {
     let source = write_lopdf_consecutive_text_runs_pdf("lopdf-consecutive-runs");
     let engine = LopdfEngine;
