@@ -22,6 +22,7 @@ use tiny_skia::{
 const BUILTIN_MONOSPACE_SENTINEL: &str = "__pdfeditor_builtin_monospace__";
 const BUILTIN_SERIF_SENTINEL: &str = "__pdfeditor_builtin_serif__";
 const BUILTIN_SANS_SENTINEL: &str = "__pdfeditor_builtin_sans__";
+const PDF_EDITOR_CJK_FONT_NAME: &str = "PdfEditorNotoSC";
 
 #[derive(Debug, Clone, Default)]
 pub struct LopdfEngine;
@@ -1498,9 +1499,15 @@ impl LopdfDocument {
     /// Store parsed CJK font data so subsequent edits can embed it instead of using
     /// the unembedded STSong-Light standard font.
     pub fn set_cjk_font(&mut self, data: CjkFontData) {
+        let same_font = self
+            .cjk_font
+            .as_ref()
+            .is_some_and(|existing| existing.sfnt_bytes == data.sfnt_bytes);
         self.cjk_font = Some(data);
-        self.cjk_font_pages.clear(); // invalidate per-page caches
-        self.cjk_font_page_chars.clear();
+        if !same_font {
+            self.cjk_font_pages.clear(); // invalidate per-page caches
+            self.cjk_font_page_chars.clear();
+        }
     }
 
     /// Returns `true` if an embedded CJK font is available (set via [`set_cjk_font`]).
@@ -1616,9 +1623,17 @@ impl LopdfDocument {
     }
 
     pub fn set_local_font(&mut self, key: String, data: CjkFontData) {
+        let same_font = self
+            .local_fonts
+            .get(&key)
+            .is_some_and(|existing| existing.sfnt_bytes == data.sfnt_bytes);
+        if !same_font {
+            self.local_font_pages
+                .retain(|(_, font_key), _| font_key != &key);
+            self.local_font_page_chars
+                .retain(|(_, font_key), _| font_key != &key);
+        }
         self.local_fonts.insert(key, data);
-        self.local_font_pages.clear();
-        self.local_font_page_chars.clear();
     }
 
     fn ensure_page_local_font(
@@ -1773,6 +1788,29 @@ impl LopdfDocument {
         chars
     }
 
+    fn existing_page_text_chars_for_font(
+        &self,
+        page_id: ObjectId,
+        font_name: &str,
+    ) -> BTreeSet<char> {
+        let Some(page_index) = self
+            .pages
+            .iter()
+            .position(|id| *id == page_id)
+            .map(|index| PageIndex(index as u32))
+        else {
+            return BTreeSet::new();
+        };
+
+        self.text_objects
+            .get(&page_index)
+            .into_iter()
+            .flatten()
+            .filter(|object| object.font_name.as_deref() == Some(font_name))
+            .flat_map(|object| object.content.chars())
+            .collect()
+    }
+
     /// Ensure a CJK fallback font is registered in the given page's resources.
     ///
     /// If [`set_cjk_font`] has been called, embeds the loaded TrueType font (NotoSansSC etc.)
@@ -1791,6 +1829,12 @@ impl LopdfDocument {
             .get(&page_id)
             .cloned()
             .unwrap_or_default();
+        if self.cjk_font.is_some() {
+            combined_chars.extend(self.existing_page_text_chars_for_font(
+                page_id,
+                PDF_EDITOR_CJK_FONT_NAME,
+            ));
+        }
         combined_chars.extend(chars.iter().copied());
         if let Some(name) = self.cjk_font_pages.get(&page_id) {
             if self.cjk_font.is_none()
@@ -1805,8 +1849,6 @@ impl LopdfDocument {
 
         let font_resource_id: ObjectId = if self.cjk_font.is_some() {
             // ── Embedded TrueType path (Identity-H) ─────────────────────────────────────
-            const NOTO_FONT_NAME: &str = "PdfEditorNotoSC";
-
             let data = self.cjk_font.as_ref().unwrap(); // is_some checked above
 
             // 1. Embed a glyph subset as a FontFile2 stream.
@@ -1822,7 +1864,7 @@ impl LopdfDocument {
             let upm = data.units_per_em as f64;
             let descriptor_id = self.document.add_object(dictionary! {
                 "Type" => "FontDescriptor",
-                "FontName" => Object::Name(NOTO_FONT_NAME.as_bytes().to_vec()),
+                "FontName" => Object::Name(PDF_EDITOR_CJK_FONT_NAME.as_bytes().to_vec()),
                 "Flags" => 4i64,
                 "FontBBox" => vec![
                     Object::Real((data.x_min as f64 / upm * 1000.0) as f32),
@@ -1845,7 +1887,7 @@ impl LopdfDocument {
             let cid_font_id = self.document.add_object(dictionary! {
                 "Type" => "Font",
                 "Subtype" => "CIDFontType2",
-                "BaseFont" => Object::Name(NOTO_FONT_NAME.as_bytes().to_vec()),
+                "BaseFont" => Object::Name(PDF_EDITOR_CJK_FONT_NAME.as_bytes().to_vec()),
                 "CIDSystemInfo" => dictionary! {
                     "Registry" => Object::string_literal("Adobe"),
                     "Ordering" => Object::string_literal("Identity"),
@@ -1869,14 +1911,14 @@ impl LopdfDocument {
             let type0_id = self.document.add_object(dictionary! {
                 "Type" => "Font",
                 "Subtype" => "Type0",
-                "BaseFont" => Object::Name(NOTO_FONT_NAME.as_bytes().to_vec()),
+                "BaseFont" => Object::Name(PDF_EDITOR_CJK_FONT_NAME.as_bytes().to_vec()),
                 "Encoding" => Object::Name(b"Identity-H".to_vec()),
                 "DescendantFonts" => vec![Object::Reference(cid_font_id)],
                 "ToUnicode" => Object::Reference(to_unicode_id),
             });
 
             self.cjk_font_pages
-                .insert(page_id, NOTO_FONT_NAME.to_string());
+                .insert(page_id, PDF_EDITOR_CJK_FONT_NAME.to_string());
             self.cjk_font_page_chars
                 .insert(page_id, combined_chars.clone());
             type0_id
@@ -10292,4 +10334,157 @@ fn u32_to_bytes(value: u32, len: usize) -> Vec<u8> {
         .rev()
         .map(|shift| ((value >> (shift * 8)) & 0xff) as u8)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::font_embed::{parse_cjk_font, woff1_to_sfnt};
+    use lopdf::Stream;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn preserves_previous_cjk_fallback_text_after_later_cjk_edit() {
+        let bytes = two_line_latin_pdf();
+        let mut document = open_lopdf_document_from_bytes(&bytes).unwrap();
+        document.set_cjk_font(noto_sans_sc_font());
+
+        let first = document
+            .page_structure(PageIndex(0))
+            .unwrap()
+            .text
+            .into_iter()
+            .find(|object| object.content == "Alpha")
+            .expect("first text object");
+        document
+            .update_text_object(first.id, "真假".to_string(), None)
+            .unwrap();
+        document.set_cjk_font(noto_sans_sc_font());
+
+        let second = document
+            .page_structure(PageIndex(0))
+            .unwrap()
+            .text
+            .into_iter()
+            .find(|object| object.content == "Beta")
+            .expect("second text object");
+        document
+            .update_text_object(second.id, "伙伴".to_string(), None)
+            .unwrap();
+
+        let saved = document.save_to_bytes().unwrap();
+        let reopened = open_lopdf_document_from_bytes(&saved).unwrap();
+        let contents = reopened
+            .page_structure(PageIndex(0))
+            .unwrap()
+            .text
+            .into_iter()
+            .map(|object| object.content)
+            .collect::<Vec<_>>();
+
+        assert!(
+            contents.iter().any(|content| content == "真假"),
+            "first CJK edit should remain decodable after later CJK edit: {contents:?}"
+        );
+        assert!(
+            contents.iter().any(|content| content == "伙伴"),
+            "second CJK edit should be decodable: {contents:?}"
+        );
+    }
+
+    fn noto_sans_sc_font() -> CjkFontData {
+        let font_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("apps")
+            .join("web")
+            .join("node_modules")
+            .join("@fontsource")
+            .join("noto-sans-sc")
+            .join("files")
+            .join("noto-sans-sc-chinese-simplified-400-normal.woff");
+        let font_bytes = fs::read(font_path).expect("read bundled Noto Sans SC fixture");
+        let sfnt = woff1_to_sfnt(&font_bytes).expect("decode Noto Sans SC WOFF");
+        parse_cjk_font(sfnt).expect("parse Noto Sans SC font")
+    }
+
+    fn two_line_latin_pdf() -> Vec<u8> {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 0,
+            "Widths" => Object::Array((0..=255).map(|_| Object::Integer(600)).collect()),
+        });
+        let resources_id = document.add_object(dictionary! {
+            "Font" => dictionary! {
+                "F1" => font_id,
+            },
+        });
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new(
+                    "Tf",
+                    vec![Object::Name(b"F1".to_vec()), Object::Integer(12)],
+                ),
+                Operation::new(
+                    "Tm",
+                    vec![
+                        Object::Integer(1),
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(1),
+                        Object::Integer(40),
+                        Object::Integer(120),
+                    ],
+                ),
+                Operation::new("Tj", vec![Object::string_literal("Alpha")]),
+                Operation::new(
+                    "Tm",
+                    vec![
+                        Object::Integer(1),
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(1),
+                        Object::Integer(40),
+                        Object::Integer(96),
+                    ],
+                ),
+                Operation::new("Tj", vec![Object::string_literal("Beta")]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = document.add_object(Stream::new(
+            dictionary! {},
+            content.encode().expect("encode PDF content stream"),
+        ));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources_id,
+            "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(300), Object::Integer(300)],
+        });
+        document.objects.insert(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }
+            .into(),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("save generated PDF");
+        bytes
+    }
 }
